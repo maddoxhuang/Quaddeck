@@ -82,6 +82,16 @@ Build in the checkout under test with the required repository command:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 ```
 
+CPU colour checks run as `QuadDeckColorConversionCpuTests`; GPU colour checks
+run separately as `QuadDeckColorConversionGpuTests`. `QuadDeckShaderProbe`
+also requires D3D11 video processing. The local build script explicitly sets
+`QUADDECK_ALLOW_MISSING_VIDEO_SUPPORT=OFF`, so missing hardware fails validation.
+GitHub Actions sets this option to `ON`: only `E_NOINTERFACE` from a query for
+`ID3D11VideoDevice` or `ID3D11VideoContext` permits exit code 77, which CTest
+reports as skipped. Device creation errors, other HRESULTs and later renderer
+or pixel-check failures still fail. CPU tests always run. A successful CI run
+with GPU tests skipped provides no GPU or real-playback acceptance evidence.
+
 The seek probe takes one video per invocation. The following argument shape
 was checked against `tests/seek_probe.cpp` at `5924cf9`:
 

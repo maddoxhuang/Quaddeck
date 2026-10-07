@@ -4,7 +4,10 @@ Public releases start at 1.0.0. See [README.md](README.md) for current usage and
 
 ## Unreleased
 
-No changes for a subsequent release yet.
+- Separate CPU colour conversion checks from GPU tests. Windows CI can report
+  GPU tests as skipped when a required D3D11 video interface is absent, while
+  all other failures still stop the build. The local build script requires
+  all tests to run, including GPU checks.
 
 ## 1.0.0 (2026-10-08, initial public release)
 

@@ -19,8 +19,10 @@ jobs:
       - uses: lukka/run-cmake@v10
         with:
           configurePreset: windows-release
+          configurePresetAdditionalArgs: "['-DQUADDECK_ALLOW_MISSING_VIDEO_SUPPORT=ON']"
           buildPreset: windows-release
           testPreset: windows-release
+          testPresetAdditionalArgs: "['--verbose']"
 
       - name: Stage runtime
         shell: pwsh
@@ -41,3 +43,4 @@ jobs:
         with:
           name: QuadDeck-win-x64
           path: dist/QuadDeck-win-x64.zip
+          if-no-files-found: error

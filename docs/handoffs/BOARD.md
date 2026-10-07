@@ -63,3 +63,19 @@ no published Release or completed CI result is implied.
 Validation: English text, document anchors and links, packaged README consistency
 and unchanged executable/dependency hashes. No native rebuild was needed.
 Next: review the rendered public README and retain the existing runtime checklist.
+
+## Windows CI video capability checks - 2026-10-08
+
+Agent: Codex
+Public baseline: `edf82ea` on `maddoxhuang/Quaddeck`.
+Scope: split CPU/GPU colour tests and narrowly permit missing D3D11 video
+interfaces in CI; the production renderer and application version are unchanged.
+Validation: the required `scripts/build-windows.ps1` completed with 15/15 CTests
+passing in 37.24 seconds, including both GPU tests with skipping disabled.
+A temporary WARP harness exercised the same interface query and confirmed
+`E_NOINTERFACE` returns 1 in strict mode and 77 in optional mode; CTest reported
+the latter as skipped. Twelve capability/error cases were checked in both modes.
+Independent code review and `git diff --check` passed. Real-media, HDR display,
+NVIDIA inference and NAS acceptance were not run; the runtime register stays open.
+Next: verify the public commit's Actions result and package. A CI skip must never
+be reported as GPU acceptance.

@@ -1,5 +1,6 @@
 #include "ColorConversion.hpp"
 #include "D3DRenderer.hpp"
+#include "D3D11TestSupport.hpp"
 
 #include <algorithm>
 #include <array>
@@ -605,10 +606,20 @@ int wmain(int argc, wchar_t** argv) {
             softwareRtxProbe();
             return 0;
         }
-        require(argc == 1, "Usage: QuadDeckColorConversionTests [--software-rtx-probe]");
-        metadataPolicy();
-        softwarePixels();
-        {
+        const bool cpuOnly = argc == 2 && std::wstring(argv[1]) == L"--cpu";
+        const bool gpuOnly = (argc == 2 || argc == 3) && std::wstring(argv[1]) == L"--gpu";
+        const bool allowMissingVideoSupport = gpuOnly && argc == 3 &&
+            std::wstring(argv[2]) == L"--allow-missing-video-support";
+        require(argc == 1 || cpuOnly || (gpuOnly && (argc == 2 || allowMissingVideoSupport)),
+                "Usage: QuadDeckColorConversionTests [--cpu | --gpu "
+                "[--allow-missing-video-support] | --software-rtx-probe]");
+        if (!gpuOnly) {
+            metadataPolicy();
+            softwarePixels();
+        }
+        if (!cpuOnly) {
+            const int capability = test::checkVideoSupport(allowMissingVideoSupport);
+            if (capability != 0) return capability;
             D3DRenderer renderer;
             D3DRendererColorProbe::initializeOffscreen(renderer);
             hardwarePixels(renderer, DXGI_FORMAT_NV12);

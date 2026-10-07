@@ -1,5 +1,6 @@
 #include "D3DRenderer.hpp"
 #include "ColorConversion.hpp"
+#include "D3D11TestSupport.hpp"
 
 #include <array>
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <memory>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace quaddeck;
@@ -340,7 +342,15 @@ LRESULT CALLBACK probeWindowProcedure(HWND window, UINT message, WPARAM wParam, 
 
 }  // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
+    const bool allowMissingVideoSupport = argc == 2 &&
+        std::wstring(argv[1]) == L"--allow-missing-video-support";
+    if (argc != 1 && !allowMissingVideoSupport) {
+        std::cerr << "Usage: QuadDeckShaderProbe [--allow-missing-video-support]\n";
+        return 1;
+    }
+    const int capability = test::checkVideoSupport(allowMissingVideoSupport);
+    if (capability != 0) return capability;
     const HINSTANCE instance = GetModuleHandleW(nullptr);
     constexpr wchar_t className[] = L"QuadDeckShaderProbeWindow";
     WNDCLASSW windowClass{};
