@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml"><img src="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml/badge.svg?branch=main" alt="Windows Build status"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.0.0-0891b2" alt="Version 1.0.0"></a>
+  <a href="https://github.com/maddoxhuang/Quaddeck/releases/tag/v1.0.0"><img src="https://img.shields.io/badge/version-1.0.0-0891b2" alt="Version 1.0.0"></a>
   <a href="#upgrading-and-building"><img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078d4" alt="Windows 10 / 11"></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-20-00599c" alt="C++20"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-16a34a" alt="GPL-3.0 licence"></a>
@@ -59,11 +59,13 @@
 
 ## Get started
 
-1. **Download a build.** Sign in to GitHub, open [Windows Build](https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml) and select a successful run for `main`. Download **QuadDeck-win-x64** from **Artifacts**. You can also [build from source](#build-from-source).
-2. **Extract and run.** Extract the downloaded artifact, then extract the `QuadDeck-win-x64.zip` inside it. Open `QuadDeck\QuadDeck.exe` and keep the accompanying files together.
+1. **Download QuadDeck.** Get [QuadDeck-win-x64.zip](https://github.com/maddoxhuang/Quaddeck/releases/latest/download/QuadDeck-win-x64.zip) from the [latest release](https://github.com/maddoxhuang/Quaddeck/releases/latest). You can also [build from source](#build-from-source).
+2. **Extract and run.** Extract the ZIP, then open `QuadDeck\QuadDeck.exe`. Keep the accompanying files together. QuadDeck requires Windows 10/11 x64 and the [Microsoft Visual C++ v14 x64 runtime](https://aka.ms/vc14/vc_redist.x64.exe).
 3. **Open some videos.** Press `O` or drop files into the window. Use `F6` to browse local files, `Ctrl+E` for Emby and `F5` for settings.
 
 See the [1.0.0 release notes](CHANGELOG.md) for this release and [settings and compatibility](#settings-and-compatibility) before replacing an existing installation.
+
+For a development build, sign in to GitHub and download **QuadDeck-win-x64** from a successful [Windows Build](https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml) run for `main`. Extract the downloaded artifact, then the ZIP inside it.
 
 ## The bottom bar and settings
 

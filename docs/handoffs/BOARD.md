@@ -93,3 +93,15 @@ attribution, dependency licences and compatibility guidance.
 Validation: document links, section anchors, English text and package consistency.
 Application sources, build configuration and binaries are unchanged; no native
 rebuild or additional runtime test is required for this documentation edit.
+
+## Version 1.0.0 release preparation - 2026-10-08
+
+Agent: Codex
+Public baseline: `4fc39c8`.
+Scope: release download links, current validation counts and portable-package
+documentation. The v1.0.0 release reuses the local build that passed all 15 tests;
+only README and CHANGELOG are refreshed in the archive. Program and dependency
+bytes remain unchanged. The executable imports the Microsoft Visual C++ v14
+runtime, so the download instructions link the official x64 installer.
+Release assets: the portable ZIP and its SHA-256 checksum, with English notes.
+Outstanding runtime acceptance remains in the validation register.

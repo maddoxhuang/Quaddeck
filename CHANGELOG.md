@@ -4,10 +4,7 @@ Public releases start at 1.0.0. See [README.md](README.md) for current usage and
 
 ## Unreleased
 
-- Separate CPU colour conversion checks from GPU tests. Windows CI can report
-  GPU tests as skipped when a required D3D11 video interface is absent, while
-  all other failures still stop the build. The local build script requires
-  all tests to run, including GPU checks.
+No changes for a subsequent release yet.
 
 ## 1.0.0 (2026-10-08, initial public release)
 
@@ -61,7 +58,8 @@ Public releases start at 1.0.0. See [README.md](README.md) for current usage and
 ### Build, licensing and validation scope
 
 - Builds use MSVC, CMake and vcpkg. `vcpkg.json` pins the dependency baseline, and a Windows GitHub Actions build workflow is provided.
+- CPU colour conversion checks run separately from GPU tests. Windows CI can report GPU tests as skipped when a required D3D11 video interface is absent; other failures still stop the build. The local build script requires all tests to run, including GPU checks.
 - `scripts/build-windows.ps1` builds, runs CTest and creates the package. The archive includes the EXE, required DLLs, documentation, example shaders and dependency licences, excluding logs, PDB files and personal configuration.
 - The project uses GPL-3.0. See [README.md](README.md#licence) for the Smart Vibrance Plus algorithm's attribution and third-party dependency licences.
 - Logs contain playback diagnostics and thread information when the window thread stops responding for an extended period. A PDB beside a local build supplies function names and line numbers. Logs may contain media paths; review them before sharing.
-- The full Windows build and all 14 CTests passed for this public source. Automated tests do not establish real-media, NAS, Emby, audio-device, DPI or NVIDIA display acceptance. Outstanding scenarios are recorded in the [runtime validation register](docs/RUNTIME-VALIDATION.md).
+- The full local Windows build passed all 15 CTests, including both GPU tests. GitHub's Windows runner passed 13 tests and skipped the 2 GPU tests because it lacks the required D3D11 video interface. Automated tests do not establish real-media, NAS, Emby, audio-device, DPI or NVIDIA display acceptance. Outstanding scenarios are recorded in the [runtime validation register](docs/RUNTIME-VALIDATION.md).
