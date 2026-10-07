@@ -77,5 +77,19 @@ A temporary WARP harness exercised the same interface query and confirmed
 the latter as skipped. Twelve capability/error cases were checked in both modes.
 Independent code review and `git diff --check` passed. Real-media, HDR display,
 NVIDIA inference and NAS acceptance were not run; the runtime register stays open.
-Next: verify the public commit's Actions result and package. A CI skip must never
-be reported as GPU acceptance.
+Result: public commit `2cd59f7` passed [Windows CI](https://github.com/maddoxhuang/Quaddeck/actions/runs/37626252438)
+with 13 tests passed and 2 GPU tests skipped for missing video interfaces.
+The uploaded ZIP was downloaded and checked against the source documents and shaders.
+A CI skip must never be reported as GPU acceptance.
+
+## README language review - 2026-10-08
+
+Agent: Codex
+Public baseline: `2cd59f7`.
+Scope: natural English usage guidance, concise settings and playback instructions,
+and a GridPlayer inspiration credit requested by the maintainer. Removed outdated
+implementation history and an unrelated source-copying disclaimer; retained shader
+attribution, dependency licences and compatibility guidance.
+Validation: document links, section anchors, English text and package consistency.
+Application sources, build configuration and binaries are unchanged; no native
+rebuild or additional runtime test is required for this documentation edit.
