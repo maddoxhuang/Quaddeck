@@ -1,0 +1,33 @@
+#include "resource.h"
+#include <windows.h>
+
+IDI_QUADDECK ICON "../assets/QuadDeck.ico"
+
+// The two places the player takes typed text: an Emby sign-in and a search
+// term. Native dialogs, because an edit control with IME is not something
+// the drawn interface reproduces.
+IDD_EMBY_SIGNIN DIALOGEX 0, 0, 268, 112
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Sign in to Emby"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Server", IDC_STATIC, 12, 14, 48, 10
+    EDITTEXT        IDC_EMBY_SERVER, 64, 12, 192, 13, ES_AUTOHSCROLL
+    LTEXT           "User", IDC_STATIC, 12, 36, 48, 10
+    EDITTEXT        IDC_EMBY_USER, 64, 34, 192, 13, ES_AUTOHSCROLL
+    LTEXT           "Password", IDC_STATIC, 12, 58, 48, 10
+    EDITTEXT        IDC_EMBY_PASSWORD, 64, 56, 192, 13, ES_AUTOHSCROLL | ES_PASSWORD
+    DEFPUSHBUTTON   "Sign in", IDOK, 148, 86, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 206, 86, 50, 14
+END
+
+IDD_EMBY_SEARCH DIALOGEX 0, 0, 268, 64
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Search Emby"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT           "Title contains", IDC_STATIC, 12, 14, 60, 10
+    EDITTEXT        IDC_EMBY_SEARCH_TERM, 76, 12, 180, 13, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Search", IDOK, 148, 38, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 206, 38, 50, 14
+END

@@ -1,0 +1,13 @@
+#pragma once
+
+#define IDI_QUADDECK 101
+
+#define IDD_EMBY_SIGNIN 201
+#define IDD_EMBY_SEARCH 202
+#define IDC_EMBY_SERVER 1001
+#define IDC_EMBY_USER 1002
+#define IDC_EMBY_PASSWORD 1003
+#define IDC_EMBY_SEARCH_TERM 1004
+#ifndef IDC_STATIC
+#define IDC_STATIC -1
+#endif

@@ -1,0 +1,43 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+
+      - uses: lukka/run-cmake@v10
+        with:
+          configurePreset: windows-release
+          buildPreset: windows-release
+          testPreset: windows-release
+
+      - name: Stage runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/QuadDeck | Out-Null
+          Copy-Item build/windows/Release/QuadDeck.exe dist/QuadDeck/
+          Copy-Item build/windows/vcpkg_installed/x64-windows/bin/*.dll dist/QuadDeck/
+          Copy-Item README.md,CHANGELOG.md,LICENSE dist/QuadDeck/
+          Copy-Item shaders dist/QuadDeck/ -Recurse
+          New-Item -ItemType Directory -Force dist/QuadDeck/licenses | Out-Null
+          Get-ChildItem build/windows/vcpkg_installed/x64-windows/share -Directory | ForEach-Object {
+            $c = Join-Path $_.FullName copyright
+            if (Test-Path $c -PathType Leaf) { Copy-Item $c "dist/QuadDeck/licenses/$($_.Name).txt" }
+          }
+          Compress-Archive dist/QuadDeck dist/QuadDeck-win-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuadDeck-win-x64
+          path: dist/QuadDeck-win-x64.zip

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>QuadDeck: three panes and play</title>
+  <rect x="8" y="8" width="240" height="240" rx="48" fill="#102238"/>
+  <rect x="40" y="40" width="72" height="72" rx="10" fill="#36DBF2"/>
+  <rect x="136" y="40" width="72" height="72" rx="10" fill="#36DBF2"/>
+  <rect x="40" y="136" width="72" height="72" rx="10" fill="#36DBF2"/>
+  <polygon points="144,132 216,180 144,228" fill="#FFFFFF"/>
+</svg>

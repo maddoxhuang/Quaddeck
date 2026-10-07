@@ -1,0 +1,15 @@
+{
+  "name": "quaddeck",
+  "version-semver": "1.0.0",
+  "license": "GPL-3.0-only",
+  "builtin-baseline": "aae277acf4e7de287ddb5e208b5316614de6aad7",
+  "description": "A synchronized four-video FFmpeg + Direct3D 11 player for Windows",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": true
+    },
+    "nlohmann-json",
+    "libass"
+  ]
+}
