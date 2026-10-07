@@ -1,15 +1,46 @@
-# QuadDeck 1.0.0
+<p align="center">
+  <img src="https://raw.githubusercontent.com/maddoxhuang/Quaddeck/main/assets/QuadDeck.png" alt="QuadDeck icon" width="112" height="112">
+</p>
 
-A native Windows player for several videos in sync. Up to five videos are composed in one window and one D3D11 swap chain, with repeated adds, independent seek bars, staggered starts, hardware decoding, pixel shaders and full mouse control.
+<h1 align="center">QuadDeck</h1>
 
-Codex, Claude Code and human developers who change this project must first read
-[`docs/AI-WORKFLOW.md`](docs/AI-WORKFLOW.md). It requires a separate
-worktree and branch per tool, names the owner of each high-risk module, and
-uses one set of MSVC/vcpkg commands for handoff verification.
+<p align="center">
+  <strong>Five videos. One window. Your timeline.</strong><br>
+  A native Windows player with synchronised or independent playback,<br>
+  hardware acceleration, Emby integration and styled subtitles.
+</p>
 
-Release notes are in [CHANGELOG.md](CHANGELOG.md). Technical and contributor documentation is in [ARCHITECTURE.md](ARCHITECTURE.md) and `docs/`.
+<p align="center">
+  <a href="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml"><img src="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml/badge.svg?branch=main" alt="Windows Build status"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-1.0.0-0891b2" alt="Version 1.0.0"></a>
+  <a href="#upgrading-and-building"><img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078d4" alt="Windows 10 / 11"></a>
+  <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-20-00599c" alt="C++20"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-16a34a" alt="GPL-3.0 licence"></a>
+</p>
+
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#feature-overview">Features</a> ·
+  <a href="#keyboard-shortcuts">Shortcuts</a> ·
+  <a href="CHANGELOG.md">Changelog</a> ·
+  <a href="https://github.com/maddoxhuang/Quaddeck/issues">Report an issue</a>
+</p>
+
+---
 
 ## Feature overview
+
+| | What you can do |
+| :--- | :--- |
+| **Five video panes** | Combine up to five videos, choose a layout, focus one pane or drag to swap. |
+| **Your choice of timeline** | Link playback, seek independently or offset each video against the master timeline. |
+| **Audio per pane** | Mix several sources and control each pane's volume, mute and audio track. |
+| **Local files + Emby** | Browse folders or your Emby library and build a separate queue for each pane. |
+| **Styled subtitles** | Render ASS / SSA with libass, including attached fonts, or load SRT / WebVTT. |
+| **GPU decoding + shaders** | Use D3D11VA, live Vibrance+ controls and RTX Video features on supported setups. |
+
+<details>
+<summary><strong>Explore all features</strong></summary>
 
 - **Synchronised playback:** up to five videos composed in one window and one D3D11 swap chain, following one master timeline. Pressing play, a master A-B loop wrapping around and a joint restart use an exact synchronised seek: every pane presents its target frame, then all start together.
 - **Per-pane Offset:** each pane has a signed offset (seconds, fractions allowed) from the master time. The `0` key zeroes every Offset at once, paying for one synchronised seek.
@@ -32,7 +63,15 @@ Release notes are in [CHANGELOG.md](CHANGELOG.md). Technical and contributor doc
 - **Interface:** the bottom bar, per-pane labels and buttons, notices and the settings sheet are all drawn with Direct2D over the video and hide themselves; the process declares Per-Monitor V2 DPI awareness.
 - **No title bar:** like PotPlayer's "auto-hide under video", the window has no Windows title bar and the picture fills the whole window; the title and the minimise, maximise and close buttons are drawn along the top edge and appear and hide with the bottom bar.
 
-The [1.0.0 release notes](CHANGELOG.md) summarise the initial public release. The sections below describe current use.
+</details>
+
+## Get started
+
+- **Build locally:** follow the [requirements and build instructions](#build-from-source) to create the Windows application and portable ZIP.
+- **Try a CI build:** sign in to GitHub, open [Windows Build](https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml), choose a successful run for `main` and download **QuadDeck-win-x64** under **Artifacts**. Extract the downloaded artifact, then the `QuadDeck-win-x64.zip` inside it; run `QuadDeck\QuadDeck.exe` with its DLLs beside it. A run must finish successfully before its package is available.
+- **Start watching:** press `O` or drop videos into the window, use `F6` for the local list, and `Ctrl+E` for Emby. Open `F5` to adjust playback, audio, subtitles and picture settings.
+
+The [1.0.0 release notes](CHANGELOG.md) summarise this release. See [compatibility guidance](#settings-and-compatibility) before replacing an existing installation.
 
 ## The bottom bar and settings
 
@@ -179,6 +218,18 @@ The hardware path reads nothing back from video memory. Software frames are conv
 - Per-Monitor V2 DPI awareness is declared, but re-layout while moving the window between monitors of different scaling has not been verified on real hardware.
 
 For a problem report, send the complete window title and the `QuadDeck.log` beside the EXE. When the program has hung (the window says "Not responding") for 4 seconds, the log records where every thread is stopped, again at 10 seconds, and how long the hang lasted once it recovers; all of that is written before you close the window, so killing it loses nothing. When the EXE's directory is not writable, the log is in `%LOCALAPPDATA%\QuadDeck`. The log contains the media paths that were opened; check it for private information before sharing.
+
+## Contributing
+
+Keep QuadDeck a native Windows C++20 application. Before changing the project, read
+[`docs/AI-WORKFLOW.md`](docs/AI-WORKFLOW.md) and the [handoff board](docs/handoffs/BOARD.md).
+They define worktree isolation, module ownership and the shared MSVC / CMake / vcpkg
+verification command for human contributors, Codex and Claude Code.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the implementation; the
+[runtime validation register](docs/RUNTIME-VALIDATION.md) records what has and has
+not been tested. Please keep documentation in English and include reproduction
+steps when [reporting a problem](https://github.com/maddoxhuang/Quaddeck/issues).
 
 ## Licence
 

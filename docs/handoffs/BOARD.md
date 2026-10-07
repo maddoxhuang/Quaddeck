@@ -50,3 +50,16 @@ Program sources and binaries are unchanged. Only README and CHANGELOG differ
 inside the archive; no native rebuild or runtime test was needed for this edit.
 Next: keep future documentation in English and publish only the independent
 public repository after the user supplies its remote.
+
+## README presentation - 2026-10-08
+
+Agent: Codex
+Scope: project icon, live build badge, version/platform/licence badges, feature
+summary, navigation, expandable feature details and practical getting-started links.
+Public baseline: `b18cc19` on `maddoxhuang/Quaddeck`.
+The icon uses the public source URL so the packaged README can display it online
+without requiring an extra assets directory. CI packages are identified as such;
+no published Release or completed CI result is implied.
+Validation: English text, document anchors and links, packaged README consistency
+and unchanged executable/dependency hashes. No native rebuild was needed.
+Next: review the rendered public README and retain the existing runtime checklist.
