@@ -1,0 +1,17 @@
+/build/
+/out/
+/dist/
+/.vs/
+/.vscode/
+*.user
+*.VC.db
+*.suo
+*.log
+
+# Runtime state, personal sessions and debugging artifacts are local only.
+*.qauth
+*.qconfig
+*.qdeck
+*.qstyle
+*.pdb
+*.dmp

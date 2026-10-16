@@ -1,0 +1,5 @@
+# Keep line endings consistent across development environments.
+* text=auto eol=lf
+
+*.ico binary
+*.png binary

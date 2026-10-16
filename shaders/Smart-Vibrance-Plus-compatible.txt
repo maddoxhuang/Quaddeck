@@ -1,0 +1,40 @@
+// Legacy QuadDeck adaptive approximation kept for existing presets.
+// Derived from aston89's Smart-vibrance-for-reshade (GPL-3.0,
+// https://github.com/aston89/Smart-vibrance-for-reshade); see LICENSE.
+// For the complete four-parameter Smart Vibrance Plus effect, select the
+// native "Smart Vibrance Plus" preset in QuadDeck's Pixel shader settings.
+Texture2D videoTexture : register(t0);
+SamplerState videoSampler : register(s0);
+
+float sigmoid(float x)
+{
+    return 1.0 / (1.0 + exp(-x));
+}
+
+float3 AdjustColor(float3 color, float intensity, float sceneActivity)
+{
+    float luminance = dot(color, float3(0.2126, 0.7152, 0.0722));
+    float3 chroma = color - luminance;
+    float chromaEnergy = dot(chroma, chroma);
+    float chromaMag = sqrt(chromaEnergy);
+    float satRef = lerp(0.35, 0.65, sceneActivity);
+    float grayRef = lerp(0.006, 0.0015, sceneActivity);
+    float normSat = saturate(chromaMag / satRef);
+    float rolloff = 1.0 - normSat;
+    float graySoft = sigmoid((grayRef - chromaEnergy) * 45.0);
+    float response = lerp(rolloff, 1.0, graySoft);
+    float gain = (intensity - 1.0) * response;
+    return luminance + chroma + chroma * gain;
+}
+
+float4 main(float4 position : SV_POSITION, float2 texCoord : TEXCOORD0) : SV_TARGET
+{
+    float4 inputColor = videoTexture.Sample(videoSampler, texCoord);
+    float luminance = dot(inputColor.rgb, float3(0.2126, 0.7152, 0.0722));
+    float3 chroma = inputColor.rgb - luminance;
+    float chromaEnergy = dot(chroma, chroma);
+    float sceneActivity = saturate(chromaEnergy * 10.0);
+    float stabilityBoost = 1.0 - saturate(chromaEnergy * 5.0);
+    float intensity = 2.0 * lerp(0.85, 1.0, sceneActivity) * stabilityBoost;
+    return float4(saturate(AdjustColor(inputColor.rgb, intensity, sceneActivity)), inputColor.a);
+}

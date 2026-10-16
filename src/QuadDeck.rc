@@ -1,0 +1,6 @@
+#include "resource.h"
+#include <windows.h>
+
+IDI_QUADDECK ICON "../assets/QuadDeck.ico"
+
+// The sign-in form and search box are drawn in the sheet (AppTextFields.cpp).
