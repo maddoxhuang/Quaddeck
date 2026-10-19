@@ -151,17 +151,11 @@ std::wstring subtitleTrackLabel(const SubtitleTrackInfo& track) {
     return label;
 }
 
-// A menu takes `&` as the mark of a shortcut letter and a tab as the start
-// of the key column; a file name means neither.
+// A menu's line is one line: a tab in a file name, which DirectWrite would
+// stretch to its next stop, is a space. An `&` is drawn as it is.
 std::wstring menuText(std::wstring text) {
-    std::wstring escaped;
-    escaped.reserve(text.size());
-    for (const wchar_t character : text) {
-        if (character == L'\t') { escaped += L' '; continue; }
-        escaped += character;
-        if (character == L'&') escaped += L'&';
-    }
-    return escaped;
+    std::replace(text.begin(), text.end(), L'\t', L' ');
+    return text;
 }
 
 std::wstring signedSeconds(double value) {
@@ -335,8 +329,8 @@ void App::selectSubtitle(std::size_t pane, const SubtitleSelection& selection, b
     if (byViewer) subtitleChosenByViewer_[pane] = true;
     // The Subtitles menu has no switch of its own: a subtitle picked from it
     // or stepped to is one the viewer wants to see.
-    if (byViewer && selection.kind != SubtitleKind::None && !subtitleSettings_.show) {
-        subtitleSettings_.show = true;
+    if (byViewer && selection.kind != SubtitleKind::None && !subtitlesShownFor(subtitleSettings_, pane)) {
+        setSubtitlesShownFor(subtitleSettings_, pane, true);
         scheduleAppSettingsSave();
     }
     subtitles_[pane].reset();
@@ -632,33 +626,40 @@ int App::subtitlePane() const {
     return first;
 }
 
-void App::toggleSubtitlesShown() {
-    subtitleSettings_.show = !subtitleSettings_.show;
-    showNotice(subtitleSettings_.show ? L"Subtitles shown" : L"Subtitles hidden");
+// "V2 subtitles" beside other videos, "Subtitles" for the only one.
+std::wstring App::subtitleNoticeName(std::size_t pane) const {
+    return severalPanesLoaded() ? paneLabel(pane) + L" subtitles" : std::wstring(L"Subtitles");
+}
+
+void App::toggleSubtitlesShown(std::size_t pane) {
+    if (pane >= kMaxPanes) return;
+    const bool shown = !subtitlesShownFor(subtitleSettings_, pane);
+    setSubtitlesShownFor(subtitleSettings_, pane, shown);
+    showNotice(subtitleNoticeName(pane) + (shown ? L" shown" : L" hidden"));
     scheduleAppSettingsSave();
 }
 
-bool App::subtitlesSwitchedOn() const {
-    if (!subtitleSettings_.show) return false;
-    const int pane = subtitlePane();
-    return pane < 0 || subtitleSelection_[static_cast<std::size_t>(pane)].kind != SubtitleKind::None;
+bool App::subtitlesSwitchedOn(int pane) const {
+    if (pane < 0 || pane >= static_cast<int>(kMaxPanes)) return false;
+    const auto index = static_cast<std::size_t>(pane);
+    return subtitlesShownFor(subtitleSettings_, index) && subtitleSelection_[index].kind != SubtitleKind::None;
 }
 
-void App::toggleSubtitles() {
-    const int target = subtitlePane();
-    if (target < 0 || subtitleSelection_[static_cast<std::size_t>(target)].kind != SubtitleKind::None) {
-        toggleSubtitlesShown();
+void App::toggleSubtitles(int target) {
+    if (target < 0 || target >= static_cast<int>(sources_.size())) return;
+    const auto pane = static_cast<std::size_t>(target);
+    if (subtitleSelection_[pane].kind != SubtitleKind::None) {
+        toggleSubtitlesShown(pane);
         return;
     }
-    const auto pane = static_cast<std::size_t>(target);
     // Nothing chosen for this video: what the player would have chosen, the
     // viewer's earlier choice of Off notwithstanding.
     const auto options = subtitleOptions(pane);
     const int best = preferredSubtitle(pane, options, -1);
     if (best < 0) {
-        // The other videos' lines come back all the same.
-        if (!subtitleSettings_.show) {
-            subtitleSettings_.show = true;
+        // A file loaded for it later is shown.
+        if (!subtitlesShownFor(subtitleSettings_, pane)) {
+            setSubtitlesShownFor(subtitleSettings_, pane, true);
             scheduleAppSettingsSave();
         }
         showNotice(L"This video has no subtitles  (Alt+O loads a file)");
@@ -749,7 +750,7 @@ void App::setSubtitleLanguage(int language) {
 bool App::handleAltKey(WPARAM key) {
     const int pane = subtitlePane();
     switch (key) {
-    case 'H': toggleSubtitles(); return true;
+    case 'H': toggleSubtitles(pane); return true;
     case 'L': if (pane >= 0) cycleSubtitle(static_cast<std::size_t>(pane)); return true;
     case 'O': if (pane >= 0) loadSubtitleDialog(static_cast<std::size_t>(pane)); return true;
     case VK_PRIOR: setSubtitleSize(subtitleSettings_.size + 0.1F); return true;
@@ -868,11 +869,12 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
     // libass raises the bottom lines by a share of the height between their
     // place and the top of the frame.
     double raise = static_cast<double>(subtitleSettings_.position) * 100.0;
-    // Clear of the transport bar while it is up, as far as it reaches into
-    // the frame -- at once when it is half in, not with every frame of its
-    // slide, for each change of the line position empties libass's caches.
-    if (dockProgress_ > 0.5F) {
-        const double cover = paneCoveredBottom(cell, true) -
+    // Clear of the transport bar and of the pane's strip while they are up,
+    // as far as they reach into the frame -- at once when each is half in,
+    // not with every frame of its slide or fade, for each change of the line
+    // position empties libass's caches.
+    if (const float clearance = paneSubtitleClearance(pane, true); clearance > 0.0F) {
+        const double cover = static_cast<double>(clearance) -
                              (static_cast<double>(cell.y + cell.height) - (placement.originY + frame.height));
         if (cover > 0.0) raise += 100.0 * cover / frame.height;
     }
@@ -883,8 +885,9 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
 // ---------------------------------------------------------------------------
 // The menu
 
-// What to show; showing and hiding them is the bar's switch and Alt+H.
-void App::appendSubtitleMenu(HMENU menu, std::size_t pane) const {
+// What to show; showing and hiding them is the video's switch -- on its
+// strip, or the bar's with one video -- and Alt+H.
+void App::appendSubtitleMenu(PanelMenu& menu, std::size_t pane) const {
     const bool loaded = pane < sources_.size() && paneLogicallyLoaded(pane);
     const auto options = loaded ? subtitleOptions(pane) : std::vector<SubtitleOption>{};
     const SubtitleSelection selection = loaded ? subtitleSelection_[pane] : SubtitleSelection{};
@@ -894,45 +897,35 @@ void App::appendSubtitleMenu(HMENU menu, std::size_t pane) const {
     subtitleMenuOptions_ = options;
     subtitleMenuPane_ = loaded ? static_cast<int>(pane) : -1;
     subtitleMenuSerial_ = loaded ? subtitleSerial_[pane] : 0;
-    AppendMenuW(menu, MF_STRING | (selection.kind == SubtitleKind::None ? MF_CHECKED : 0) |
-                (loaded ? 0 : MF_GRAYED), CmdSubtitleOff, L"Off");
+    menu.option(CmdSubtitleOff, L"Off", selection.kind == SubtitleKind::None, {}, loaded);
     for (std::size_t choice = 0; choice < options.size() && choice < kSubtitleMenuLimit; ++choice) {
-        AppendMenuW(menu, MF_STRING | (options[choice].what == selection ? MF_CHECKED : 0) |
-                    (options[choice].usable ? 0 : MF_GRAYED),
-                    CmdSubtitleFirst + static_cast<unsigned>(choice), menuText(options[choice].label).c_str());
+        menu.option(CmdSubtitleFirst + static_cast<unsigned>(choice), menuText(options[choice].label),
+                    options[choice].what == selection, {}, options[choice].usable);
     }
     if (options.size() > kSubtitleMenuLimit) {
-        const std::wstring more = std::to_wstring(options.size() - kSubtitleMenuLimit) +
-                                  L" more  (Alt+L steps through them all)";
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, more.c_str());
+        menu.option(0, std::to_wstring(options.size() - kSubtitleMenuLimit) + L" more  (Alt+L steps through them all)",
+                    false, {}, false);
     }
-    AppendMenuW(menu, MF_STRING | (options.empty() ? MF_GRAYED : 0), CmdSubtitleCycle, L"Next subtitle\tAlt+L");
-    AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), CmdSubtitleLoad, L"Load subtitle file...\tAlt+O");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    menu.separator();
+    menu.option(CmdSubtitleCycle, L"Next subtitle", false, L"Alt+L", !options.empty());
+    menu.option(CmdSubtitleLoad, L"Load subtitle file...", false, L"Alt+O", loaded);
+    menu.separator();
     const bool timed = loaded && selection.kind != SubtitleKind::None;
-    AppendMenuW(menu, MF_STRING | (timed ? 0 : MF_GRAYED), CmdSubtitleEarlier, L"Earlier by 0.5 s\t.");
-    AppendMenuW(menu, MF_STRING | (timed ? 0 : MF_GRAYED), CmdSubtitleLater, L"Later by 0.5 s\t,");
-    const std::wstring reset = L"Timing as in the file  (now " +
-                               signedSeconds(loaded ? subtitleDelay_[pane] : 0.0) + L")\t/";
-    AppendMenuW(menu, MF_STRING | (timed && subtitleDelay_[pane] != 0.0 ? 0 : MF_GRAYED), CmdSubtitleSyncReset,
-                reset.c_str());
+    menu.option(CmdSubtitleEarlier, L"Earlier by 0.5 s", false, L".", timed);
+    menu.option(CmdSubtitleLater, L"Later by 0.5 s", false, L",", timed);
+    menu.option(CmdSubtitleSyncReset,
+                L"Timing as in the file  (now " + signedSeconds(loaded ? subtitleDelay_[pane] : 0.0) + L")", false,
+                L"/", timed && subtitleDelay_[pane] != 0.0);
 }
 
-void App::showSubtitleMenu(int pane, POINT screenPoint) {
-    contextPane_ = pane;
-    contextMenuOpen_ = true;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) { contextMenuOpen_ = false; contextPane_ = -1; return; }
+void App::showSubtitleMenu(int pane, WindowMenuAnchor anchor) {
+    PanelMenu menu;
     appendSubtitleMenu(menu, pane >= 0 ? static_cast<std::size_t>(pane) : kMaxPanes);
-    const unsigned command = TrackPopupMenuEx(
-        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, window_, nullptr);
-    if (command) handleContextCommand(command, pane);
-    DestroyMenu(menu);
-    subtitleMenuOptions_.clear();
-    subtitleMenuPane_ = -1;
-    subtitleMenuSerial_ = 0;
-    contextMenuOpen_ = false;
-    contextPane_ = -1;
+    openWindowMenu(std::move(menu), anchor,
+                   [this, snapshot = takePaneMenuSnapshot(), pane](unsigned command) {
+                       runPaneMenuCommand(snapshot, command, pane);
+                   },
+                   pane);
 }
 
 }  // namespace quaddeck

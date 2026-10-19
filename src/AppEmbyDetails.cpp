@@ -353,21 +353,21 @@ void App::embyDetailAction(int action) {
     const auto item = detail.item;
     auto queue = emby::takeQueue(detail.sourceItems, detail.sourceChosen, detail.sourcePage);
     const bool add = action >= 3;
-    bool fromBeginning = false;
     if (action == 1 || action == 4) {
         const auto account = embyAccountSerial_;
         const auto serial = detail.serial;
-        HMENU menu = CreatePopupMenu();
-        if (!menu) return;
-        AppendMenuW(menu, MF_STRING, 1, hasResume(item) ? L"Resume" : L"Play");
-        AppendMenuW(menu, MF_STRING, 2, L"From beginning");
-        const auto command = showPanelMenu(menu, SettingId::EmbyDetailAction, action);
-        if (!command || command > 2 || account != embyAccountSerial_ || !embyDetails_ ||
-            !settingsOpen_ || !embyBrowserOpen_ ||
-            embyDetails_->serial != serial || embyDetails_->item.id != item.id) return;
-        fromBeginning = command == 2;
+        PanelMenu menu;
+        menu.option(1, hasResume(item) ? L"Resume" : L"Play").option(2, L"From beginning");
+        openPanelMenu(std::move(menu), SettingId::EmbyDetailAction, action, -1,
+                      [this, account, serial, item, queue = std::move(queue), add](unsigned command) mutable {
+            if (!command || command > 2 || account != embyAccountSerial_ || !embyDetails_ ||
+                !settingsOpen_ || !embyBrowserOpen_ ||
+                embyDetails_->serial != serial || embyDetails_->item.id != item.id) return;
+            embyRequestPlay(item, std::move(queue), add, command == 2);
+        });
+        return;
     }
-    embyRequestPlay(item, std::move(queue), add, fromBeginning);
+    embyRequestPlay(item, std::move(queue), add, false);
 }
 
 void App::embyDetailEpisodeAction(int index, int action) {
@@ -377,23 +377,23 @@ void App::embyDetailEpisodeAction(int index, int action) {
     if (!emby::isPlayableVideo(item)) return;
     if (action < 0 || action > 4) return;
     auto queue = emby::takeQueue(detail.episodes, index, "detail-season:" + detail.item.id + "/" + detail.seasonId);
-    bool add = action >= 2;
-    bool fromBeginning = action == 1 || action == 3;
+    const bool add = action >= 2;
+    const bool fromBeginning = action == 1 || action == 3;
     if (action == 4) {
         const auto account = embyAccountSerial_;
         const auto serial = detail.serial;
         const auto seasonId = detail.seasonId;
-        HMENU menu = CreatePopupMenu();
-        if (!menu) return;
-        const std::wstring target = L"Play from beginning \u2192 V" + std::to_wstring(positionForPane(embyPlaybackTarget()) + 1);
-        AppendMenuW(menu, MF_STRING, 1, target.c_str());
-        AppendMenuW(menu, MF_STRING, 2, L"Add from beginning");
-        const auto command = showPanelMenu(menu, SettingId::EmbyDetailEpisode, action, index);
-        if (!command || command > 2 || account != embyAccountSerial_ || !embyDetails_ ||
-            !settingsOpen_ || !embyBrowserOpen_ ||
-            embyDetails_->serial != serial || embyDetails_->seasonId != seasonId) return;
-        add = command == 2;
-        fromBeginning = true;
+        PanelMenu menu;
+        menu.option(1, L"Play from beginning \u2192 V" + std::to_wstring(positionForPane(embyPlaybackTarget()) + 1))
+            .option(2, L"Add from beginning");
+        openPanelMenu(std::move(menu), SettingId::EmbyDetailEpisode, action, index,
+                      [this, account, serial, seasonId, item, queue = std::move(queue)](unsigned command) mutable {
+            if (!command || command > 2 || account != embyAccountSerial_ || !embyDetails_ ||
+                !settingsOpen_ || !embyBrowserOpen_ ||
+                embyDetails_->serial != serial || embyDetails_->seasonId != seasonId) return;
+            embyRequestPlay(item, std::move(queue), command == 2, true);
+        });
+        return;
     }
     embyRequestPlay(item, std::move(queue), add, fromBeginning);
 }
@@ -455,6 +455,12 @@ std::vector<PanelRow> App::buildEmbyDetailRows(float clientWidth) const {
             formatTime(emby::secondsFromTicks(item.runTimeTicks)) + L"  \u00B7  " +
             formatTime(emby::secondsFromTicks(remaining)) + L" remaining";
     } else if (item.played) media.progressText = L"Watched";
+    // Its progress in the colour of the video playing it, the Play button
+    // in that of the video it names.
+    const auto marks = listRowMarks();
+    if (const auto playing = marks.embyPlaying.find(item.id); playing != marks.embyPlaying.end())
+        media.playingPosition = playing->second;
+    if (item.type != "Series") media.targetPosition = static_cast<int>(positionForPane(embyPlaybackTarget()));
     const auto target = L" → V" + std::to_wstring(positionForPane(embyPlaybackTarget()) + 1);
     hero.options = {item.type == "Series" ? L"Choose episode" : std::wstring(hasResume(item) ? L"Resume" : L"Play") + target,
                     item.type == "Movie" ? L"\u25BE" : L"",

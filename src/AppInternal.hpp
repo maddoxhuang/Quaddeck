@@ -87,7 +87,9 @@ enum ContextCommand : unsigned {
     CmdAudioTrackFirst, CmdAudioTrackLast = CmdAudioTrackFirst + 31,
     // An Emby item marked or unmarked as a favorite: a pane's, or the
     // browser item a right-click was on.
-    CmdEmbyFavorite
+    CmdEmbyFavorite,
+    // O's Open dialog, from the menu away from any pane.
+    CmdOpenFiles
 };
 
 // The arrangement's name as the sheet, the menu and the notice show it,

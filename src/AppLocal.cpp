@@ -65,16 +65,49 @@ bool isSessionFile(const std::wstring& path) {
     return _wcsicmp(std::filesystem::path(path).extension().c_str(), L".qdeck") == 0;
 }
 
+// A folder the list shows: not one Explorer hides, such as a drive's recycle
+// bin, and, walked for All videos, not a link to a folder elsewhere, which
+// can lead back above itself.
+bool listedFolder(const std::wstring& path, bool walking) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+        return false;
+    }
+    if (walking && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        WIN32_FIND_DATAW found{};
+        const HANDLE find = FindFirstFileW(path.c_str(), &found);
+        if (find == INVALID_HANDLE_VALUE) return false;
+        FindClose(find);
+        // A junction or a symbolic link; a cloud file's folder is walked.
+        if (IsReparseTagNameSurrogate(found.dwReserved0)) return false;
+    }
+    return true;
+}
+
+bool explorerOrder(const std::wstring& left, const std::wstring& right) {
+    return StrCmpLogicalW(left.c_str(), right.c_str()) < 0;
+}
+
 }  // namespace
 
-std::vector<LocalEntry> App::scanLocalFolder(const std::wstring& directory, std::wstring* error) {
+std::vector<LocalEntry> App::scanLocalFolder(const std::wstring& directory, std::wstring* error,
+                                             std::vector<std::wstring>* folders, bool walking) {
     if (error) error->clear();
+    if (folders) folders->clear();
     std::vector<LocalEntry> entries;
     if (directory.empty()) return entries;
     std::vector<std::wstring> subtitles;
     std::error_code code;
-    for (std::filesystem::directory_iterator entry(std::filesystem::path(directory), code), end;
+    for (std::filesystem::directory_iterator entry(std::filesystem::path(localListingPath(directory)), code), end;
          !code && entry != end; entry.increment(code)) {
+        if (folders) {
+            // A folder that cannot be looked at is left out, not the listing.
+            std::error_code kind;
+            if (entry->is_directory(kind) && !kind) {
+                if (listedFolder(entry->path().wstring(), walking)) folders->push_back(entry->path().wstring());
+                continue;
+            }
+        }
         const bool regular = entry->is_regular_file(code);
         if (code) break;
         if (!regular) continue;
@@ -102,14 +135,65 @@ std::vector<LocalEntry> App::scanLocalFolder(const std::wstring& directory, std:
                 *error = L"This folder could not be found.";
             else *error = L"This folder could not be read. Check the drive or network connection.";
         }
+        if (folders) folders->clear();
         return {};
     }
     // Explorer's ordering, so that "(2)" precedes "(10)" as it does on screen.
     std::sort(entries.begin(), entries.end(), [](const LocalEntry& left, const LocalEntry& right) {
-        return StrCmpLogicalW(left.path.c_str(), right.path.c_str()) < 0;
+        return explorerOrder(left.path, right.path);
     });
+    if (folders) std::sort(folders->begin(), folders->end(), explorerOrder);
     markSubtitleFiles(entries, subtitles);
     return entries;
+}
+
+LocalListing App::scanLocalListing(const std::wstring& directory, bool flat,
+                                   const std::atomic<std::uint64_t>* token, std::uint64_t serial) {
+    LocalListing listing;
+    std::vector<std::wstring> folders;
+    listing.entries = scanLocalFolder(directory, &listing.error, &folders, flat);
+    if (!listing.error.empty() || !flat) {
+        listing.folders = std::move(folders);
+        return listing;
+    }
+    if (listing.entries.size() > kLocalFlatLimit) {
+        listing.entries.resize(kLocalFlatLimit);
+        listing.capped = true;
+        return listing;
+    }
+    // Every video under it, as the tree is walked: each folder's own, then
+    // those of the folders in it, in turn. A folder in it that cannot be
+    // read is left out rather than the list.
+    struct Branch {
+        std::wstring path;
+        int depth{};
+    };
+    std::vector<Branch> pending;
+    const auto branchOut = [&](std::vector<std::wstring>& found, int depth) {
+        for (auto folder = found.rbegin(); folder != found.rend(); ++folder) pending.push_back({std::move(*folder), depth});
+    };
+    branchOut(folders, 1);
+    while (!pending.empty()) {
+        if (listing.entries.size() >= kLocalFlatLimit) {
+            listing.capped = true;
+            break;
+        }
+        // Superseded, or the player is gone.
+        if (token && token->load(std::memory_order_relaxed) != serial) return {};
+        Branch branch = std::move(pending.back());
+        pending.pop_back();
+        std::vector<std::wstring> inner;
+        auto videos = scanLocalFolder(branch.path, nullptr, branch.depth < kLocalFlatDepth ? &inner : nullptr, true);
+        const std::size_t room = kLocalFlatLimit - listing.entries.size();
+        if (videos.size() > room) {
+            videos.resize(room);
+            listing.capped = true;
+        }
+        listing.entries.insert(listing.entries.end(), std::make_move_iterator(videos.begin()),
+                               std::make_move_iterator(videos.end()));
+        branchOut(inner, branch.depth + 1);
+    }
+    return listing;
 }
 
 // The container's own idea of its length, in seconds, and whether it holds
@@ -148,16 +232,48 @@ LocalProbe App::probeLocalFile(const std::wstring& path, const std::atomic<std::
 
 void App::refreshLocalList(const std::wstring& path, bool force) {
     if (path.empty() || emby::isLocator(path) || path.find(L"://") != std::wstring::npos) return;
-    const std::wstring directory = localDirectory(path);
+    listLocalFolder(localDirectory(path), force);
+}
+
+void App::localFollowVideo(const std::wstring& path) {
+    if (path.empty() || emby::isLocator(path) || path.find(L"://") != std::wstring::npos) return;
+    // The same video again, or one the list already shows: the folder stays
+    // where the viewer took it, read again only if it was found empty.
+    const bool followed = !localDirectory_.empty() && path == localFollowedPath_;
+    localFollowedPath_ = path;
+    if (followed || localListHolds(path)) listLocalFolder(localDirectory_);
+    else refreshLocalList(path);
+}
+
+bool App::localListCovers(const std::wstring& path) const {
+    if (path.empty() || emby::isLocator(path)) return false;
+    return sameLocalDirectory(localDirectory(path), localDirectory_) ||
+           (localListFlat_ && localPathUnder(path, localDirectory_));
+}
+
+bool App::localListHolds(const std::wstring& path) const {
+    return !localList_.empty() && localListCovers(path) && localEntryIndex(localList_, path) >= 0;
+}
+
+void App::listLocalFolder(const std::wstring& directory, bool force) {
     if (directory.empty()) return;
     const bool sameFolder = sameLocalDirectory(directory, localDirectory_);
-    if (!force && sameFolder && (!localEntries_.empty() || localListLoading_)) return;
+    const bool flat = embyBrowser_.flat;
+    // Read with the folders, the folder is not read for every video under
+    // it, nor the other way round.
+    if (!force && sameFolder && flat == localListRequestFlat_ &&
+        (!localEntries_.empty() || !localFolders_.empty() || localListLoading_)) return;
     if (!sameFolder) {
-        // Another folder: nothing of the old one applies, its place in the
-        // list included.
+        // Another folder: nothing of the old one applies.
         localEntries_.clear();
         localList_.clear();
+        localFolders_.clear();
+        localListCapped_ = false;
         localProbes_.clear();
+    }
+    if (!sameFolder || flat != localListRequestFlat_) {
+        // Another folder, or another list of it: its place in the list goes
+        // too. What was read of its files is kept.
         localListScroll_ = 0.0F;
         if (embyBrowserOpen_ && browserSource_ == BrowserSource::Local) {
             settingsScroll_ = 0.0F;
@@ -168,6 +284,7 @@ void App::refreshLocalList(const std::wstring& path, bool force) {
     localDirectory_ = directory;
     localListError_.clear();
     localListLoading_ = true;
+    localListRequestFlat_ = flat;
     // A step that was waiting for the folder F6 showed until now is read
     // for on its own.
     if (!sameFolder && pendingFolderStep_) requestSiblingFolder(pendingFolderStep_->path);
@@ -177,19 +294,20 @@ void App::refreshLocalList(const std::wstring& path, bool force) {
     // date changed since -- a download or a copy that has finished -- or,
     // on a forced Refresh, it did not open.
     std::thread([queue = mainQueue_, token = localScanToken_.value, known = localProbes_, this, serial,
-                 directory, force] {
-        std::wstring error;
-        auto entries = scanLocalFolder(directory, &error);
+                 directory, flat, force] {
+        auto listing = scanLocalListing(directory, flat, token.get(), serial);
+        if (token->load(std::memory_order_relaxed) != serial) return;   // superseded, or the player is gone
         std::vector<LocalEntry> unread;
-        for (const auto& entry : entries) {
+        for (const auto& entry : listing.entries) {
             const auto found = known.find(entry.path);
             if (found == known.end() || !localProbeCurrent(found->second, entry) ||
                 (force && !found->second.opened)) {
                 unread.push_back(entry);
             }
         }
-        queue->post([this, serial, directory, entries = std::move(entries), error = std::move(error)]() mutable {
-            applyLocalList(serial, directory, std::move(entries), std::move(error));
+        queue->post([this, serial, directory, listing = std::move(listing)]() mutable {
+            applyLocalList(serial, directory, std::move(listing.entries), std::move(listing.error),
+                           std::move(listing.folders), listing.capped);
         });
         std::vector<std::pair<std::wstring, LocalProbe>> batch;
         auto lastPost = std::chrono::steady_clock::now();
@@ -217,7 +335,7 @@ void App::refreshLocalList(const std::wstring& path, bool force) {
 }
 
 void App::applyLocalList(std::uint64_t serial, std::wstring directory, std::vector<LocalEntry> entries,
-                        std::wstring error) {
+                        std::wstring error, std::vector<std::wstring> folders, bool capped) {
     if (serial != localListSerial_ || !sameLocalDirectory(directory, localDirectory_)) return;
     localListLoading_ = false;
     localListError_ = std::move(error);
@@ -228,6 +346,15 @@ void App::applyLocalList(std::uint64_t serial, std::wstring directory, std::vect
         runPendingFolderStep();
         return;
     }
+    // A folder row is its place among the folders: one pressed must not
+    // come to open another when a folder appears ahead of it.
+    if (folders != localFolders_ && settingsOpen_ && embyBrowserOpen_ && browserSource_ == BrowserSource::Local) {
+        panelPressArmed_ = false;
+        pressedPanelKind_ = PanelHitKind::None;
+    }
+    localFolders_ = std::move(folders);
+    localListFlat_ = localListRequestFlat_;
+    localListCapped_ = capped;
     localEntries_ = std::move(entries);
     // A file changed since it was read shows no length until it is read
     // again, rather than the old one.
@@ -239,8 +366,10 @@ void App::applyLocalList(std::uint64_t serial, std::wstring directory, std::vect
         }
     }
     orderLocalList();
-    appendDiagnostic("Folder list: " + std::to_string(localEntries_.size()) + " videos in " +
-                     wideToUtf8Text(localDirectory_));
+    appendDiagnostic("Folder list: " + std::to_string(localEntries_.size()) +
+                     (localListFlat_ ? " videos under " : " videos and " + std::to_string(localFolders_.size()) +
+                                                              " folders in ") +
+                     wideToUtf8Text(localDirectory_) + (localListCapped_ ? " (stopped at the limit)" : ""));
     // A step key or an end may have been waiting for this folder.
     runPendingFolderStep();
 }
@@ -326,7 +455,7 @@ void App::openLocalList() {
     localCancelReplacement();
     embyCancelReplacement();
     if (settingsOpen_) rememberSheetScroll();
-    refreshLocalList(paths_[embyPlaybackTarget()]);
+    localFollowVideo(paths_[embyPlaybackTarget()]);
     if (!settingsOpen_) toggleSettingsPanel();
     embyBrowserOpen_ = true;
     browserSource_ = BrowserSource::Local;
@@ -338,56 +467,68 @@ void App::localNavigate(int part) {
     if (localPendingPlay_) { localCancelReplacement(); return; }
     switch (part) {
     case 0:
+        localOpenFolder(localParentFolder(localDirectory_));
+        break;
+    case 1:
         embyOpenBrowser();
         break;
-    case 1: {
+    case 2:
         retryLocalList();
         break;
-    }
     default:
         break;
     }
 }
 
+void App::localOpenFolder(const std::wstring& directory) {
+    if (directory.empty() || sameLocalDirectory(directory, localDirectory_)) return;
+    listLocalFolder(directory);
+}
+
 void App::retryLocalList() {
-    // refreshLocalList uses only its argument's parent folder. Keep this
-    // sheet on its folder even if another pane became the playback target.
-    if (!localDirectory_.empty()) refreshLocalList(localDirectory_ + L"\\", true);
+    // The folder this sheet shows, even if another pane became the
+    // playback target.
+    listLocalFolder(localDirectory_, true);
+}
+
+// Shared with the Emby browser's Folders and All videos, as the view and the
+// sort are: the folder is read again for the other one, from its top.
+void App::localSetFlat(bool flat) {
+    if (flat == embyBrowser_.flat) return;
+    embyBrowser_.flat = flat;
+    // The Emby page behind this list asks for the choice when it next shows.
+    if (embyPageAcceptsFlat()) embyRetireHiddenList();
+    listLocalFolder(localDirectory_);
 }
 
 void App::showLocalToolbarMenu(int part) {
-    if (part < 0 || part > 1) return;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
+    if (part < 0 || part > 2) return;
+    PanelMenu menu;
     if (part == 0) {
-        AppendMenuW(menu, MF_STRING | (embyBrowser_.view == 0 ? MF_CHECKED : 0), 1, L"List");
-        AppendMenuW(menu, MF_STRING | (embyBrowser_.view != 0 ? MF_CHECKED : 0), 2, L"Thumbnails");
+        menu.option(1, L"List", embyBrowser_.view == 0).option(2, L"Thumbnails", embyBrowser_.view != 0);
+    } else if (part == 2) {
+        menu.option(1, L"Folders", !embyBrowser_.flat).option(2, L"All videos", embyBrowser_.flat);
     } else {
         const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
         const int selected = std::max(0, localSortChoice(key));
         for (int choice = 0; choice < kLocalSortCount; ++choice) {
-            AppendMenuW(menu, MF_STRING | (choice == selected ? MF_CHECKED : 0),
-                        static_cast<UINT_PTR>(choice + 1), localSortName(choice));
+            menu.option(static_cast<unsigned>(choice + 1), localSortName(choice), choice == selected);
         }
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        const UINT direction = MF_STRING | (key == emby::SortKey::Random ? MF_GRAYED : 0);
-        AppendMenuW(menu, direction | (!embyBrowser_.descending ? MF_CHECKED : 0), 10, L"Ascending");
-        AppendMenuW(menu, direction | (embyBrowser_.descending ? MF_CHECKED : 0), 11, L"Descending");
     }
-    const unsigned command = showPanelMenu(menu, SettingId::LocalToolbar, part);
-    if (part == 0) {
-        if (command >= 1 && command <= 2) localSetView(static_cast<int>(command - 1));
-    } else if (command >= 1 && command <= kLocalSortCount) {
-        const auto key = localSortKey(static_cast<int>(command - 1));
-        // Direction has its own menu entries. Picking the checked key
-        // keeps its direction; choosing Random again retains its old action.
-        if (static_cast<int>(key) != embyBrowser_.sort || key == emby::SortKey::Random)
-            sortListBy(static_cast<int>(key));
-    } else if ((command == 10 || command == 11) &&
-               emby::sortKeyFromIndex(embyBrowser_.sort) != emby::SortKey::Random &&
-               embyBrowser_.descending != (command == 11)) {
-        sortListBy(embyBrowser_.sort);
-    }
+    openPanelMenu(std::move(menu), SettingId::LocalToolbar, part, -1, [this, part](unsigned command) {
+        if (part == 0 || part == 2) {
+            if (command >= 1 && command <= 2) {
+                if (part == 0) localSetView(static_cast<int>(command - 1));
+                else localSetFlat(command == 2);
+                // The click's own save ran when the menu opened (sortListBy
+                // saves for itself).
+                scheduleAppSettingsSave();
+            }
+        } else if (command >= 1 && command <= kLocalSortCount) {
+            // The checked key chosen again reverses it; Random reshuffles.
+            sortListBy(static_cast<int>(localSortKey(static_cast<int>(command - 1))));
+        }
+    });
 }
 
 // A folder has no posters: the shell's thumbnail is a frame of the video,
@@ -400,6 +541,12 @@ void App::localSetView(int part) {
 }
 
 void App::activateLocalItem(int index, bool add) {
+    if (index <= kLocalFolderParam) {
+        // A folder opens in the list; it has nothing to add.
+        const auto folder = static_cast<std::size_t>(kLocalFolderParam - index);
+        if (!add && folder < localFolders_.size()) localOpenFolder(std::wstring(localFolders_[folder]));
+        return;
+    }
     if (index < 0 || static_cast<std::size_t>(index) >= localList_.size()) return;
     // Copies: opening the file may refresh the browser, and each pane owns
     // the order from which it was started even when another folder is shown.
@@ -450,8 +597,7 @@ void App::localPlayItem(const std::wstring& path, const std::vector<LocalEntry>&
         if (!localPanes_[legacyPane] && !embyPanes_[legacyPane] && !legacyPath.empty() &&
             !emby::isLocator(legacyPath) && legacyPath.find(L"://") == std::wstring::npos) {
             LocalPanePlayback legacy;
-            if (sameLocalDirectory(localDirectory(legacyPath), localDirectory_) &&
-                localEntryIndex(localList_, legacyPath) >= 0) {
+            if (localListHolds(legacyPath)) {
                 legacy.queue = localList_;
             } else {
                 // The old folder can be an unavailable share. Capture its
@@ -792,7 +938,9 @@ void App::openExternalDeck() {
 
 void App::processExternalFiles() {
     // Modal timers also tick while a menu/common dialog is open. Wait until
-    // its owner is enabled and no press/drag or replacement choice is armed.
+    // its owner is enabled and no press/drag or replacement choice is armed,
+    // nor a menu of ours open, whose choice is about the panes as it shows
+    // them.
     GUITHREADINFO gui{sizeof(GUITHREADINFO)};
     const bool menuOpen = GetGUIThreadInfo(GetCurrentThreadId(), &gui) &&
                           (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE));
@@ -812,7 +960,7 @@ void App::processExternalFiles() {
         showNotice(L"The subtitle's folder is still being read; opening the next file first");
     }
     if (externalFilesProcessing_ || externalSubtitleLookup_ || localPendingPlay_ || embyPendingPlay_ ||
-        contextMenuOpen_ || menuOpen || (window_ && !IsWindowEnabled(window_)) ||
+        panelMenu_.has_value() || menuOpen || (window_ && !IsWindowEnabled(window_)) ||
         controlDrag_ != ControlDrag::None || panelPressArmed_ || draggingPane_ || pressedBarItem_ >= 0 ||
         pressedChipPane_ >= 0) return;
     externalFilesProcessing_ = true;
@@ -878,8 +1026,7 @@ void App::processExternalFiles() {
             continue;
         }
         std::vector<LocalEntry> queue;
-        const bool queueCached = sameLocalDirectory(localDirectory(path), localDirectory_) &&
-                                 localEntryIndex(localList_, path) >= 0;
+        const bool queueCached = localListHolds(path);
         const auto queueSort = emby::sortKeyFromIndex(embyBrowser_.sort);
         const bool queueDescending = embyBrowser_.descending;
         if (queueCached) {
@@ -1017,6 +1164,7 @@ std::vector<PanelRow> App::buildLocalReplacementRows(float) const {
         row.id = SettingId::LocalReplaceChoice;
         row.param = static_cast<int>(pane);
         row.label = L"V" + std::to_wstring(position + 1) + L" \x2014 " + title;
+        row.video = static_cast<int>(position);
         row.value = audioPaneEnabled(pane) ? L"Audio on" : L"Muted";
         row.tileKeys.push_back(slot ? slot->imageKey : localThumbnailKey(paths_[pane], 400));
         rows.push_back(std::move(row));
@@ -1033,11 +1181,33 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
         return param >= 0 && static_cast<std::size_t>(param) < localList_.size()
             ? &localList_[static_cast<std::size_t>(param)] : nullptr;
     };
+    const auto folderAt = [&](int param) -> const std::wstring* {
+        if (param > kLocalFolderParam) return nullptr;
+        const auto index = static_cast<std::size_t>(kLocalFolderParam - param);
+        return index < localFolders_.size() ? &localFolders_[index] : nullptr;
+    };
+    // Every video under the folder: one in a folder further in says which,
+    // after its own name, so a narrow sheet still shows the name.
+    const auto title = [&](const LocalEntry& entry) {
+        std::wstring name = localFileName(entry.path);
+        if (localListFlat_) {
+            const std::wstring folder = localRelativeFolder(entry.path, localDirectory_);
+            if (!folder.empty()) name += L"  \x00B7  " + folder;
+        }
+        return name;
+    };
     // Every local file being played is marked, including the same file
-    // independently opened in more than one pane.
-    const auto isPlaying = [&](int param) {
-        return param >= 0 && std::find(marks.localPlaying.begin(), marks.localPlaying.end(), param) !=
-                                 marks.localPlaying.end();
+    // independently opened in more than one pane: in the colour of the
+    // first of them on the screen.
+    const auto playingPosition = [&](int param) {
+        int position = -1;
+        for (std::size_t pane = 0; pane < kMaxPanes && param >= 0; ++pane) {
+            const int place = marks.localPositions[pane];
+            if (marks.localPlaying[pane] == param && place >= 0 && (position < 0 || place < position)) {
+                position = place;
+            }
+        }
+        return position;
     };
     const auto length = [](const LocalEntry& entry) {
         return entry.duration > 0.0 ? formatTime(entry.duration) : std::wstring();
@@ -1048,11 +1218,24 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
         return localHasSubtitles(entry) ? std::wstring(L"Sub") : std::wstring();
     };
     if (row.kind == PanelRowKind::Item) {
+        // A folder opens, as an Emby folder's row does.
+        if (const std::wstring* folder = folderAt(row.param)) {
+            row.label = localFileName(*folder);
+            row.value = L"\x203A";
+            return;
+        }
         const LocalEntry* entry = entryAt(row.param);
         if (!entry) return;
-        row.current = isPlaying(row.param);
+        row.playingPosition = playingPosition(row.param);
+        row.current = row.playingPosition >= 0;
         row.addAvailable = true;
-        row.label = localFileName(entry->path);
+        row.label = title(*entry);
+        // A narrow sheet cuts the folder off the label: the pointer resting
+        // on the row shows where the file is.
+        if (localListFlat_) {
+            const std::wstring folder = localRelativeFolder(entry->path, localDirectory_);
+            if (!folder.empty()) row.hint = folder + L"\\" + localFileName(entry->path);
+        }
         // Length and size side by side; the size alone until the length is read.
         const std::wstring time = length(*entry);
         row.value = time.empty() ? formatFileSize(entry->size) : time + L"   " + formatFileSize(entry->size);
@@ -1069,7 +1252,21 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
     row.tileProgress.clear();
     row.tileTags.clear();
     row.tileAddAvailable.clear();
+    row.tilePlaying.clear();
     for (std::size_t part = 0; part < count; ++part) {
+        // A folder's tile has no picture: the shell's would be its icon, or
+        // a slow look inside a share's folder. The tile shows its initial.
+        if (const std::wstring* folder = folderAt(row.tileParams[part])) {
+            row.options[part] = localFileName(*folder);
+            row.tileKeys.emplace_back();
+            row.tileBadges.emplace_back(L"Folder");
+            row.tileMarks.emplace_back();
+            row.tileProgress.push_back(0.0F);
+            row.tileTags.emplace_back();
+            row.tileAddAvailable.push_back(false);
+            row.tilePlaying.push_back(-1);
+            continue;
+        }
         const LocalEntry* entry = entryAt(row.tileParams[part]);
         if (!entry) {
             row.tileKeys.emplace_back();
@@ -1078,11 +1275,13 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
             row.tileProgress.push_back(0.0F);
             row.tileTags.emplace_back();
             row.tileAddAvailable.push_back(false);
+            row.tilePlaying.push_back(-1);
             continue;
         }
         row.tileAddAvailable.push_back(true);
-        if (isPlaying(row.tileParams[part])) row.selected = static_cast<int>(part);
-        row.options[part] = localFileName(entry->path);
+        row.tilePlaying.push_back(playingPosition(row.tileParams[part]));
+        if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
+        row.options[part] = title(*entry);
         row.tileKeys.push_back(localThumbnailKey(entry->path, imageWidth));
         // The length where the Emby tiles have theirs, the size at the left.
         const std::wstring time = length(*entry);
@@ -1113,12 +1312,15 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
     const PanelMetrics metrics;
     const float innerWidth = std::max(0.0F, sheetWidth - 2.0F * metrics.pad * uiScale_);
 
-    header(localDirectory_.empty() ? std::wstring(L"Folder") : localFileName(localDirectory_));
+    header(localDirectory_.empty() ? std::wstring(L"Folder") : localFolderCrumb(localDirectory_));
     {
         PanelRow row;
         row.kind = PanelRowKind::Buttons;
         row.id = SettingId::LocalNav;
-        row.options = {L"Emby\x2026", L"Refresh"};
+        // Up stays away at the top of a drive or a share, the others in
+        // their places.
+        row.options = {localParentFolder(localDirectory_).empty() ? L"" : L"\x2191 Up", L"Emby\x2026", L"Refresh"};
+        row.buttonMinWidth = kEmbyNavButtonWidth;
         rows.push_back(std::move(row));
     }
     {
@@ -1128,40 +1330,66 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
         const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
         std::wstring sort = localSortName(std::max(0, localSortChoice(key)));
         if (key != emby::SortKey::Random) sort += embyBrowser_.descending ? L" \x2193" : L" \x2191";
-        row.options = {embyBrowser_.view == 0 ? L"List \x25BE" : L"Thumbnails \x25BE", sort + L" \x25BE"};
+        row.options = {embyBrowser_.view == 0 ? L"List \x25BE" : L"Thumbnails \x25BE", sort + L" \x25BE",
+                       embyBrowser_.flat ? L"All videos \x25BE" : L"Folders \x25BE"};
         rows.push_back(std::move(row));
     }
     // The folder, the way around and the view stay under the header while
     // the list scrolls, as in the Emby browser.
     for (auto& row : rows) row.pinned = true;
-    if (localListLoading_) note(localList_.empty() ? L"Reading the folder\x2026" : L"Refreshing the folder\x2026");
+    // The folders of a folder listed with them; every video under it lists
+    // none.
+    const std::size_t folders = localListFlat_ ? 0 : localFolders_.size();
+    const bool nothing = localList_.empty() && folders == 0;
+    if (localListLoading_) note(nothing ? L"Reading the folder\x2026" : L"Refreshing the folder\x2026");
     else if (!localListError_.empty()) {
-        note(localListError_ + (localList_.empty() ? std::wstring() : L" Showing the last successful list."));
+        note(localListError_ + (nothing ? std::wstring() : L" Showing the last successful list."));
         rows.back().alert = true;
         PanelRow retry;
         retry.kind = PanelRowKind::Buttons;
         retry.id = SettingId::LocalRetry;
         retry.options = {L"Retry"};
         rows.push_back(std::move(retry));
-    } else if (localList_.empty()) note(L"No videos in this folder.");
-    if (!localList_.empty()) note(std::to_wstring(localList_.size()) + (localList_.size() == 1 ? L" video" : L" videos"));
+    } else if (nothing) note(localListFlat_ ? L"No videos in this folder or its subfolders." : L"No videos in this folder.");
+    if (!nothing) {
+        std::wstring count;
+        if (folders > 0) count = std::to_wstring(folders) + (folders == 1 ? L" folder" : L" folders");
+        if (!localList_.empty()) {
+            if (!count.empty()) count += L"  \x00B7  ";
+            count += std::to_wstring(localList_.size()) + (localList_.size() == 1 ? L" video" : L" videos");
+            if (localListFlat_) count += L", subfolders included";
+        }
+        note(std::move(count));
+        if (localListCapped_) {
+            note(L"Only the first " + std::to_wstring(kLocalFlatLimit) +
+                 L" are listed. Open a folder further in for the rest.");
+        }
+    }
 
     // The folder is not made row by row: a run says where its rows go and
     // which files they name, and fillLocalRowContent gives a row its text,
     // marks and pictures (withListRuns, or once it is near the screen).
+    // Its folders lead, as an Emby folder's do.
     std::vector<PanelListRun> listRuns;
-    if (!localList_.empty()) {
-        const int perLine = panelTilesPerLine(innerWidth, kThumbTile, uiScale_, metrics);
+    std::size_t listedRows = 0;
+    const int perLine = panelTilesPerLine(innerWidth, kThumbTile, uiScale_, metrics);
+    const auto listing = [&](std::size_t entries, int firstParam, int paramStep) {
+        if (entries == 0) return;
         PanelListRun run;
-        run.at = rows.size();
-        run.entries = localList_.size();
+        run.at = rows.size() + listedRows;
+        run.entries = entries;
         run.kind = embyBrowser_.view == 0 ? PanelRowKind::Item : PanelRowKind::Tiles;
         run.id = SettingId::LocalItem;
+        run.firstParam = firstParam;
+        run.paramStep = paramStep;
         run.perLine = perLine;
         run.tileWidth = panelTileWidthFor(innerWidth, perLine, uiScale_, metrics);
         run.tileAspect = 16.0F / 9.0F;
+        listedRows += run.rowCount();
         listRuns.push_back(run);
-    }
+    };
+    listing(folders, kLocalFolderParam, -1);
+    listing(localList_.size(), 0, 1);
     return withListRuns(std::move(rows), std::move(listRuns), runs);
 }
 

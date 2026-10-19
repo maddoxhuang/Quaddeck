@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -133,6 +134,11 @@ struct PanelMediaDetail {
     bool expanded{};
     bool compactActions{};
     float progress{};
+    // Places on the screen (0 for V1), -1 for none: the video playing this
+    // item, whose colour its progress is in, and the one its Play button
+    // names, whose colour the button is.
+    int playingPosition{-1};
+    int targetPosition{-1};
     // DirectWrite measurements at the current text-column width/scale.
     // The pure layout also works without a renderer, using conservative
     // text heights. App measures after building rows, before hit geometry.
@@ -194,8 +200,17 @@ struct PanelRow {
     // Choice: segments on one line, 0 for the sheet's default of three.
     int segmentsPerLine{};
     // Item: this row is the item being played. Tiles: `selected` is the
-    // tile being played (-1 for none); one entry per tile in these too.
+    // first tile being played (-1 for none); one entry per tile in these too.
     bool current{};
+    // The video playing it, by its place on the screen (0 for V1), whose
+    // colour the mark is drawn in: -1 for none. Tiles: one per tile.
+    int playingPosition{-1};
+    std::vector<int> tilePlaying;
+    // Toggle, Slider, Buttons and CompactItem rows about one video: its
+    // place on the screen (0 for V1), -1 for none. Its name is in a pale
+    // shade of that video's colour, a switch, slider or picture frame of it
+    // in the colour.
+    int video{-1};
     std::vector<std::wstring> tileMarks;    // top-left: "▶ 40%", "✓"
     std::vector<float> tileProgress;        // 0..1 along the picture's bottom, 0 for none
     // Item: an accent pill before the value ("Sub"). Tiles: one per tile,
@@ -302,6 +317,22 @@ inline std::vector<PanelRow> panelRowsWithRuns(std::vector<PanelRow> rows, const
     }
     while (next < rows.size()) result.push_back(std::move(rows[next++]));
     return result;
+}
+
+// The row that shows the entry `param` names in the list `id`; none when
+// no run of it lists the entry.
+inline std::optional<std::size_t> panelListRowOf(const std::vector<PanelListRun>& runs, SettingId id, int param) {
+    for (const auto& run : runs) {
+        if (run.id != id || run.paramStep == 0) continue;
+        const long long offset = static_cast<long long>(param) - run.firstParam;
+        if (offset % run.paramStep != 0) continue;
+        const long long entry = offset / run.paramStep;
+        if (entry < 0 || static_cast<unsigned long long>(entry) >= run.entries) continue;
+        const auto index = static_cast<std::size_t>(entry);
+        if (run.kind != PanelRowKind::Tiles) return run.at + index;
+        return run.at + index / static_cast<std::size_t>(std::max(1, run.perLine));
+    }
+    return std::nullopt;
 }
 
 // Calls `visit` with the index of every row that belongs to no run.
@@ -505,6 +536,55 @@ inline float panelScrollForThumbTop(const PanelLayout& layout, float scale, floa
     const float travel = layout.scrollbar.height - thumb.height;
     if (travel <= 0.0F) return 0.0F;
     return std::clamp((thumbTop - layout.scrollbar.y) / travel, 0.0F, 1.0F) * layout.maxScroll;
+}
+
+// A video being played, marked on the scrollbar where the list shows it:
+// `y` is the mark's middle, `position` the video's place on the screen
+// (0 for V1), whose colour it is drawn in, and `scroll` the scroll that
+// shows its row in the middle of the list.
+struct PanelScrollMark {
+    float y{};
+    int position{};
+    float scroll{};
+};
+
+// The scroll that brings the row `row`'s middle to the content's, as far as
+// the list's ends let it.
+inline float panelScrollCentring(const PanelLayout& layout, std::size_t row) {
+    const OverlayRect& box = layout.rows[row].row;
+    const float middle = box.y - layout.content.y + layout.scroll + box.height * 0.5F;
+    return std::clamp(middle - layout.content.height * 0.5F, 0.0F, layout.maxScroll);
+}
+
+// Where the scrollbar marks the row `row`: the thumb's middle once that row
+// is scrolled to the middle of the content, so a press on the mark, which
+// brings the thumb's middle under the pointer, shows the row. Negative for
+// a pinned row, one not laid out, or a sheet with nothing to scroll.
+inline float panelScrollMarkY(const PanelLayout& layout, std::size_t row, float scale) {
+    const OverlayRect thumb = panelScrollThumb(layout, scale);
+    if (!thumb.visible() || row < layout.pinnedRows || row >= layout.rows.size()) return -1.0F;
+    const float travel = std::max(0.0F, layout.scrollbar.height - thumb.height);
+    return layout.scrollbar.y + travel * (panelScrollCentring(layout, row) / layout.maxScroll) + thumb.height * 0.5F;
+}
+
+// A press at `y` on the scrollbar: how far below the thumb's top the
+// pointer holds it while it is dragged. On a mark, or within a few pixels
+// of one, the thumb goes where that mark's row is in the middle exactly --
+// a pixel of a long list's track is many rows. Else on the thumb it is
+// held where it was pressed, and on the track by its middle.
+inline float panelThumbGrab(const PanelLayout& layout, float scale, float y,
+                            const std::vector<PanelScrollMark>& marks) {
+    const OverlayRect thumb = panelScrollThumb(layout, scale);
+    const PanelScrollMark* nearest = nullptr;
+    for (const auto& mark : marks) {
+        const float distance = std::abs(mark.y - y);
+        if (distance <= 5.0F * scale && (!nearest || distance < std::abs(nearest->y - y))) nearest = &mark;
+    }
+    if (nearest && thumb.visible() && layout.maxScroll > 0.0F) {
+        const float travel = std::max(0.0F, layout.scrollbar.height - thumb.height);
+        return y - (layout.scrollbar.y + travel * (nearest->scroll / layout.maxScroll));
+    }
+    return y >= thumb.y && y <= thumb.bottom() ? y - thumb.y : thumb.height * 0.5F;
 }
 
 // 96-DPI metrics.

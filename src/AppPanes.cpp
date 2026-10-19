@@ -143,7 +143,7 @@ void App::openSource(std::size_t pane, const std::wstring& path, bool resetAdjus
     subtitleEmbeddedPending_[pane] = true;
     // The only video brings its folder with it: the list F6 shows and the
     // step keys walk.
-    if (singleLoadedPane() == static_cast<int>(pane)) refreshLocalList(path);
+    if (singleLoadedPane() == static_cast<int>(pane)) localFollowVideo(path);
     // A video opened by hand in another folder has its folder read now, off
     // this thread, so that its step keys and its end find it read.
     if (!localPanes_[pane]) requestSiblingFolder(path);
@@ -740,6 +740,12 @@ void App::swapPanes(std::size_t first, std::size_t second) {
     std::swap(subtitleChosenByViewer_[first], subtitleChosenByViewer_[second]);
     std::swap(subtitleEmbeddedPending_[first], subtitleEmbeddedPending_[second]);
     std::swap(subtitleDelay_[first], subtitleDelay_[second]);
+    {
+        // Whether its lines are shown goes with the video too.
+        const bool firstShown = subtitlesShownFor(subtitleSettings_, first);
+        setSubtitlesShownFor(subtitleSettings_, first, subtitlesShownFor(subtitleSettings_, second));
+        setSubtitlesShownFor(subtitleSettings_, second, firstShown);
+    }
     std::swap(assPanes_[first], assPanes_[second]);
     audio_.swapPaneSettings(first, second);
     const bool firstAudio = audioPaneEnabled(first);

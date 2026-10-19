@@ -37,6 +37,8 @@ constexpr wchar_t kGlyphHeartFill = L'\xEB52';
 constexpr wchar_t kGlyphHeart = L'\xEB51';
 constexpr wchar_t kGlyphChevronDown = L'\xE70D';
 constexpr wchar_t kGlyphSearch = L'\xE721';
+constexpr wchar_t kGlyphCheckMark = L'\xE73E';
+constexpr wchar_t kGlyphChevronRight = L'\xE76C';
 
 D2D1_COLOR_F rgba(int r, int g, int b, float a) {
     return D2D1::ColorF(r / 255.0F, g / 255.0F, b / 255.0F, a);
@@ -50,6 +52,40 @@ const D2D1_COLOR_F kPillEdge = rgba(255, 255, 255, 0.10F);
 const D2D1_COLOR_F kFavorite = rgba(236, 72, 96, 1.0F);
 // A note saying something went wrong, as a failed sign-in's.
 const D2D1_COLOR_F kAlert = rgba(255, 150, 130, 1.0F);
+
+// Each video's own colour, by its place on the screen: V1 the accent, so
+// one video looks as it always has, then orange, green, purple and pink,
+// all deep enough for white text. Whatever is about one video is lit in it:
+// its pane's pill, rails, lit chips and edges, its menu, its rows in the
+// sheet and the browser's marks of what it plays. -1 is no video: the
+// accent.
+D2D1_COLOR_F paneColor(int position, float alpha = 1.0F) {
+    switch (position) {
+    case 1: return rgba(226, 118, 28, alpha);
+    case 2: return rgba(46, 160, 80, alpha);
+    case 3: return rgba(150, 96, 232, alpha);
+    case 4: return rgba(214, 64, 152, alpha);
+    default: return rgba(63, 132, 232, alpha);
+    }
+}
+
+// `color` taken `amount` of the way to `toward`, keeping its alpha.
+D2D1_COLOR_F blend(D2D1_COLOR_F color, D2D1_COLOR_F toward, float amount) {
+    const float keep = 1.0F - amount;
+    return {color.r * keep + toward.r * amount, color.g * keep + toward.g * amount,
+            color.b * keep + toward.b * amount, color.a};
+}
+
+// The name of the item being played, in a pale shade of its video's colour.
+D2D1_COLOR_F paneTextColor(int position) {
+    return blend(paneColor(position), rgba(255, 255, 255, 1.0F), 0.62F);
+}
+
+// A glyph or words lit in a video's colour, on a ground of it: a paler
+// shade, V1's (and no video's) the accent's own.
+D2D1_COLOR_F paneInkColor(int position) {
+    return position >= 1 ? blend(paneColor(position), rgba(255, 255, 255, 1.0F), 0.7F) : rgba(190, 216, 255, 1.0F);
+}
 
 // The text caches: a layout or width unused this many frames (about two
 // seconds) goes -- a clock's string changes every second -- and beyond
@@ -83,6 +119,12 @@ D2D1_COLOR_F withAlpha(D2D1_COLOR_F color, float alpha) {
 
 D2D1_RECT_F toRect(const OverlayRect& box) {
     return D2D1::RectF(box.x, box.y, box.right(), box.bottom());
+}
+
+// A drop-down's chosen option stands out in the heavier face.
+OverlayTextStyle panelMenuLabelStyle(const PanelMenuItem& item) {
+    return item.kind == PanelMenuItemKind::Option && item.checked ? OverlayTextStyle::BodyBold
+                                                                  : OverlayTextStyle::Body;
 }
 
 }  // namespace
@@ -332,6 +374,17 @@ void Overlay::measureWrappedNote(PanelRow& row, float rowWidth, float scale) {
     row.measuredNoteScale = scale;
 }
 
+void Overlay::measurePanelMenu(const std::vector<PanelMenuItem>& items, float scale,
+                               std::vector<float>& labelWidths, std::vector<float>& shortcutWidths) {
+    labelWidths.assign(items.size(), 0.0F);
+    shortcutWidths.assign(items.size(), 0.0F);
+    if (!std::isfinite(scale) || scale <= 0.0F || !ensureFormats(scale)) return;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        labelWidths[i] = measureText(items[i].label, panelMenuLabelStyle(items[i]), scale);
+        shortcutWidths[i] = measureText(items[i].shortcut, OverlayTextStyle::Small, scale);
+    }
+}
+
 void Overlay::mediaText(const std::wstring& value, OverlayTextStyle style, const OverlayRect& box,
                         float lineHeight, D2D1_COLOR_F color) {
     if (!box.visible()) return;
@@ -380,22 +433,22 @@ void Overlay::strokeRound(const OverlayRect& box, float radius, D2D1_COLOR_F col
 }
 
 void Overlay::button(const OverlayRect& box, wchar_t code, const wchar_t* fallback,
-                     bool hot, bool pressed, bool toggled, float alpha, float scale, bool dimmed) {
+                     bool hot, bool pressed, bool toggled, float alpha, float scale, bool dimmed, int video) {
     if (!box.visible()) return;
     const float radius = 8.0F * scale;
     if (toggled) {
-        fillRound(box, radius, withAlpha(rgba(63, 132, 232, 0.32F), alpha));
-        strokeRound(box, radius, withAlpha(rgba(63, 132, 232, 0.9F), alpha), std::max(1.0F, scale));
+        fillRound(box, radius, withAlpha(paneColor(video, 0.32F), alpha));
+        strokeRound(box, radius, withAlpha(paneColor(video, 0.9F), alpha), std::max(1.0F, scale));
     }
     if (pressed) fillRound(box, radius, withAlpha(rgba(255, 255, 255, 0.22F), alpha));
     else if (hot) fillRound(box, radius, withAlpha(rgba(255, 255, 255, 0.14F), alpha));
-    const D2D1_COLOR_F ink = toggled ? rgba(190, 216, 255, 1.0F)
+    const D2D1_COLOR_F ink = toggled ? paneInkColor(video)
                            : dimmed ? rgba(240, 243, 248, 0.38F) : kText;
     glyph(code, fallback, box, withAlpha(ink, alpha));
 }
 
 void Overlay::rail(const OverlayRect& band, float inset, float thickness, float position01,
-                   float buffered01, bool showThumb, float thumbRadius, float alpha) {
+                   float buffered01, bool showThumb, float thumbRadius, float alpha, int video) {
     if (!band.visible()) return;
     const float left = band.x + inset;
     const float right = band.right() - inset;
@@ -410,7 +463,7 @@ void Overlay::rail(const OverlayRect& band, float inset, float thickness, float 
         fillRound({playhead, centerY - half, bufferedX - playhead, thickness}, half,
                   withAlpha(rgba(255, 255, 255, 0.28F), alpha));
     }
-    fillRound({left, centerY - half, playhead - left, thickness}, half, withAlpha(kAccent, alpha));
+    fillRound({left, centerY - half, playhead - left, thickness}, half, withAlpha(paneColor(video), alpha));
     if (showThumb && thumbRadius > 0.0F) {
         brush_->SetColor(withAlpha(kText, alpha));
         context_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(playhead, centerY), thumbRadius, thumbRadius),
@@ -458,6 +511,7 @@ void Overlay::draw(IDXGISurface* surface, const OverlayScene& scene, bool transp
     drawEmptyHint(scene);
     drawPanel(scene);
     drawCaption(scene);
+    drawPanelMenu(scene);
     drawNotice(scene);
     drawTooltip(scene);
     const HRESULT hr = context_->EndDraw();
@@ -593,28 +647,29 @@ void Overlay::drawPanes(const OverlayScene& scene) {
             fillRound(cell, 0.0F, rgba(0, 0, 0, 0.35F));
         }
         if (pane.dropTarget) {
-            strokeRound(cell, 0.0F, rgba(63, 132, 232, 0.95F), std::max(2.0F, 3.0F * s));
+            strokeRound(cell, 0.0F, paneColor(pane.position, 0.95F), std::max(2.0F, 3.0F * s));
         } else if (const float edge = paneMarkAlpha(pane.audioOn, scene.activePaneCount, pane.chromeAlpha);
                    edge > 0.0F) {
-            // Which pane is being heard, without a label: a fine accent edge
-            // that fades with the pane's chrome.
-            strokeRound(cell, 0.0F, withAlpha(rgba(63, 132, 232, 0.55F), edge), std::max(1.0F, 2.0F * s));
+            // Which pane is being heard, without a label: a fine edge in the
+            // video's colour that fades with the pane's chrome.
+            strokeRound(cell, 0.0F, withAlpha(paneColor(pane.position, 0.55F), edge), std::max(1.0F, 2.0F * s));
         }
         if (const float outline = paneMarkAlpha(pane.targeted, scene.activePaneCount, pane.chromeAlpha);
             outline > 0.0F) {
-            // The playback destination is independent of the blue audio
-            // edge. Its quiet inner outline fades with the pane's chrome.
+            // The playback destination is independent of the audio edge.
+            // Its inner outline, in the same colour but solid and inside
+            // it, fades with the pane's chrome.
             const float inset = 4.0F * s;
             strokeRound({cell.x + inset, cell.y + inset, cell.width - 2.0F * inset,
-                         cell.height - 2.0F * inset}, 0.0F, withAlpha(rgba(230, 237, 248, 0.72F), outline),
-                        std::max(1.0F, s));
+                         cell.height - 2.0F * inset}, 0.0F, withAlpha(paneColor(pane.position, 0.95F), outline),
+                        std::max(1.0F, 2.0F * s));
         }
 
         // Subtitles belong to the picture, not the chrome: they stay while
-        // the pill and chips have faded. libass's picture, when it drew
-        // them; otherwise the plain lines, the bottom ones at their own
-        // height plus what the viewer raised them by, or clear of the
-        // transport bar while it is up, whichever is higher.
+        // the strip has faded. libass's picture, when it drew them;
+        // otherwise the plain lines, the bottom ones at their own height
+        // plus what the viewer raised them by, or clear of the transport bar
+        // and the pane's strip while they are up, whichever is higher.
         if (pane.subtitleImage) drawSubtitleImage(index, pane, cell);
         if (!pane.subtitle.empty()) {
             constexpr float kPlainSubtitleHeight = 0.06F;
@@ -627,63 +682,77 @@ void Overlay::drawPanes(const OverlayScene& scene) {
                          std::max(cell.height * 0.05F, 8.0F * s), scene.subtitleBackground);
         }
 
+        // The tag fades with the pane's chrome; the rest of the strip with
+        // its own reveal, on the pane under the pointer.
         const float alpha = std::clamp(pane.chromeAlpha, 0.0F, 1.0F);
-        const float timelineAlpha = std::clamp(pane.timelineAlpha, 0.0F, 1.0F);
-        if (std::max(alpha, timelineAlpha) <= 0.0F) continue;
+        const float stripAlpha = std::clamp(pane.timelineAlpha, 0.0F, 1.0F);
+        if (std::max(alpha, stripAlpha) <= 0.0F) continue;
         const auto& chrome = pane.chrome;
-        if (chrome.pill.visible()) {
-            const float radius = chrome.pill.height * 0.5F;
-            fillRound(chrome.pill, radius,
-                      withAlpha(pane.pillPressed ? rgba(30, 34, 44, 0.9F)
-                                : pane.pillHot ? rgba(24, 28, 36, 0.86F) : kPillFill, alpha));
-            strokeRound(chrome.pill, radius,
-                        withAlpha(pane.targeted ? rgba(230, 237, 248, 0.72F) : kPillEdge, alpha), std::max(1.0F, s));
-            OverlayRect textBox = chrome.pill;
-            textBox.x += 12.0F * s;
-            textBox.width = std::max(0.0F, textBox.width - 24.0F * s);
-            text(pane.label, OverlayTextStyle::BodyBold, textBox, withAlpha(kText, alpha),
-                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
-        }
-        struct Chip { wchar_t code; const wchar_t* fallback; bool toggled; };
-        const std::array<Chip, kPaneChipCount> chips{{
-            {pane.audioOn ? kGlyphVolume : kGlyphMute, L"Aud", pane.audioOn},
-            {pane.paused ? kGlyphPlay : kGlyphPause, pane.paused ? L"Go" : L"||", pane.paused},
-            {pane.solo ? kGlyphWindowed : kGlyphFullscreen, L"Solo", pane.solo},
-            {kGlyphRepeat, L"Rpt", pane.repeat},
-            {kGlyphClose, L"X", false},
-        }};
-        for (std::size_t chip = 0; chip < chips.size(); ++chip) {
-            const auto& box = chrome.chips[chip];
-            if (!box.visible()) continue;
-            fillRound(box, box.height * 0.5F, withAlpha(kPillFill, alpha));
-            const bool idle = chip == static_cast<std::size_t>(PaneChip::Repeat) && pane.repeatIdle;
-            button(box, chips[chip].code, chips[chip].fallback,
-                   pane.hotChip == static_cast<int>(chip),
-                   pane.pressedChip == static_cast<int>(chip), chips[chip].toggled,
-                   idle ? alpha * 0.45F : alpha, s);
-        }
-        if (chrome.volume.visible()) {
-            fillRound(chrome.volume, chrome.volume.height * 0.5F, withAlpha(kPillFill, alpha));
-            const bool emphasised = pane.volumeHot || pane.volumeDragging;
-            rail(chrome.volume, 12.0F * s, (emphasised ? 5.0F : 4.0F) * s, pane.volume01, 0.0F,
-                 true, 6.0F * s, alpha);
-        }
-
-        if (chrome.timeline.visible() && pane.seekable) {
-            const bool emphasised = pane.railHot || pane.railDragging;
-            rail(chrome.timeline, 12.0F * s, (emphasised ? 6.0F : 3.0F) * s,
-                 pane.position01, pane.buffered01, emphasised, 7.0F * s, timelineAlpha);
-            if (emphasised && chrome.timeLabel.visible() && !pane.timeText.empty()) {
-                const float labelWidth = std::min(
-                    chrome.timeLabel.width,
-                    measureText(pane.timeText, OverlayTextStyle::Small, s) + 16.0F * s);
-                const OverlayRect label{chrome.timeLabel.x, chrome.timeLabel.y,
-                                        labelWidth, chrome.timeLabel.height};
-                fillRound(label, label.height * 0.5F, withAlpha(kPillFill, timelineAlpha));
-                text(pane.timeText, OverlayTextStyle::Small, label, withAlpha(kText, timelineAlpha));
+        if (stripAlpha > 0.0F) {
+            // A scrim as the bar's: clear at its top, darkest at the edge.
+            if (chrome.band.visible()) fillScrim(chrome.band, chrome.band.y, chrome.band.bottom(), stripAlpha);
+            if (chrome.timeline.visible() && pane.seekable) {
+                const bool emphasised = pane.railHot || pane.railDragging;
+                rail(chrome.timeline, 12.0F * s, (emphasised ? 6.0F : 4.0F) * s,
+                     pane.position01, pane.buffered01, emphasised, 7.0F * s, stripAlpha, pane.position);
+            } else if (chrome.timeline.visible()) {
+                rail(chrome.timeline, 12.0F * s, 4.0F * s, 0.0F, 0.0F, false, 0.0F, stripAlpha * 0.5F);
             }
-        } else if (chrome.timeline.visible() && (pane.waiting || !pane.seekable)) {
-            rail(chrome.timeline, 12.0F * s, 3.0F * s, 0.0F, 0.0F, false, 0.0F, timelineAlpha * 0.5F);
+            if (chrome.time.visible()) {
+                text(pane.timeText, OverlayTextStyle::Small, chrome.time, withAlpha(kText, stripAlpha),
+                     DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            }
+            struct Chip { wchar_t code; const wchar_t* fallback; bool toggled; bool dimmed; };
+            const std::array<Chip, kPaneChipCount> chips{{
+                {pane.audioOn ? kGlyphVolume : kGlyphMute, L"Aud", pane.audioOn, false},
+                {pane.paused ? kGlyphPlay : kGlyphPause, pane.paused ? L"Go" : L"||", pane.paused, false},
+                {pane.solo ? kGlyphWindowed : kGlyphFullscreen, L"Solo", pane.solo, false},
+                {kGlyphRepeat, L"Rpt", pane.repeat, false},
+                {kGlyphClose, L"X", false, false},
+                // A switch, as the bar's: lit while its lines show, greyed
+                // while they do not.
+                {kGlyphSubtitles, L"CC", pane.subtitlesOn, !pane.subtitlesOn},
+            }};
+            for (std::size_t chip = 0; chip < chips.size(); ++chip) {
+                const auto& box = chrome.chips[chip];
+                if (!box.visible()) continue;
+                fillRound(box, box.height * 0.5F, withAlpha(kPillFill, stripAlpha));
+                const bool idle = chip == static_cast<std::size_t>(PaneChip::Repeat) && pane.repeatIdle;
+                button(box, chips[chip].code, chips[chip].fallback,
+                       pane.hotChip == static_cast<int>(chip),
+                       pane.pressedChip == static_cast<int>(chip), chips[chip].toggled,
+                       idle ? stripAlpha * 0.45F : stripAlpha, s, chips[chip].dimmed, pane.position);
+            }
+            if (chrome.volume.visible()) {
+                const bool emphasised = pane.volumeHot || pane.volumeDragging;
+                rail(chrome.volume, 12.0F * s, (emphasised ? 5.0F : 4.0F) * s, pane.volume01, 0.0F,
+                     true, 6.0F * s, stripAlpha, pane.position);
+            }
+        }
+        if (chrome.pill.visible()) {
+            // In the video's own colour, lighter under the pointer, darker pressed.
+            const float tagAlpha = std::max(alpha, stripAlpha);
+            const float radius = chrome.pill.height * 0.5F;
+            const D2D1_COLOR_F own = paneColor(pane.position, 0.9F);
+            fillRound(chrome.pill, radius,
+                      withAlpha(pane.pillPressed ? blend(own, rgba(0, 0, 0, 1.0F), 0.25F)
+                                : pane.pillHot ? blend(own, rgba(255, 255, 255, 1.0F), 0.18F) : own, tagAlpha));
+            strokeRound(chrome.pill, radius,
+                        withAlpha(pane.targeted ? rgba(230, 237, 248, 0.72F) : kPillEdge, tagAlpha),
+                        std::max(1.0F, s));
+            text(pane.label, OverlayTextStyle::BodyBold, chrome.pill, withAlpha(kText, tagAlpha),
+                 DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        }
+        // Over the rail at the pointer: where a seek lands and what it reaches.
+        if (stripAlpha > 0.0F && chrome.timeline.visible() && pane.seekable && !pane.railText.empty()) {
+            const float width = measureText(pane.railText, OverlayTextStyle::Small, s) + 16.0F * s;
+            const float height = 22.0F * s;
+            OverlayRect bubble{pane.railX - width * 0.5F, chrome.timeline.y - height, width, height};
+            bubble.x = std::clamp(bubble.x, cell.x, std::max(cell.x, cell.right() - width));
+            fillRound(bubble, height * 0.5F, withAlpha(kPillFill, stripAlpha));
+            strokeRound(bubble, height * 0.5F, withAlpha(paneColor(pane.position, 0.8F), stripAlpha),
+                        std::max(1.0F, s));
+            text(pane.railText, OverlayTextStyle::Small, bubble, withAlpha(kText, stripAlpha));
         }
     }
 }
@@ -715,10 +784,19 @@ void Overlay::drawBar(const OverlayScene& scene) {
     fillScrim(bar.band, bar.band.y, bar.band.bottom(), alpha);
     const auto hot = [&](BarItem item) { return scene.hotBarItem == static_cast<int>(item); };
     const auto pressed = [&](BarItem item) { return scene.pressedBarItem == static_cast<int>(item); };
+    // The capsule is a pill of its own, edged, apart from any pane's strip;
+    // its "All" a lighter pill in it.
+    if (bar.capsule && bar.row.visible()) {
+        const float radius = bar.row.height * 0.5F;
+        fillRound(bar.row, radius, withAlpha(rgba(14, 16, 20, 0.86F), alpha));
+        strokeRound(bar.row, radius, withAlpha(rgba(255, 255, 255, 0.16F), alpha), std::max(1.0F, s));
+        if (bar.divider.visible()) fillRound(bar.divider, 0.0F, withAlpha(rgba(255, 255, 255, 0.25F), alpha));
+    }
     if (scene.activePaneCount > 1 && bar.scopeLabel.visible() && !scene.scopeText.empty()) {
-        fillRound(bar.scopeLabel, 9.0F * s, withAlpha(kPillFill, alpha));
-        text(scene.scopeText, OverlayTextStyle::Small, bar.scopeLabel, withAlpha(kTextDim, alpha),
-             DWRITE_TEXT_ALIGNMENT_CENTER, true);
+        fillRound(bar.scopeLabel, bar.scopeLabel.height * 0.5F,
+                  withAlpha(bar.capsule ? rgba(255, 255, 255, 0.14F) : kPillFill, alpha));
+        text(scene.scopeText, bar.capsule ? OverlayTextStyle::BodyBold : OverlayTextStyle::Small, bar.scopeLabel,
+             withAlpha(bar.capsule ? kText : kTextDim, alpha), DWRITE_TEXT_ALIGNMENT_CENTER, true);
     }
     if (bar[BarItem::Previous].visible()) {
         button(bar[BarItem::Previous], kGlyphPrevious, L"<<", hot(BarItem::Previous),
@@ -739,7 +817,7 @@ void Overlay::drawBar(const OverlayScene& scene) {
         const bool emphasised = scene.seekHot || scene.seekDragging;
         rail(bar[BarItem::Seek], 8.0F * s, (emphasised ? 6.0F : 4.0F) * s,
              scene.seekable ? scene.seek01 : 0.0F, 0.0F, scene.seekable && emphasised,
-             7.0F * s, scene.seekable ? alpha : alpha * 0.45F);
+             7.0F * s, scene.seekable ? alpha : alpha * 0.45F, scene.seekPosition);
         if (emphasised && scene.seekHoverX >= 0.0F && !scene.seekHoverText.empty()) {
             const float width = measureText(scene.seekHoverText, OverlayTextStyle::Small, s) + 16.0F * s;
             const float height = 22.0F * s;
@@ -848,10 +926,142 @@ void Overlay::drawTooltip(const OverlayScene& scene) {
     text(scene.tooltip, OverlayTextStyle::Small, box, kText);
 }
 
-void Overlay::toggleSwitch(const OverlayRect& box, bool on, bool hot, float alpha, float scale) {
+// Raised cards a shade lighter than the sheet, softly shadowed: options
+// with the chosen one ticked in the accent, or in the colour of the video
+// the menu is about, switches, segments cut from a track, a submenu's
+// chevron, keys in dim caps at the lines' ends. A submenu's card lies over
+// the edge of the one it opened from, whose line stays lit.
+void Overlay::drawPanelMenu(const OverlayScene& scene) {
+    const auto& menu = scene.panelMenu;
+    if (menu.items.empty()) return;
+    drawPanelMenuCard(menu.items, menu.layout, menu.highlighted, menu.pressed,
+                      menu.submenus.empty() ? -1 : menu.submenus.front().from, menu.alpha, menu.offset, scene.scale,
+                      menu.position);
+    const std::vector<PanelMenuItem>* items = &menu.items;
+    for (std::size_t depth = 0; depth < menu.submenus.size(); ++depth) {
+        const auto& submenu = menu.submenus[depth];
+        if (submenu.from < 0 || static_cast<std::size_t>(submenu.from) >= items->size()) break;
+        items = &(*items)[static_cast<std::size_t>(submenu.from)].children;
+        drawPanelMenuCard(*items, submenu.layout, submenu.highlighted, submenu.pressed,
+                          depth + 1 < menu.submenus.size() ? menu.submenus[depth + 1].from : -1, submenu.alpha,
+                          0.0F, scene.scale, menu.position);
+    }
+}
+
+void Overlay::drawPanelMenuCard(const std::vector<PanelMenuItem>& items, const PanelMenuLayout& layout,
+                                int highlighted, int pressed, int opened, float cardAlpha, float offset, float s,
+                                int video) {
+    const float alpha = std::clamp(cardAlpha, 0.0F, 1.0F);
+    if (alpha <= 0.0F || items.empty() || !layout.card.visible()) return;
+    const float hairline = std::max(1.0F, s);
+    const auto placed = [&](OverlayRect box) {
+        box.y += offset;
+        return box;
+    };
+    const OverlayRect card = placed(layout.card);
+    const float radius = 10.0F * s;
+    for (int ring = 3; ring >= 1; --ring) {
+        const float spread = static_cast<float>(ring) * 3.0F * s;
+        fillRound({card.x - spread, card.y - spread + 5.0F * s, card.width + 2.0F * spread,
+                   card.height + 2.0F * spread}, radius + spread, rgba(0, 0, 0, 0.09F * alpha));
+    }
+    fillRound(card, radius, withAlpha(rgba(31, 35, 44, 1.0F), alpha));
+    strokeRound(card, radius, withAlpha(rgba(255, 255, 255, 0.13F), alpha), hairline);
+    // Cut to a short window, its lines scroll inside the card, a thin thumb
+    // at its right edge saying how far.
+    const OverlayRect view = placed(layout.view);
+    if (!view.visible()) return;
+    context_->PushAxisAlignedClip(toRect(view), D2D1_ANTIALIAS_MODE_ALIASED);
+    if (layout.maxScroll > 0.0F) {
+        const float thumbHeight = std::max(24.0F * s, view.height * view.height / (view.height + layout.maxScroll));
+        const float thumbY = view.y + (view.height - thumbHeight) * (layout.scroll / layout.maxScroll);
+        fillRound({card.right() - 5.0F * s, thumbY, 3.0F * s, thumbHeight}, 1.5F * s,
+                  withAlpha(rgba(255, 255, 255, 0.28F), alpha));
+    }
+    for (const auto& track : layout.tracks) {
+        fillRound(placed(track), 8.0F * s, withAlpha(rgba(255, 255, 255, 0.06F), alpha));
+    }
+    const D2D1_COLOR_F chosen = video >= 1 ? paneInkColor(video) : rgba(196, 220, 255, 1.0F);
+    const D2D1_COLOR_F tick = video >= 1 ? blend(paneColor(video), rgba(255, 255, 255, 1.0F), 0.35F)
+                                         : rgba(110, 168, 248, 1.0F);
+    const D2D1_COLOR_F dim = rgba(150, 158, 172, 1.0F);
+    for (std::size_t i = 0; i < items.size() && i < layout.items.size(); ++i) {
+        const auto& item = items[i];
+        const OverlayRect box = placed(layout.items[i]);
+        if (!box.visible()) continue;
+        const float itemAlpha = item.enabled ? alpha : alpha * 0.38F;
+        // A submenu's line stays lit while its card is open, unless the
+        // pointer lights another line of this card: one line lit at a time.
+        const bool lit = item.enabled && (highlighted == static_cast<int>(i) ||
+                                          (highlighted < 0 && opened == static_cast<int>(i)));
+        const bool down = lit && pressed == static_cast<int>(i);
+        switch (item.kind) {
+        case PanelMenuItemKind::Separator:
+            fillRound({box.x + 6.0F * s, std::round(box.y + box.height * 0.5F), box.width - 12.0F * s, hairline},
+                      0.0F, withAlpha(rgba(255, 255, 255, 0.09F), alpha));
+            break;
+        case PanelMenuItemKind::Segment: {
+            const D2D1_COLOR_F fill = item.checked ? paneColor(video, lit ? 0.50F : 0.38F)
+                                    : rgba(255, 255, 255, down ? 0.16F : lit ? 0.09F : 0.0F);
+            fillRound(box, 6.0F * s, withAlpha(fill, itemAlpha));
+            if (item.checked) strokeRound(box, 6.0F * s, withAlpha(paneColor(video, 0.95F), itemAlpha), hairline);
+            text(item.label, OverlayTextStyle::Body, box, withAlpha(item.checked ? chosen : kText, itemAlpha),
+                 DWRITE_TEXT_ALIGNMENT_CENTER, true);
+            break;
+        }
+        case PanelMenuItemKind::Option:
+        case PanelMenuItemKind::Check:
+        case PanelMenuItemKind::Submenu: {
+            if (lit) fillRound(box, 7.0F * s, withAlpha(rgba(255, 255, 255, down ? 0.15F : 0.085F), alpha));
+            const bool option = item.kind == PanelMenuItemKind::Option;
+            const float labelX = box.x + (item.kind == PanelMenuItemKind::Check ? layout.checkLabelInset
+                                                                              : layout.optionLabelInset);
+            float labelRight = box.right() - 12.0F * s;
+            if (option && item.checked) {
+                glyph(kGlyphCheckMark, L"\x2713", {box.x, box.y, layout.optionLabelInset, box.height},
+                      withAlpha(tick, itemAlpha));
+            }
+            if (item.kind == PanelMenuItemKind::Check) {
+                const OverlayRect knob{box.right() - 44.0F * s, box.y + (box.height - 18.0F * s) * 0.5F,
+                                       32.0F * s, 18.0F * s};
+                toggleSwitch(knob, item.checked, lit, itemAlpha, s, video);
+                labelRight = knob.x - 8.0F * s;
+            }
+            if (item.kind == PanelMenuItemKind::Submenu) {
+                const OverlayRect chevron{box.right() - 28.0F * s, box.y, 20.0F * s, box.height};
+                const D2D1_COLOR_F color = withAlpha(lit ? kText : dim, itemAlpha);
+                if (formats_.captionIcon) {
+                    text(std::wstring(1, kGlyphChevronRight), OverlayTextStyle::CaptionIcon, chevron, color);
+                } else {
+                    text(L"\x203A", OverlayTextStyle::Small, chevron, color, DWRITE_TEXT_ALIGNMENT_CENTER, true);
+                }
+                labelRight = chevron.x - 4.0F * s;
+            }
+            if (!item.shortcut.empty()) {
+                // Its key ends the line, or stands before its switch; a
+                // one-character key in a square cap, not a sliver.
+                const float keyWidth = std::max(20.0F * s, measureText(item.shortcut, OverlayTextStyle::Small, s) +
+                                                               12.0F * s);
+                const float keyRight = item.kind == PanelMenuItemKind::Check ? labelRight : box.right() - 6.0F * s;
+                const OverlayRect key{keyRight - keyWidth, box.y + (box.height - 20.0F * s) * 0.5F, keyWidth, 20.0F * s};
+                fillRound(key, 5.0F * s, withAlpha(rgba(255, 255, 255, 0.06F), itemAlpha));
+                strokeRound(key, 5.0F * s, withAlpha(rgba(255, 255, 255, 0.08F), itemAlpha), hairline);
+                text(item.shortcut, OverlayTextStyle::Small, key, withAlpha(dim, itemAlpha));
+                labelRight = key.x - 8.0F * s;
+            }
+            text(item.label, panelMenuLabelStyle(item), {labelX, box.y, std::max(0.0F, labelRight - labelX), box.height},
+                 withAlpha(option && item.checked ? chosen : kText, itemAlpha), DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            break;
+        }
+        }
+    }
+    context_->PopAxisAlignedClip();
+}
+
+void Overlay::toggleSwitch(const OverlayRect& box, bool on, bool hot, float alpha, float scale, int video) {
     if (!box.visible()) return;
     const float radius = box.height * 0.5F;
-    D2D1_COLOR_F track = on ? rgba(63, 132, 232, 0.9F) : rgba(255, 255, 255, 0.22F);
+    D2D1_COLOR_F track = on ? paneColor(video, 0.9F) : rgba(255, 255, 255, 0.22F);
     if (hot) track.a = std::min(1.0F, track.a + 0.1F);
     fillRound(box, radius, withAlpha(track, alpha));
     const float knob = box.height - 6.0F * scale;
@@ -1039,6 +1249,8 @@ void Overlay::drawPanel(const OverlayScene& scene) {
         if (row.contentPending) continue;
         const float rowAlpha = row.enabled ? alpha : alpha * 0.4F;
         const D2D1_COLOR_F textColor = withAlpha(kText, rowAlpha);
+        // A row about one video names it in a pale shade of its colour.
+        const D2D1_COLOR_F videoLabel = withAlpha(paneTextColor(row.video), rowAlpha);
         const bool hotRow = panel.hotRow == static_cast<int>(i);
         const bool pressedRow = panel.pressedRow == static_cast<int>(i);
         const OverlayRect labelLine{geometry.row.x, geometry.row.y, geometry.row.width, 24.0F * s};
@@ -1090,22 +1302,23 @@ void Overlay::drawPanel(const OverlayScene& scene) {
             text(row.label, OverlayTextStyle::Body,
                  {geometry.row.x, geometry.row.y, geometry.row.width - geometry.control.width - 12.0F * s,
                   geometry.row.height},
-                 textColor, DWRITE_TEXT_ALIGNMENT_LEADING, true);
-            toggleSwitch(geometry.control, row.on, hotRow && row.enabled, rowAlpha, s);
+                 row.video >= 0 ? videoLabel : textColor, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            toggleSwitch(geometry.control, row.on, hotRow && row.enabled, rowAlpha, s, row.video);
             break;
         case PanelRowKind::Slider: {
-            text(row.label, OverlayTextStyle::Body, labelLine, textColor, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+            text(row.label, OverlayTextStyle::Body, labelLine, row.video >= 0 ? videoLabel : textColor,
+                 DWRITE_TEXT_ALIGNMENT_LEADING, true);
             text(row.value, OverlayTextStyle::Small, labelLine, withAlpha(kTextDim, rowAlpha),
                  DWRITE_TEXT_ALIGNMENT_TRAILING, true);
             const bool emphasised = row.enabled && (hotRow || panel.dragRow == static_cast<int>(i));
             rail(geometry.control, 8.0F * s, (emphasised ? 6.0F : 4.0F) * s, row.slider01, 0.0F,
-                 true, 7.0F * s, rowAlpha);
+                 true, 7.0F * s, rowAlpha, row.video);
             if (geometry.trailing.visible()) {
                 button(geometry.trailing, row.trailingOn ? kGlyphMute : kGlyphVolume,
                        row.trailingOn ? L"M" : L"S",
                        hotRow && panel.hotKind == PanelHitKind::Trailing,
                        pressedRow && panel.pressedKind == PanelHitKind::Trailing,
-                       row.trailingOn, rowAlpha, s);
+                       row.trailingOn, rowAlpha, s, false, row.video);
             }
             break;
         }
@@ -1155,10 +1368,15 @@ void Overlay::drawPanel(const OverlayScene& scene) {
                 text(row.label.substr(0, row.label.find(L' ')), OverlayTextStyle::BodyBold, picture,
                      withAlpha(kTextDim, rowAlpha), DWRITE_TEXT_ALIGNMENT_CENTER, true);
             }
+            // One of the videos on the screen, its picture framed in its colour.
+            if (row.video >= 0) {
+                strokeRound(picture, 6.0F * s, withAlpha(paneColor(row.video), rowAlpha), std::max(1.0F, 2.0F * s));
+            }
             const float textX = picture.right() + 12.0F * s;
             const float textWidth = std::max(0.0F, geometry.row.right() - textX - 8.0F * s);
             mediaText(row.label, OverlayTextStyle::Body,
-                      {textX, geometry.row.y + 10.0F * s, textWidth, 40.0F * s}, 20.0F * s, textColor);
+                      {textX, geometry.row.y + 10.0F * s, textWidth, 40.0F * s}, 20.0F * s,
+                      row.video >= 0 ? videoLabel : textColor);
             text(row.value, OverlayTextStyle::Small,
                  {textX, geometry.row.y + 54.0F * s, textWidth, 20.0F * s},
                  withAlpha(row.on ? rgba(150, 190, 245, 1.0F) : kTextDim, rowAlpha),
@@ -1171,10 +1389,11 @@ void Overlay::drawPanel(const OverlayScene& scene) {
                           withAlpha(rgba(255, 255, 255, pressedRow ? 0.16F : 0.08F), alpha));
             }
             if (row.current) {
-                // The item being played: a bar at the left and its name in the accent.
-                fillRound(geometry.row, 8.0F * s, withAlpha(rgba(63, 132, 232, 0.14F), alpha));
+                // The item being played: a bar at the left and its name in
+                // the colour of the video playing it.
+                fillRound(geometry.row, 8.0F * s, withAlpha(paneColor(row.playingPosition, 0.14F), alpha));
                 fillRound({geometry.row.x, geometry.row.y + 8.0F * s, 3.0F * s, geometry.row.height - 16.0F * s},
-                          1.5F * s, withAlpha(rgba(63, 132, 232, 0.95F), alpha));
+                          1.5F * s, withAlpha(paneColor(row.playingPosition, 0.95F), alpha));
             }
             const OverlayRect add = geometry.addParts.empty() ? OverlayRect{} : geometry.addParts[0];
             const float textRight = add.visible() ? add.x - 8.0F * s : geometry.row.right();
@@ -1193,7 +1412,7 @@ void Overlay::drawPanel(const OverlayScene& scene) {
                                        std::max(0.0F, available - valueWidth - tagSpace - heartSpace - 20.0F * s),
                                        geometry.row.height};
             text(row.label, OverlayTextStyle::Body, labelBox,
-                 row.current ? withAlpha(rgba(190, 216, 255, 1.0F), rowAlpha) : textColor,
+                 row.current ? withAlpha(paneTextColor(row.playingPosition), rowAlpha) : textColor,
                  DWRITE_TEXT_ALIGNMENT_LEADING, true);
             if (valueWidth > 0.0F) {
                 const OverlayRect valueBox{textRight - valueWidth - 8.0F * s, geometry.row.y,
@@ -1206,8 +1425,10 @@ void Overlay::drawPanel(const OverlayScene& scene) {
                 const float height = 20.0F * s;
                 const OverlayRect tagBox{textRight - valueWidth - 8.0F * s - tagSpace,
                                          geometry.row.y + (geometry.row.height - height) * 0.5F, tagWidth, height};
-                fillRound(tagBox, height * 0.5F, withAlpha(rgba(63, 132, 232, 0.32F), rowAlpha));
-                text(row.tag, OverlayTextStyle::Small, tagBox, withAlpha(rgba(190, 216, 255, 1.0F), rowAlpha),
+                // On the item being played, in its video's colour.
+                const int tagVideo = row.current ? row.playingPosition : -1;
+                fillRound(tagBox, height * 0.5F, withAlpha(paneColor(tagVideo, 0.32F), rowAlpha));
+                text(row.tag, OverlayTextStyle::Small, tagBox, withAlpha(paneInkColor(tagVideo), rowAlpha),
                      DWRITE_TEXT_ALIGNMENT_CENTER, true);
             }
             if (heart > 0.0F) {
@@ -1237,8 +1458,8 @@ void Overlay::drawPanel(const OverlayScene& scene) {
                 const OverlayRect textLine{labelLine.x, labelLine.y,
                                            std::max(0.0F, labelLine.width - (heart > 0.0F ? heart + 4.0F * s : 0.0F)),
                                            labelLine.height};
-                text(row.label, OverlayTextStyle::Small, textLine, withAlpha(kTextDim, rowAlpha),
-                     DWRITE_TEXT_ALIGNMENT_LEADING, true);
+                text(row.label, OverlayTextStyle::Small, textLine,
+                     row.video >= 0 ? videoLabel : withAlpha(kTextDim, rowAlpha), DWRITE_TEXT_ALIGNMENT_LEADING, true);
                 text(row.value, OverlayTextStyle::Small, textLine, textColor,
                      DWRITE_TEXT_ALIGNMENT_TRAILING, true);
                 if (heart > 0.0F) {
@@ -1271,6 +1492,22 @@ void Overlay::drawPanel(const OverlayScene& scene) {
         const float width = (active ? 6.0F : 3.0F) * s;
         fillRound({layout.sheet.right() - 3.0F * s - width, thumb.y, width, thumb.height}, width * 0.5F,
                   withAlpha(rgba(255, 255, 255, active ? 0.55F : 0.25F), alpha));
+        // The videos being played, where the list shows them: a tick wider
+        // than the thumb, over it, in each one's colour; those of one row
+        // share the tick side by side.
+        const auto& marks = panel.scrollMarks;
+        const float tickWidth = 10.0F * s, tickHeight = 4.0F * s;
+        const float tickLeft = layout.sheet.right() - 3.0F * s - tickWidth;
+        for (std::size_t first = 0; first < marks.size();) {
+            std::size_t end = first + 1;
+            while (end < marks.size() && marks[end].y == marks[first].y) ++end;
+            const float share = tickWidth / static_cast<float>(end - first);
+            for (std::size_t i = first; i < end; ++i) {
+                fillRound({tickLeft + share * static_cast<float>(i - first), marks[i].y - tickHeight * 0.5F, share,
+                           tickHeight}, std::min(share, tickHeight) * 0.5F, withAlpha(paneColor(marks[i].position), alpha));
+            }
+            first = end;
+        }
     }
 }
 
@@ -1281,14 +1518,18 @@ void Overlay::drawEmptyHint(const OverlayScene& scene) {
     text(L"Drop videos here", OverlayTextStyle::Title, hint.title, kTextDim);
     text(L"O  open      right-click  menu      F5  settings      F6  Emby", OverlayTextStyle::Body,
          hint.keys, rgba(120, 126, 138, 1.0F));
-    // In the accent, as a form's own button.
-    const float alpha = std::clamp(scene.emptyEmbyAlpha, 0.0F, 1.0F);
-    if (!hint.emby.visible() || alpha <= 0.0F) return;
-    const D2D1_COLOR_F fill = scene.emptyEmbyPressed ? rgba(43, 102, 195, 0.98F)
-                            : scene.emptyEmbyHot ? rgba(63, 132, 232, 0.98F) : rgba(63, 132, 232, 0.85F);
-    fillRound(hint.emby, 8.0F * s, withAlpha(fill, alpha));
-    text(L"Open Emby", OverlayTextStyle::BodyBold, hint.emby, withAlpha(kText, alpha),
-         DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    // In the accent, as a form's own button; the two alike.
+    const float alpha = std::clamp(scene.emptyButtonsAlpha, 0.0F, 1.0F);
+    if (alpha <= 0.0F) return;
+    const auto button = [&](const OverlayRect& box, const wchar_t* label, bool hot, bool pressed) {
+        if (!box.visible()) return;
+        const D2D1_COLOR_F fill = pressed ? rgba(43, 102, 195, 0.98F)
+                                : hot ? rgba(63, 132, 232, 0.98F) : rgba(63, 132, 232, 0.85F);
+        fillRound(box, 8.0F * s, withAlpha(fill, alpha));
+        text(label, OverlayTextStyle::BodyBold, box, withAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER, true);
+    };
+    button(hint.open, L"Open file", scene.emptyOpenHot, scene.emptyOpenPressed);
+    button(hint.emby, L"Open Emby", scene.emptyEmbyHot, scene.emptyEmbyPressed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,7 +1725,7 @@ void Overlay::drawMediaDetail(const PanelRow& row, const PanelRowGeometry& rowGe
         fillRound(geometry.progress, 5.0F * s, withAlpha(rgba(255, 255, 255, 0.20F), alpha));
         const float progress = std::isfinite(detail.progress) ? std::clamp(detail.progress, 0.0F, 1.0F) : 0.0F;
         fillRound({geometry.progress.x, geometry.progress.y, geometry.progress.width * progress,
-                   geometry.progress.height}, 5.0F * s, withAlpha(kAccent, alpha));
+                   geometry.progress.height}, 5.0F * s, withAlpha(paneColor(detail.playingPosition), alpha));
         mediaText(detail.progressText, OverlayTextStyle::Small, geometry.progressText, 20.0F * s,
                   withAlpha(kTextDim, alpha));
     }
@@ -1504,6 +1745,13 @@ void Overlay::drawMediaDetail(const PanelRow& row, const PanelRowGeometry& rowGe
         } else if (hot) {
             fill = primary ? rgba(85, 150, 244, 1.0F)
                  : favorite  ? withAlpha(kFavorite, 0.36F) : rgba(255, 255, 255, 0.18F);
+        }
+        // "Play → V2" in V2's colour, as V2's outline as the destination
+        // is; lighter and darker as the pill is.
+        if (primary && detail.targetPosition >= 1) {
+            const D2D1_COLOR_F own = paneColor(detail.targetPosition);
+            fill = pressed ? blend(own, rgba(0, 0, 0, 1.0F), 0.25F)
+                 : hot ? blend(own, rgba(255, 255, 255, 1.0F), 0.18F) : own;
         }
         fillRound(box, 9.0F * s, withAlpha(fill, alpha));
         if (!primary && part != 2) {
@@ -1553,18 +1801,22 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
         }
         text(initial, OverlayTextStyle::Title, picture, withAlpha(kTextDim, alpha * 0.6F));
     }
-    const bool current = row.selected == static_cast<int>(part);
+    // The tile being played framed in the colour of the video playing it.
+    const int playing = part < row.tilePlaying.size() ? row.tilePlaying[part]
+                      : row.selected == static_cast<int>(part) ? 0 : -1;
+    const bool current = playing >= 0;
     if (hot || pressed || current) {
-        strokeRound(picture, radius, withAlpha(rgba(63, 132, 232, current ? 1.0F : 0.9F), alpha),
+        strokeRound(picture, radius, current ? withAlpha(paneColor(playing), alpha) : withAlpha(kAccent, 0.9F * alpha),
                     std::max(1.0F, (current ? 3.0F : 2.0F) * s));
     }
-    // How far it was watched, along the picture's bottom edge.
+    // How far it was watched, along the picture's bottom edge: in the colour
+    // of the video playing it, as its frame.
     const float progress = part < row.tileProgress.size() ? std::clamp(row.tileProgress[part], 0.0F, 1.0F) : 0.0F;
     if (progress > 0.0F) {
         const OverlayRect track{picture.x + 6.0F * s, picture.bottom() - 7.0F * s, picture.width - 12.0F * s, 3.0F * s};
         fillRound(track, 1.5F * s, withAlpha(rgba(0, 0, 0, 0.55F), alpha));
         fillRound({track.x, track.y, track.width * progress, track.height}, 1.5F * s,
-                  withAlpha(rgba(63, 132, 232, 1.0F), alpha));
+                  withAlpha(paneColor(playing), alpha));
     }
     // A caption in a pill at a corner of the picture: at the top, or at the
     // bottom above the watched bar.
@@ -1582,11 +1834,12 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
         text(caption, OverlayTextStyle::Small, pillBox, withAlpha(kText, alpha), DWRITE_TEXT_ALIGNMENT_CENTER, true);
     };
     // Watched state at the left, length at the right: both, side by side;
-    // a tag in the accent below them.
+    // a tag in the accent below them, or in the colour of the video
+    // playing it.
     const D2D1_COLOR_F shade = rgba(0, 0, 0, 0.65F);
     if (part < row.tileMarks.size()) pill(row.tileMarks[part], true, true, shade);
     if (part < row.tileBadges.size()) pill(row.tileBadges[part], false, true, shade);
-    if (part < row.tileTags.size()) pill(row.tileTags[part], true, false, rgba(63, 132, 232, 0.92F));
+    if (part < row.tileTags.size()) pill(row.tileTags[part], true, false, paneColor(playing, 0.92F));
     // A favorite's heart in the right-hand column, under the badge: the
     // bottom-right corner is the Add button's, placed as settingsPanelLayout
     // places it, and on a tile too small for both the heart gives way.
@@ -1613,7 +1866,7 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
     const OverlayRect labelBox{box.x, picture.bottom() + 4.0F * s, box.width,
                                std::max(0.0F, box.height - pictureHeight - 4.0F * s)};
     text(row.options[part], OverlayTextStyle::Small, labelBox,
-         withAlpha(current ? rgba(190, 216, 255, 1.0F) : kText, alpha),
+         withAlpha(current ? paneTextColor(playing) : kText, alpha),
          DWRITE_TEXT_ALIGNMENT_LEADING, true, true);
 }
 

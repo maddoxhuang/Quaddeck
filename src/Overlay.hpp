@@ -14,6 +14,7 @@
 #include "AssSubtitles.hpp"
 #include "Core.hpp"
 #include "OverlayLayout.hpp"
+#include "PanelMenu.hpp"
 #include "SettingsPanel.hpp"
 #include "Thumbnails.hpp"
 
@@ -37,12 +38,19 @@ struct OverlayPaneScene {
     bool active{};
     RectF cell{};
     PaneChromeLayout chrome{};
-    // Corner controls and the bottom rail reveal independently.
+    // The tag shows on every pane while the pointer moves (chromeAlpha);
+    // the rest of the strip -- rail, buttons, time -- on the pane under it
+    // (timelineAlpha).
     float chromeAlpha{};
     float timelineAlpha{};
     bool hovered{};
     // Explicit playback destination, independent of pointer and audio.
     bool targeted{};
+    // Its place on the screen, 0 for V1: its pill, rails, lit chips, the
+    // edge saying it is heard, its outline as the destination or a drop's
+    // are in that place's colour, as the browser's marks of what it plays
+    // are.
+    int position{};
     std::wstring label;
     bool audioOn{};
     bool paused{};
@@ -58,7 +66,14 @@ struct OverlayPaneScene {
     float buffered01{};
     bool railHot{};
     bool railDragging{};
+    // The row's time.
     std::wstring timeText;
+    // Over the rail while it is pointed at or dragged: the time there and
+    // what a seek reaches, centred on `railX`.
+    std::wstring railText;
+    float railX{};
+    // Its subtitle switch: lines shown and one chosen.
+    bool subtitlesOn{};
     int hotChip{-1};
     int pressedChip{-1};
     bool pillHot{};
@@ -114,6 +129,44 @@ struct OverlayPanelScene {
     int dragRow{-1};
     bool scrollbarHot{};
     bool scrollbarDragging{};
+    // The videos being played, where the list shows them, marked across the
+    // scrollbar: sorted by `y`, those of one row side by side.
+    std::vector<PanelScrollMark> scrollMarks;
+};
+
+// A submenu that is open, beside the line `from` of the card before it.
+// Its items are that line's children.
+struct OverlayPanelSubmenuScene {
+    int from{-1};
+    PanelMenuLayout layout{};
+    int highlighted{-1};
+    int pressed{-1};
+    float alpha{};
+};
+
+// The menu that is open (PanelMenu.hpp), the sheet's or one over the
+// picture; no items when none is.
+struct OverlayPanelMenuScene {
+    std::vector<PanelMenuItem> items;
+    PanelMenuLayout layout{};
+    // What it hangs from and is kept inside, and how, for a fixture that
+    // measures its text again.
+    OverlayRect anchor{};
+    OverlayRect bounds{};
+    PanelMenuPlacement placement{PanelMenuPlacement::Below};
+    PanelMenuMetrics metrics{};
+    // Under the pointer or the keyboard, and pressed.
+    int highlighted{-1};
+    int pressed{-1};
+    // Fading in -- with the sheet's own alpha, for its drop-down -- and the
+    // distance it still has to slide to its place, in pixels.
+    float alpha{};
+    float offset{};
+    // Outermost first.
+    std::vector<OverlayPanelSubmenuScene> submenus;
+    // The place of the video it is about (0 for V1), whose colour its
+    // ticks, switches and chosen segments are lit in; -1 for none.
+    int position{-1};
 };
 
 struct OverlayScene {
@@ -133,6 +186,9 @@ struct OverlayScene {
     bool volumeOpen{};
     bool volumeDragging{};
     float seek01{};
+    // The place of the video the rail is the timeline of, whose colour it
+    // is filled in; -1 while it is all of them.
+    int seekPosition{-1};
     bool seekHot{};
     bool seekDragging{};
     // Pointer x over the rail for the time bubble; negative when absent.
@@ -175,14 +231,18 @@ struct OverlayScene {
     OverlayRect tooltipAnchor{};
 
     bool showEmptyHint{};
-    // Where the hint's lines and its Open Emby button stand, how far the
-    // button shows (it fades under the sheet) and its pointer states.
+    // Where the hint's lines and its Open file and Open Emby buttons stand,
+    // how far the buttons show (they fade under the sheet) and their
+    // pointer states.
     EmptyHintLayout emptyHint{};
-    float emptyEmbyAlpha{};
+    float emptyButtonsAlpha{};
+    bool emptyOpenHot{};
+    bool emptyOpenPressed{};
     bool emptyEmbyHot{};
     bool emptyEmbyPressed{};
 
     OverlayPanelScene panel;
+    OverlayPanelMenuScene panelMenu;
 };
 
 enum class OverlayTextStyle { Body, BodyBold, Small, Title, Icon, MediaTitle, MediaTitleCompact, CaptionIcon };
@@ -216,6 +276,11 @@ public:
 
     // Opt-in wrapped notes use the same layout for measurement and paint.
     void measureWrappedNote(PanelRow& row, float rowWidth, float scale);
+
+    // A drop-down's text widths by item, in the styles it is drawn in, for
+    // panelMenuLayout; 0 where no font is ready.
+    void measurePanelMenu(const std::vector<PanelMenuItem>& items, float scale,
+                          std::vector<float>& labelWidths, std::vector<float>& shortcutWidths);
 
     // Paints the scene onto the swap chain's current back buffer. Called by
     // the renderer inside its device lock, between the last pane and Present.
@@ -254,7 +319,9 @@ private:
     void clearTextCaches();
     void mediaText(const std::wstring& value, OverlayTextStyle style, const OverlayRect& box,
                    float lineHeight, D2D1_COLOR_F color);
-    void toggleSwitch(const OverlayRect& box, bool on, bool hot, float alpha, float scale);
+    // On, it is lit in the accent, or in the colour of the video at place
+    // `video` (0 for V1) when it is about one.
+    void toggleSwitch(const OverlayRect& box, bool on, bool hot, float alpha, float scale, int video = -1);
     // A one-line box: its label, the search's magnifier, the text (dots for
     // a password) or its grey placeholder, an input method's composition,
     // the selection, the caret and the clear button, all placed by
@@ -264,12 +331,15 @@ private:
     void glyph(wchar_t code, const wchar_t* fallback, const OverlayRect& box, D2D1_COLOR_F color);
     void fillRound(const OverlayRect& box, float radius, D2D1_COLOR_F color);
     void strokeRound(const OverlayRect& box, float radius, D2D1_COLOR_F color, float width);
-    // `toggled` lights a switch that is on in the accent; `dimmed` greys
+    // `toggled` lights a switch that is on in the accent, or in the colour
+    // of the video at place `video` when it is one of its; `dimmed` greys
     // the glyph of one that is off.
     void button(const OverlayRect& box, wchar_t code, const wchar_t* fallback,
-                bool hot, bool pressed, bool toggled, float alpha, float scale, bool dimmed = false);
+                bool hot, bool pressed, bool toggled, float alpha, float scale, bool dimmed = false,
+                int video = -1);
+    // Filled to the playhead in the accent, or in the video's colour.
     void rail(const OverlayRect& band, float inset, float thickness, float position01,
-              float buffered01, bool showThumb, float thumbRadius, float alpha);
+              float buffered01, bool showThumb, float thumbRadius, float alpha, int video = -1);
     // A rail standing up: 0 at the bottom, 1 at the top. The volume popup.
     void verticalRail(const OverlayRect& band, float inset, float thickness, float position01,
                       float thumbRadius, float alpha);
@@ -307,6 +377,10 @@ private:
     void drawTooltip(const OverlayScene& scene);
     void drawEmptyHint(const OverlayScene& scene);
     void drawPanel(const OverlayScene& scene);
+    void drawPanelMenu(const OverlayScene& scene);
+    // One card of it: `opened` is the line whose submenu is open.
+    void drawPanelMenuCard(const std::vector<PanelMenuItem>& items, const PanelMenuLayout& layout, int highlighted,
+                           int pressed, int opened, float alpha, float offset, float scale, int video);
 
     Microsoft::WRL::ComPtr<ID2D1Factory1> factory_;
     Microsoft::WRL::ComPtr<ID2D1Device> device_;

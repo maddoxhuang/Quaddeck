@@ -102,22 +102,123 @@ inline std::wstring localDirectory(const std::wstring& path) {
 }
 
 // Within one folder the name identifies the file, however the path that
-// reached the player was spelled.
+// reached the player was spelled. A list of every video under a folder can
+// hold one name twice, in two of its folders: the file of the path's own
+// folder is that one, and the first of its name only when none is.
 inline int localEntryIndex(const std::vector<LocalEntry>& entries, const std::wstring& path) {
     const std::wstring name = localFileName(path);
+    const std::size_t folderLength = path.size() - name.size();
+    int byName = -1;
     for (std::size_t i = 0; i < entries.size(); ++i) {
         // The name in place: the sheet asks this of every pane each frame.
         const auto& candidate = entries[i].path;
         const auto slash = candidate.find_last_of(L"\\/");
-        const wchar_t* candidateName = candidate.c_str() + (slash == std::wstring::npos ? 0 : slash + 1);
-        if (_wcsicmp(candidateName, name.c_str()) == 0) return static_cast<int>(i);
+        const std::size_t nameAt = slash == std::wstring::npos ? 0 : slash + 1;
+        if (_wcsicmp(candidate.c_str() + nameAt, name.c_str()) != 0) continue;
+        if (nameAt == folderLength && _wcsnicmp(candidate.c_str(), path.c_str(), folderLength) == 0) {
+            return static_cast<int>(i);
+        }
+        if (byName < 0) byName = static_cast<int>(i);
     }
-    return -1;
+    return byName;
 }
 
 inline bool sameLocalDirectory(const std::wstring& left, const std::wstring& right) {
     return !left.empty() && _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
+
+inline bool isLocalSeparator(wchar_t character) { return character == L'\\' || character == L'/'; }
+
+// The path a folder is read by. A drive's top folder is "D:" as a file's
+// folder ("D:\clip.mp4"), and "D:" alone would be that drive's current folder.
+inline std::wstring localListingPath(const std::wstring& directory) {
+    if (directory.size() == 2 && directory[1] == L':') return directory + L"\\";
+    return directory;
+}
+
+// The folder above one the list shows, or nothing at the top of a drive or
+// a share: "D:" above "D:\Videos", "\\nas\share" above "\\nas\share\Videos",
+// and nothing above either of those.
+inline std::wstring localParentFolder(const std::wstring& directory) {
+    std::wstring folder = directory;
+    while (folder.size() > 1 && isLocalSeparator(folder.back())) folder.pop_back();
+    if (folder.size() > 2 && isLocalSeparator(folder[0]) && isLocalSeparator(folder[1])) {
+        // \\server\share is a share's top; a server alone cannot be listed.
+        const auto separators = std::count_if(folder.begin() + 2, folder.end(), isLocalSeparator);
+        if (separators < 2) return {};
+    }
+    const auto slash = folder.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash == 0) return {};
+    return folder.substr(0, slash);
+}
+
+// Whether a path is in a folder or any folder under it.
+inline bool localPathUnder(const std::wstring& path, const std::wstring& directory) {
+    if (directory.empty() || path.size() <= directory.size()) return false;
+    if (_wcsnicmp(path.c_str(), directory.c_str(), directory.size()) != 0) return false;
+    return isLocalSeparator(directory.back()) || isLocalSeparator(path[directory.size()]);
+}
+
+// The folders between a folder and a file under it: "Season 1" for
+// "D:\Show\Season 1\E01.mkv" under "D:\Show", nothing for a file in it.
+inline std::wstring localRelativeFolder(const std::wstring& path, const std::wstring& directory) {
+    if (!localPathUnder(path, directory)) return {};
+    const std::wstring folder = localDirectory(path);
+    std::size_t start = directory.size();
+    while (start < folder.size() && isLocalSeparator(folder[start])) ++start;
+    return start < folder.size() ? folder.substr(start) : std::wstring();
+}
+
+// Where the list is, as the browser's header says it: the folder's last two
+// names under an ellipsis -- "… › Show › Season 1" -- or all of them when
+// there are no more than three: "D: › Show".
+inline std::wstring localFolderCrumb(const std::wstring& directory) {
+    std::vector<std::wstring> names;
+    std::wstring name;
+    for (const wchar_t character : directory) {
+        if (isLocalSeparator(character)) {
+            if (!name.empty()) names.push_back(std::move(name));
+            name.clear();
+        } else {
+            name += character;
+        }
+    }
+    if (!name.empty()) names.push_back(std::move(name));
+    if (names.empty()) return L"Folder";
+    std::size_t first = 0;
+    std::wstring crumb;
+    if (names.size() > 3) {
+        first = names.size() - 2;
+        crumb = L"\x2026";
+    }
+    for (std::size_t i = first; i < names.size(); ++i) {
+        if (!crumb.empty()) crumb += L" \x203A ";
+        crumb += names[i];
+    }
+    return crumb;
+}
+
+// Every video under a folder (All videos) is read only so far: a share's
+// whole tree for one list has to end somewhere, and so does a link that
+// leads back above itself.
+inline constexpr std::size_t kLocalFlatLimit = 5000;
+inline constexpr int kLocalFlatDepth = 16;
+
+// A folder's row in the list is named by a param of its own, counting down
+// from this for the folders in order; -1 names no row, and a video's param
+// is its place in the list.
+inline constexpr int kLocalFolderParam = -2;
+
+// What reading a folder for the list gives: its videos, and the folders in
+// it -- or, for All videos, every video under it, each folder's own before
+// those of the folders in it, and no folders.
+struct LocalListing {
+    std::vector<LocalEntry> entries;
+    std::vector<std::wstring> folders;
+    std::wstring error;
+    // All videos stopped at kLocalFlatLimit.
+    bool capped{};
+};
 
 // A file's name without its last extension: "movie.chs" of "movie.chs.ass".
 inline std::wstring localStem(const std::wstring& path) {

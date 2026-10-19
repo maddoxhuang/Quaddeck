@@ -168,6 +168,7 @@ std::vector<PanelRow> App::buildEmbyReplacementRows(float clientWidth) const {
         row.id = SettingId::EmbyReplaceChoice;
         row.param = static_cast<int>(pane);
         row.label = L"V" + std::to_wstring(position + 1) + L" · " + title;
+        row.video = position;
         row.on = audioPaneEnabled(pane);
         row.value = row.on ? L"Audio on" : L"Muted";
         row.tileKeys.push_back(slot ? slot->imageKey : localThumbnailKey(paths_[pane], 200));

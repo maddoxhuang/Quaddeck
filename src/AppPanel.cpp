@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
+#include <tuple>
 
 namespace quaddeck {
 
@@ -132,6 +133,8 @@ void App::closeSettingsPanel() {
     embyCancelReplacement();
     localCancelReplacement();
     if (!settingsOpen_) return;
+    // Its drop-down goes with it; a menu over the picture stays.
+    if (panelMenu_ && panelMenu_->inSheet) closePanelMenu();
     rememberSheetScroll();
     settingsOpen_ = false;
     if (controlDrag_ == ControlDrag::PanelSlider) endControlDrag(true);
@@ -248,6 +251,7 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
             buttons(SettingId::PaneOffset, static_cast<int>(position),
                     positionName(position) + L" offset", {L"−1 s", L"−0.1 s", L"+0.1 s", L"+1 s"},
                     seconds(offset), loaded);
+            rows.back().video = static_cast<int>(position);
         }
         buttons(SettingId::ResetOffsets, -1, L"", {L"Reset all offsets to zero"}, L"", anyPaneOffset());
         for (std::size_t position = 0; position < kMaxPanes; ++position) {
@@ -257,6 +261,7 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
                    positionName(position) + L" repeats", sourceAutoRepeat_[pane],
                    activeSeekMode() == SeekMode::Independent && sources_[pane] != nullptr &&
                        paneRepeatFlagInForce(paneOrigins(), pane, seekMode_));
+            rows.back().video = static_cast<int>(position);
         }
         note(perPaneTimelines()
             ? L"F6 and Emby videos repeat on their own; a video opened by hand repeats only among "
@@ -274,15 +279,16 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
             if (!loaded) continue;
             toggle(SettingId::PaneAudio, static_cast<int>(position),
                    positionName(position) + L" audio output", audioPaneEnabled(pane), loaded);
+            rows.back().video = static_cast<int>(position);
             slider(SettingId::PaneVolume, static_cast<int>(position),
                    positionName(position) + L" volume", audio_.paneVolume(pane),
                    percent(audio_.paneVolume(pane)), loaded, true, audio_.paneMuted(pane));
+            rows.back().video = static_cast<int>(position);
         }
         break;
     }
 
     case SettingsTab::Subtitles: {
-        toggle(SettingId::SubtitleShow, -1, L"Show subtitles  (Alt+H)", subtitleSettings_.show);
         {
             std::vector<std::wstring> languages;
             for (int language = 0; language < kSubtitleLanguageCount; ++language) {
@@ -307,12 +313,17 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
             const auto pane = paneForPosition(position);
             if (!paneLogicallyLoaded(pane)) continue;
             subtitleRows = true;
-            // What the video shows, its timing, and the ways to change both.
+            // Its switch, as on its strip; then what it shows, its timing,
+            // and the ways to change both.
+            toggle(SettingId::SubtitleShow, static_cast<int>(position),
+                   positionName(position) + L" subtitles  (Alt+H)", subtitlesSwitchedOn(static_cast<int>(pane)));
+            rows.back().video = static_cast<int>(position);
             std::wstring shown = subtitleLabel(pane);
             if (shown.size() > 34) shown = shown.substr(0, 33) + L"\x2026";
             buttons(SettingId::SubtitlePane, static_cast<int>(position),
                     positionName(position) + L"  \x00B7  " + shown,
                     {L"Next", L"Earlier", L"Later", L"Load\x2026"}, seconds(subtitleDelay_[pane]));
+            rows.back().video = static_cast<int>(position);
         }
         note(subtitleRows ? L"Next: Alt+L.  Earlier / later by 0.5 s:  .  and  ,  (/ resets).  Load: Alt+O."
                           : L"Open a video to choose its subtitles, or drop a subtitle file on it.");
@@ -420,16 +431,19 @@ App::ListRowMarks App::listRowMarks() const {
     ListRowMarks marks;
     for (std::size_t pane = 0; pane < embyPanes_.size(); ++pane) {
         if (embyPaneAccountMatches(pane) && !embyPanes_[pane]->itemId.empty()) {
-            marks.embyPlaying.insert(embyPanes_[pane]->itemId);
+            const int position = static_cast<int>(positionForPane(pane));
+            const auto [playing, added] = marks.embyPlaying.try_emplace(embyPanes_[pane]->itemId, position);
+            if (!added) playing->second = std::min(playing->second, position);
         }
     }
     marks.localPlaying.fill(-1);
+    marks.localPositions.fill(-1);
     if (browserSource_ == BrowserSource::Local) {
         for (std::size_t pane = 0; pane < paths_.size(); ++pane) {
             const auto& path = paths_[pane];
-            if (!emby::isLocator(path) && sameLocalDirectory(localDirectory(path), localDirectory_)) {
-                marks.localPlaying[pane] = localEntryIndex(localList_, path);
-            }
+            if (!localListCovers(path)) continue;
+            marks.localPlaying[pane] = localEntryIndex(localList_, path);
+            if (marks.localPlaying[pane] >= 0) marks.localPositions[pane] = static_cast<int>(positionForPane(pane));
         }
     }
     // All libraries must finish before an item's provenance or final
@@ -503,13 +517,12 @@ void App::composePanelRows(std::vector<PanelRow> rows, std::vector<PanelListRun>
 // its text, so the layout made without it stands and only their parts are
 // placed now. The content's rows follow each other down, so the search
 // starts at the first one reaching the band and ends below it.
-void App::fillListWindow() {
+void App::fillListWindow(const ListRowMarks& marks) {
     if (panelRuns_.empty()) return;
     const auto& content = panelLayout_.content;
     const float margin = content.height;
     const float top = content.y - margin;
     const float bottom = content.bottom() + margin;
-    const auto marks = listRowMarks();
     const std::size_t count = std::min(panelRows_.size(), panelLayout_.rows.size());
     for (std::size_t i = panelFirstRowReaching(panelLayout_, top); i < count; ++i) {
         auto& geometry = panelLayout_.rows[i];
@@ -523,6 +536,59 @@ void App::fillListWindow() {
         fillListRow(row, marks);
         panelRowParts(geometry, row, uiScale_);
         panelFilledRows_.push_back(i);
+    }
+}
+
+// The videos being played, marked on the scrollbar where the list shows
+// them, near the screen or not: found by the entries the list's runs name,
+// so no row is filled for it. One mark per entry, in the colour its row or
+// tile is marked in -- a file in two panes the first one's -- in the rows'
+// order and then the videos' places on the screen.
+void App::placePanelScrollMarks(const ListRowMarks& marks) {
+    panelScrollMarks_.clear();
+    if (!panelLayout_.scrollbar.visible()) return;
+    struct Found {
+        std::size_t row;
+        int param;
+        int position;
+    };
+    std::vector<Found> found;
+    const auto mark = [&](SettingId id, int param, int position) {
+        if (const auto row = panelListRowOf(panelRuns_, id, param)) found.push_back({*row, param, position});
+    };
+    for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
+        if (marks.localPlaying[pane] >= 0) mark(SettingId::LocalItem, marks.localPlaying[pane], marks.localPositions[pane]);
+    }
+    const bool embyListed = std::any_of(panelRuns_.begin(), panelRuns_.end(),
+                                        [](const PanelListRun& run) { return run.id == SettingId::EmbyItem; });
+    if (embyListed && !marks.embyPlaying.empty()) {
+        // Wherever the item appears: Continue watching and the list below it.
+        const auto look = [&](const std::vector<emby::Item>& items, bool resume) {
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                const auto playing = marks.embyPlaying.find(items[index].id);
+                if (playing == marks.embyPlaying.end()) continue;
+                mark(SettingId::EmbyItem, resume ? -static_cast<int>(index) - 1 : static_cast<int>(index),
+                     playing->second);
+            }
+        };
+        look(embyResume_, true);
+        look(embyItems_, false);
+    }
+    const auto byRowAndPlace = [](const Found& left, const Found& right) {
+        return std::tie(left.row, left.position, left.param) < std::tie(right.row, right.position, right.param);
+    };
+    std::sort(found.begin(), found.end(), byRowAndPlace);
+    // The first of an entry's marks in its row is the lowest place's.
+    std::vector<Found> kept;
+    for (const auto& candidate : found) {
+        const bool seen = std::any_of(kept.begin(), kept.end(), [&](const Found& other) {
+            return other.row == candidate.row && other.param == candidate.param;
+        });
+        if (!seen) kept.push_back(candidate);
+    }
+    for (const auto& entry : kept) {
+        const float y = panelScrollMarkY(panelLayout_, entry.row, uiScale_);
+        if (y >= 0.0F) panelScrollMarks_.push_back({y, entry.position, panelScrollCentring(panelLayout_, entry.row)});
     }
 }
 
@@ -552,9 +618,15 @@ void App::refreshPanelGeometry(const RECT& client) {
         panelRows_, settingsScroll_, settingsAlpha_, PanelMetrics{}, sheetWidth, captionInset(),
         embyBrowserOpen_ ? 0 : kSettingsTabCount, static_cast<int>(sheetSwitches().size()));
     settingsScroll_ = std::clamp(settingsScroll_, 0.0F, panelLayout_.maxScroll);
-    fillListWindow();
+    panelScrollMarks_.clear();
+    if (!panelRuns_.empty()) {
+        const auto marks = listRowMarks();
+        fillListWindow(marks);
+        placePanelScrollMarks(marks);
+    }
     if (embyBrowserOpen_ && settingsOpen_) embyRequestVisibleImages();
     if (embyBrowserOpen_ && settingsOpen_ && browserSource_ == BrowserSource::Emby) embyLoadMoreNearEnd();
+    layoutPanelMenu();
 }
 
 bool App::sheetTakesPointer() const { return settingsOpen_ && settingsAlpha_ > 0.05F; }
@@ -612,27 +684,490 @@ void App::applyPanelSlider(int rowIndex, float fraction) {
     }
 }
 
-unsigned App::showPanelMenu(HMENU menu, SettingId id, int part, int param) {
-    if (!menu) return 0;
-    POINT anchor{};
-    GetCursorPos(&anchor);
-    for (std::size_t i = 0; i < panelRows_.size() && i < panelLayout_.rows.size(); ++i) {
-        if (panelRows_[i].id != id || (param >= 0 && panelRows_[i].param != param)) continue;
-        const auto& geometry = panelLayout_.rows[i];
-        if (part >= 0 && part < static_cast<int>(geometry.parts.size()) && geometry.parts[part].visible()) {
-            const auto box = geometry.parts[part];
-            anchor = {static_cast<LONG>(std::lround(box.x)), static_cast<LONG>(std::lround(box.bottom()))};
-            if (videoWindow_) ClientToScreen(videoWindow_, &anchor);
+void App::takePointerAndKeysForPanelMenu() {
+    // A Windows menu took the capture, which ended whatever the left button
+    // was doing (a right-click can open one mid-drag), and its loop took the
+    // keys from the box typed into. The drawn one does both itself.
+    if (videoWindow_ && GetCapture() == videoWindow_) ReleaseCapture();
+    pressedPanelId_ = SettingId::None;
+    pressedPanelParam_ = -1;
+    blurField();
+}
+
+void App::openPanelMenu(PanelMenu menu, SettingId id, int part, int param, std::function<void(unsigned)> choose) {
+    closePanelMenu();
+    if (menu.items.empty() || !choose) return;
+    takePointerAndKeysForPanelMenu();
+    OpenPanelMenu open;
+    open.menu = std::move(menu);
+    open.id = id;
+    open.part = part;
+    open.param = param;
+    open.choose = std::move(choose);
+    open.openedAt = GetTickCount64();
+    GetCursorPos(&open.pointer);
+    if (videoWindow_) ScreenToClient(videoWindow_, &open.pointer);
+    panelMenu_ = std::move(open);
+    layoutPanelMenu();
+}
+
+void App::openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose) {
+    closePanelMenu();
+    if (menu.items.empty() || !choose) return;
+    takePointerAndKeysForPanelMenu();
+    OpenPanelMenu open;
+    open.menu = std::move(menu);
+    open.anchor ={static_cast<float>(local.x), static_cast<float>(local.y), 0.0F, 0.0F};
+    open.choose = std::move(choose);
+    open.openedAt = GetTickCount64();
+    open.pointer = local;
+    panelMenu_ = std::move(open);
+    layoutPanelMenu();
+}
+
+void App::openWindowMenu(PanelMenu menu, WindowMenuAnchor anchor, std::function<void(unsigned)> choose, int pane) {
+    closePanelMenu();
+    if (menu.items.empty() || !choose) return;
+    takePointerAndKeysForPanelMenu();
+    OpenPanelMenu open;
+    open.menu = std::move(menu);
+    open.inSheet = false;
+    open.barItem = anchor.barItem >= 0 && anchor.barItem < static_cast<int>(kBarItemCount) ? anchor.barItem : -1;
+    open.pillPane = anchor.pillPane >= 0 && anchor.pillPane < static_cast<int>(kMaxPanes) ? anchor.pillPane : -1;
+    if (anchor.chipPane >= 0 && anchor.chipPane < static_cast<int>(kMaxPanes) &&
+        anchor.chip >= 0 && anchor.chip < static_cast<int>(kPaneChipCount)) {
+        open.chipPane = anchor.chipPane;
+        open.chip = anchor.chip;
+    }
+    open.pane = pane >= 0 && pane < static_cast<int>(kMaxPanes) ? pane : -1;
+    open.placement = open.barItem >= 0 || open.pillPane >= 0 || open.chipPane >= 0 ? PanelMenuPlacement::Below
+                                                             : PanelMenuPlacement::AtPoint;
+    open.metrics = PanelMenuMetrics::compact();
+    open.anchor = {static_cast<float>(anchor.point.x), static_cast<float>(anchor.point.y), 0.0F, 0.0F};
+    open.choose = std::move(choose);
+    open.openedAt = GetTickCount64();
+    GetCursorPos(&open.pointer);
+    if (videoWindow_) ScreenToClient(videoWindow_, &open.pointer);
+    // As long as a Windows menu waits under a resting pointer to open a
+    // submenu or close one the pointer has left.
+    DWORD delay = 400;
+    if (SystemParametersInfoW(SPI_GETMENUSHOWDELAY, 0, &delay, 0)) open.delay = std::min<ULONGLONG>(delay, 2000);
+    panelMenu_ = std::move(open);
+    layoutPanelMenu();
+}
+
+void App::closePanelMenu() {
+    panelMenu_.reset();
+}
+
+OverlayRect App::windowMenuBounds() const {
+    RECT client{};
+    if (!videoWindow_ || !GetClientRect(videoWindow_, &client)) return {};
+    // Under the caption's strip whether or not it is up: up, a press there
+    // is the frame's (WM_NCHITTEST), and a menu opened while it was down
+    // would come to lie under it.
+    const float height = static_cast<float>(client.bottom);
+    const float top = std::min(captionInset(), height);
+    return {0.0F, top, static_cast<float>(client.right), height - top};
+}
+
+OverlayRect App::panelMenuBounds() const {
+    if (panelMenu_ && !panelMenu_->inSheet) return windowMenuBounds();
+    const auto& sheet = panelLayout_.sheet;
+    if (!sheet.visible()) return {};
+    // Below the caption's strip, which stands over the sheet's column.
+    const float top = std::clamp(panelLayout_.header.y, sheet.y, sheet.bottom());
+    return {sheet.x, top, sheet.width, sheet.bottom() - top};
+}
+
+void App::layoutPanelMenu() {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    if (open.inSheet && !sheetTakesPointer()) {
+        closePanelMenu();
+        return;
+    }
+    if (open.inSheet && open.id != SettingId::None) {
+        // The rows are rebuilt every frame: the button is looked for again,
+        // by what it is rather than by its place in the list.
+        open.anchorRow = -1;
+        for (std::size_t i = 0; i < panelRows_.size() && i < panelLayout_.rows.size(); ++i) {
+            if (panelRows_[i].id != open.id || (open.param >= 0 && panelRows_[i].param != open.param)) continue;
+            const auto& parts = panelLayout_.rows[i].parts;
+            if (open.part >= 0 && open.part < static_cast<int>(parts.size()) &&
+                parts[static_cast<std::size_t>(open.part)].visible()) {
+                open.anchor = parts[static_cast<std::size_t>(open.part)];
+                open.anchorRow = static_cast<int>(i);
+            }
+            break;
         }
+        if (open.anchorRow < 0) {
+            closePanelMenu();
+            return;
+        }
+        // Nor does it hang from a button moved out of the band it is shown
+        // in -- the window made shorter under it, the page reflowed.
+        const OverlayRect& band = open.anchorRow < static_cast<int>(panelLayout_.pinnedRows)
+                                      ? panelLayout_.pinned : panelLayout_.content;
+        if (open.anchor.bottom() <= band.y || open.anchor.y >= band.bottom()) {
+            closePanelMenu();
+            return;
+        }
+    }
+    if (!open.inSheet && (open.barItem >= 0 || open.pillPane >= 0 || open.chipPane >= 0)) {
+        // A bar button, a pane's tag or a button on its strip, looked for
+        // again as the sheet's button is: the menu goes with it -- the bar
+        // narrowed past it, the pane closed.
+        const OverlayRect button = open.barItem >= 0 ? barLayout_[static_cast<BarItem>(open.barItem)]
+            : open.pillPane >= 0 ? paneChrome_[static_cast<std::size_t>(open.pillPane)].pill
+            : paneChrome_[static_cast<std::size_t>(open.chipPane)].chips[static_cast<std::size_t>(open.chip)];
+        if (!button.visible()) {
+            closePanelMenu();
+            return;
+        }
+        open.anchor = button;
+    }
+    const OverlayRect bounds = panelMenuBounds();
+    std::vector<float> labelWidths;
+    std::vector<float> shortcutWidths;
+    overlay_.measurePanelMenu(open.menu.items, uiScale_, labelWidths, shortcutWidths);
+    open.layout = panelMenuLayout(open.menu.items, labelWidths, shortcutWidths, open.anchor, bounds,
+                                  uiScale_, open.layout.scroll, open.placement, open.metrics);
+    // Each submenu beside the line it opened from; with those past it, it
+    // closes when that line has been scrolled out of its card's view.
+    for (std::size_t depth = 1; depth <= open.submenus.size(); ++depth) {
+        const OverlayRect from = panelSubmenuAnchor(open.layoutAt(depth - 1), open.submenus[depth - 1].from);
+        if (!from.visible()) {
+            closePanelSubmenus(depth - 1);
+            break;
+        }
+        const auto& items = open.itemsAt(depth);
+        overlay_.measurePanelMenu(items, uiScale_, labelWidths, shortcutWidths);
+        auto& submenu = open.submenus[depth - 1];
+        submenu.layout = panelMenuLayout(items, labelWidths, shortcutWidths, from, bounds, uiScale_,
+                                         submenu.layout.scroll, PanelMenuPlacement::Beside, open.metrics);
+    }
+}
+
+void App::closePanelSubmenus(std::size_t depth) {
+    if (!panelMenu_ || panelMenu_->submenus.size() <= depth) return;
+    auto& open = *panelMenu_;
+    open.submenus.resize(depth);
+    open.keyDepth = std::min(open.keyDepth, depth);
+    if (open.pressedDepth > depth) {
+        open.pressed = -1;
+        open.pressedDepth = 0;
+    }
+    if (open.restDepth > depth) open.restSince = 0;
+}
+
+void App::openPanelSubmenu(std::size_t depth, int index, bool byKeyboard) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    if (depth > open.submenus.size()) return;
+    const auto& items = open.itemsAt(depth);
+    if (index < 0 || index >= static_cast<int>(items.size())) return;
+    const auto& item = items[static_cast<std::size_t>(index)];
+    if (item.kind != PanelMenuItemKind::Submenu || !panelMenuSelectable(item)) return;
+    open.restSince = 0;
+    open.highlightedAt(depth) = index;
+    // A line at the edge of a card cut to a short window, lit though less
+    // than half of it shows, comes into view first: a submenu hangs only
+    // from a line in view.
+    open.layoutAt(depth).scroll = panelMenuScrollToShow(open.layoutAt(depth), index);
+    if (depth == open.submenus.size() || open.submenus[depth].from != index) {
+        closePanelSubmenus(depth);
+        open.submenus.push_back({index, {}, -1, GetTickCount64()});
+    }
+    if (byKeyboard) {
+        open.keyDepth = depth + 1;
+        open.highlightedAt(depth + 1) = panelMenuStep(open.itemsAt(depth + 1), -1, 1);
+    }
+    layoutPanelMenu();
+}
+
+int App::panelMenuCardAt(POINT local) const {
+    if (!panelMenu_) return -1;
+    const auto& open = *panelMenu_;
+    const float x = static_cast<float>(local.x);
+    const float y = static_cast<float>(local.y);
+    // The deepest first: a submenu's card lies over the edge of the one it
+    // opened from.
+    for (std::size_t depth = open.submenus.size() + 1; depth-- > 0;) {
+        if (open.layoutAt(depth).card.contains(x, y)) return static_cast<int>(depth);
+    }
+    return -1;
+}
+
+OverlayHit App::panelMenuAnchorHit() const {
+    if (!panelMenu_ || panelMenu_->inSheet) return {};
+    if (panelMenu_->barItem >= 0) return {OverlayHitKind::BarItem, -1, panelMenu_->barItem};
+    if (panelMenu_->pillPane >= 0) return {OverlayHitKind::PanePill, panelMenu_->pillPane, -1};
+    if (panelMenu_->chipPane >= 0) return {OverlayHitKind::PaneChip, panelMenu_->chipPane, panelMenu_->chip};
+    return {};
+}
+
+void App::scrollPanelMenu(int wheelDelta) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    // The card under the pointer, or else the one the keys are in.
+    const int card = panelMenuCardAt(open.pointer);
+    const std::size_t depth = card >= 0 ? static_cast<std::size_t>(card) : std::min(open.keyDepth, open.submenus.size());
+    if (open.layoutAt(depth).maxScroll <= 0.0F) return;
+    // No submenu hangs from a line scrolling away.
+    closePanelSubmenus(depth);
+    // Two lines a notch.
+    open.layoutAt(depth).scroll -= static_cast<float>(wheelDelta) / WHEEL_DELTA * 2.0F * open.metrics.itemHeight * uiScale_;
+    layoutPanelMenu();
+    if (!panelMenu_) return;
+    // The line under the pointer is another one now, and only it may open
+    // a submenu: the one the pointer rested on before has moved away.
+    auto& scrolled = *panelMenu_;
+    const int line = panelMenuItemAt(scrolled.layoutAt(depth), scrolled.itemsAt(depth),
+                                     static_cast<float>(scrolled.pointer.x), static_cast<float>(scrolled.pointer.y));
+    scrolled.highlightedAt(depth) = line;
+    scrolled.restSince = 0;
+    if (card >= 0) panelMenuRest(depth, line);
+}
+
+void App::panelMenuHover(POINT local) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    if (local.x == open.pointer.x && local.y == open.pointer.y) return;
+    open.pointer = local;
+    const int card = panelMenuCardAt(local);
+    // Lines go dark where the pointer is not. A submenu stays open, its
+    // line lit, as in a Windows menu.
+    for (std::size_t depth = 0; depth <= open.submenus.size(); ++depth) {
+        if (static_cast<int>(depth) != card) open.highlightedAt(depth) = -1;
+    }
+    if (card < 0) {
+        open.restSince = 0;
+        return;
+    }
+    const auto depth = static_cast<std::size_t>(card);
+    const auto& items = open.itemsAt(depth);
+    const int line = panelMenuItemAt(open.layoutAt(depth), items, static_cast<float>(local.x),
+                                     static_cast<float>(local.y));
+    open.highlightedAt(depth) = line;
+    open.keyDepth = depth;
+    panelMenuRest(depth, line);
+}
+
+void App::panelMenuRest(std::size_t depth, int line) {
+    if (!panelMenu_ || depth > panelMenu_->submenus.size()) return;
+    auto& open = *panelMenu_;
+    const auto& items = open.itemsAt(depth);
+    // Resting on a submenu's line opens it; on another line of a card whose
+    // submenu is open, closes that. On the open one's line, or between
+    // lines, nothing waits.
+    const bool opener = depth < open.submenus.size() && open.submenus[depth].from == line;
+    if (line < 0 || line >= static_cast<int>(items.size()) || opener) {
+        open.restSince = 0;
+        return;
+    }
+    int wanted = -1;
+    if (items[static_cast<std::size_t>(line)].kind == PanelMenuItemKind::Submenu) {
+        wanted = line;
+    } else if (depth == open.submenus.size()) {
+        open.restSince = 0;
+        return;
+    }
+    if (open.restSince == 0 || open.restDepth != depth || open.restLine != wanted) {
+        open.restDepth = depth;
+        open.restLine = wanted;
+        open.restSince = std::max<ULONGLONG>(GetTickCount64(), 1);
+    }
+}
+
+void App::panelMenuTick() {
+    if (!panelMenu_ || panelMenu_->restSince == 0) return;
+    auto& open = *panelMenu_;
+    if (GetTickCount64() - open.restSince < open.delay) return;
+    const std::size_t depth = open.restDepth;
+    const int line = open.restLine;
+    open.restSince = 0;
+    if (line >= 0) openPanelSubmenu(depth, line, false);
+    else closePanelSubmenus(depth);
+}
+
+void App::panelMenuPress(POINT local) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    const int card = panelMenuCardAt(local);
+    if (card < 0) {
+        // Anywhere else a press only closes it, as a Windows menu's does:
+        // on its own button too, which would otherwise open it again.
+        closePanelMenu();
+        return;
+    }
+    const auto depth = static_cast<std::size_t>(card);
+    open.pressing = true;
+    open.pressedDepth = depth;
+    open.pressedAt = local;
+    open.pressed = panelMenuItemAt(open.layoutAt(depth), open.itemsAt(depth), static_cast<float>(local.x),
+                                   static_cast<float>(local.y));
+    if (open.pressed >= 0) {
+        open.highlightedAt(depth) = open.pressed;
+        open.keyDepth = depth;
+    }
+    // Its release comes here wherever it is let go, off the window too.
+    if (videoWindow_) SetCapture(videoWindow_);
+    // A submenu's line opens under a press at once, without the delay.
+    if (open.pressed >= 0) openPanelSubmenu(depth, open.pressed, false);
+}
+
+void App::panelMenuRelease(POINT local) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    const bool pressing = open.pressing;
+    const int pressed = open.pressed;
+    const std::size_t pressedDepth = open.pressedDepth;
+    open.pressing = false;
+    open.pressed = -1;
+    if (videoWindow_ && GetCapture() == videoWindow_) ReleaseCapture();
+    if (!panelMenu_ || !pressing) return;
+    // Let go on the submenu's line it was pressed on -- or where it was
+    // pressed, that line scrolled into view from under it -- the press
+    // opened that submenu and the release chooses nothing, not a line of
+    // its card wherever that stands. Dragged into the card, it chooses there.
+    if (pressedDepth <= open.submenus.size() && pressed >= 0 &&
+        pressed < static_cast<int>(open.itemsAt(pressedDepth).size()) &&
+        open.itemsAt(pressedDepth)[static_cast<std::size_t>(pressed)].kind == PanelMenuItemKind::Submenu &&
+        ((local.x == open.pressedAt.x && local.y == open.pressedAt.y) ||
+         open.layoutAt(pressedDepth).items[static_cast<std::size_t>(pressed)].contains(static_cast<float>(local.x),
+                                                                                        static_cast<float>(local.y)))) {
+        return;
+    }
+    // Let go on an item, wherever on the menu the press was.
+    const int card = panelMenuCardAt(local);
+    if (card < 0) return;
+    const auto depth = static_cast<std::size_t>(card);
+    const int index = panelMenuItemAt(panelMenu_->layoutAt(depth), panelMenu_->itemsAt(depth),
+                                      static_cast<float>(local.x), static_cast<float>(local.y));
+    if (index >= 0) choosePanelMenuItem(index, depth);
+}
+
+void App::panelMenuRightClick(POINT local) {
+    layoutPanelMenu();
+    if (!panelMenu_) return;
+    // The right button chooses as the left does, as it did in the Windows
+    // menus these replace; off the cards it only closes the menu.
+    const int card = panelMenuCardAt(local);
+    if (card < 0) {
+        closePanelMenu();
+        return;
+    }
+    const auto depth = static_cast<std::size_t>(card);
+    const int index = panelMenuItemAt(panelMenu_->layoutAt(depth), panelMenu_->itemsAt(depth),
+                                      static_cast<float>(local.x), static_cast<float>(local.y));
+    if (index >= 0) choosePanelMenuItem(index, depth);
+}
+
+void App::panelMenuKey(WPARAM key) {
+    if (!panelMenu_) return;
+    auto& open = *panelMenu_;
+    // The keys take over from a pointer resting on a line.
+    open.restSince = 0;
+    const std::size_t depth = std::min(open.keyDepth, open.submenus.size());
+    open.keyDepth = depth;
+    const auto& items = open.itemsAt(depth);
+    const int lit = open.highlightedAt(depth);
+    const bool onItem = lit >= 0 && lit < static_cast<int>(items.size());
+    const bool onSegment = onItem && items[static_cast<std::size_t>(lit)].kind == PanelMenuItemKind::Segment;
+    const bool onSubmenu = onItem && items[static_cast<std::size_t>(lit)].kind == PanelMenuItemKind::Submenu &&
+                           panelMenuSelectable(items[static_cast<std::size_t>(lit)]);
+    // Out of a submenu, back to the line it opened from.
+    const auto back = [&] {
+        const int from = open.submenus[depth - 1].from;
+        closePanelSubmenus(depth - 1);
+        open.keyDepth = depth - 1;
+        open.highlightedAt(depth - 1) = from;
+    };
+    switch (key) {
+    case VK_ESCAPE: {
+        // The deepest card closes alone, as a Windows submenu does, however
+        // it was opened -- by the keys, the pointer or a press; the menu's
+        // own closes the menu.
+        if (open.submenus.empty()) {
+            closePanelMenu();
+            return;
+        }
+        const std::size_t deepest = open.submenus.size();
+        const int from = open.submenus[deepest - 1].from;
+        closePanelSubmenus(deepest - 1);
+        open.keyDepth = deepest - 1;
+        open.highlightedAt(deepest - 1) = from;
         break;
     }
-    const bool previous = contextMenuOpen_;
-    contextMenuOpen_ = true;
-    const unsigned selected = window_ ? TrackPopupMenuEx(
-        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, anchor.x, anchor.y, window_, nullptr) : 0;
-    contextMenuOpen_ = previous;
-    DestroyMenu(menu);
-    return selected;
+    case VK_UP:
+    case VK_DOWN:
+    case VK_HOME:
+    case VK_END: {
+        // Walking a card closes the submenus past it.
+        closePanelSubmenus(depth);
+        int& line = open.highlightedAt(depth);
+        line = key == VK_UP ? panelMenuStep(items, line, -1)
+             : key == VK_DOWN ? panelMenuStep(items, line, 1)
+             : key == VK_HOME ? panelMenuStep(items, -1, 1)
+             : panelMenuStep(items, -1, -1);
+        break;
+    }
+    // Along a row of segments; into a submenu and out of it.
+    case VK_LEFT:
+    case VK_RIGHT:
+        if (onSegment) {
+            const int next = panelMenuStep(items, lit, key == VK_LEFT ? -1 : 1);
+            if (next >= 0 && items[static_cast<std::size_t>(next)].kind == PanelMenuItemKind::Segment) {
+                open.highlightedAt(depth) = next;
+            }
+        } else if (key == VK_RIGHT && onSubmenu) {
+            openPanelSubmenu(depth, lit, true);
+        } else if (key == VK_LEFT && depth > 0) {
+            back();
+        }
+        break;
+    case VK_RETURN:
+    case VK_SPACE:
+        // Its character is dropped (WM_CHAR), whatever the choice opens.
+        if (key == VK_SPACE) menuSpaceTaken_ = true;
+        if (onSubmenu) {
+            openPanelSubmenu(depth, lit, true);
+            break;
+        }
+        if (onItem) choosePanelMenuItem(lit, depth);
+        return;
+    default:
+        // Every other key is the menu's too, and does nothing.
+        return;
+    }
+    // A line the keyboard reaches in a card cut to a short window is
+    // scrolled into view.
+    if (!panelMenu_) return;
+    auto& keyed = *panelMenu_;
+    const std::size_t at = std::min(keyed.keyDepth, keyed.submenus.size());
+    if (keyed.layoutAt(at).maxScroll > 0.0F) {
+        keyed.layoutAt(at).scroll = panelMenuScrollToShow(keyed.layoutAt(at), keyed.highlightedAt(at));
+        layoutPanelMenu();
+    }
+}
+
+void App::choosePanelMenuItem(int index, std::size_t depth) {
+    if (!panelMenu_ || depth > panelMenu_->submenus.size()) return;
+    const auto& items = panelMenu_->itemsAt(depth);
+    if (index < 0 || index >= static_cast<int>(items.size())) return;
+    const auto& item = items[static_cast<std::size_t>(index)];
+    if (!panelMenuSelectable(item)) return;
+    // A submenu's line opens it, and the menu stays.
+    if (item.kind == PanelMenuItemKind::Submenu) {
+        openPanelSubmenu(depth, index, false);
+        return;
+    }
+    const unsigned command = item.command;
+    // Closed first: what the choice does may open another.
+    auto choose = std::move(panelMenu_->choose);
+    closePanelMenu();
+    if (choose) choose(command);
 }
 
 void App::activatePanelHit(const PanelHit& hit) {
@@ -857,7 +1392,7 @@ void App::activatePanelHit(const PanelHit& hit) {
         fileTypesAction(hit.part);
         break;
     case SettingId::SubtitleShow:
-        toggleSubtitlesShown();
+        if (row.param >= 0 && paneLogicallyLoaded(pane)) toggleSubtitles(static_cast<int>(pane));
         break;
     case SettingId::SubtitleLanguage:
         if (hit.part >= 0 && hit.part < kSubtitleLanguageCount) setSubtitleLanguage(hit.part);

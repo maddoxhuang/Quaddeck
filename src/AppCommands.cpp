@@ -58,137 +58,138 @@ void App::setMasterLoopB(double seconds) {
     updateTitle();
 }
 
-void App::showContextMenu(int pane, POINT screenPoint) {
-    contextPane_ = pane;
-    contextMenuOpen_ = true;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) { contextMenuOpen_ = false; contextPane_ = -1; return; }
+void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
+    // What a pane is doing is a switch, as the sheet shows it; the rest are
+    // commands, and the choices of several a submenu each.
+    PanelMenu menu;
     if (pane >= 0 && pane < static_cast<int>(kMaxPanes)) {
         const std::size_t index = static_cast<std::size_t>(pane);
         const bool loaded = paneLogicallyLoaded(index);
-        AppendMenuW(menu, MF_STRING, CmdOpenPane, loaded ? L"Replace video..." : L"Open video...");
-        AppendMenuW(menu, MF_STRING, CmdOpenEmby, L"Open from Emby...\tCtrl+E");
-        AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), CmdPreviousFile,
-                    L"Previous file in folder	Page Up");
-        AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), CmdNextFile,
-                    L"Next file in folder	Page Down");
-        AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), CmdClosePane, L"Close video");
+        menu.option(CmdOpenPane, loaded ? L"Replace video..." : L"Open video...");
+        menu.option(CmdOpenEmby, L"Open from Emby...", false, L"Ctrl+E");
+        menu.option(CmdPreviousFile, L"Previous file in folder", false, L"Page Up", loaded);
+        menu.option(CmdNextFile, L"Next file in folder", false, L"Page Down", loaded);
+        menu.option(CmdClosePane, L"Close video", false, {}, loaded);
         appendEmbyFavoriteMenu(menu, index);
-        AppendMenuW(menu, MF_STRING | (audioPaneEnabled(index) ? MF_CHECKED : 0) |
-                    (loaded ? 0 : MF_GRAYED), CmdSelectAudio, L"Output this audio\t1-5");
-        AppendMenuW(menu, MF_STRING | (audio_.paneMuted(index) ? MF_CHECKED : 0) |
-                    (loaded ? 0 : MF_GRAYED), CmdPaneMute, L"Mute this video");
-        AppendMenuW(menu, MF_STRING | (sources_[index] ? 0 : MF_GRAYED), CmdTogglePanePause,
-                    sourcePaused_[index] ? L"Resume this video" : L"Pause this video");
+        menu.check(CmdSelectAudio, L"Output this audio", audioPaneEnabled(index), L"1-5", loaded);
+        menu.check(CmdPaneMute, L"Mute this video", audio_.paneMuted(index), {}, loaded);
+        menu.check(CmdTogglePanePause, L"Pause this video", sources_[index] && sourcePaused_[index], {},
+                   sources_[index] != nullptr);
         const bool onlyVideo = singleLoadedPane() == pane;
-        AppendMenuW(menu, MF_STRING | ((onlyVideo ? playOrder_ == PlayOrder::RepeatOne : sourceAutoRepeat_[index]) ? MF_CHECKED : 0) |
-                    (loaded ? 0 : MF_GRAYED), CmdTogglePaneRepeat,
-                    onlyVideo ? L"Repeat this video"
-                        : paneRepeatFlagInForce(paneOrigins(), index, seekMode_) ? L"Repeat this video (Independent mode)"
-                        : L"Repeat this video (not beside F6 or Emby videos)");
-        if (severalPanesLoaded()) AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), CmdToggleSolo,
-                    soloPane_ == pane ? L"Return to grid" : L"Solo this video");
-        AppendMenuW(menu, MF_STRING |
-                    (sources_[index] && paneOffsetSeconds(index) != 0.0 ? 0 : MF_GRAYED),
-                    CmdResetPaneOffset, L"Reset this video's offset");
+        menu.check(CmdTogglePaneRepeat,
+                   onlyVideo ? L"Repeat this video"
+                       : paneRepeatFlagInForce(paneOrigins(), index, seekMode_) ? L"Repeat this video (Independent mode)"
+                       : L"Repeat this video (not beside F6 or Emby videos)",
+                   onlyVideo ? playOrder_ == PlayOrder::RepeatOne : sourceAutoRepeat_[index], {}, loaded);
+        if (severalPanesLoaded()) menu.check(CmdToggleSolo, L"Solo this video", soloPane_ == pane, {}, loaded);
+        menu.option(CmdResetPaneOffset, L"Reset this video's offset", false, {},
+                    sources_[index] && paneOffsetSeconds(index) != 0.0);
         const auto active = activePanes();
         const auto activeCount = static_cast<std::size_t>(
             std::count(active.begin(), active.end(), true));
-        const bool canFocusPane = supportsExpandedPaneCount(activeCount);
-        const bool paneIsFocused = canFocusPane && expandedPane_ == pane;
-        if (canFocusPane) AppendMenuW(menu, MF_STRING | (paneIsFocused ? MF_CHECKED : 0) |
-                    (canFocusPane ? 0 : MF_GRAYED),
-                    CmdToggleExpanded,
-                    paneIsFocused ? L"Use automatic focus"
-                                  : L"Make this video the focus");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (supportsExpandedPaneCount(activeCount)) {
+            // On, the arrangement gives this video the focus; off, it chooses.
+            menu.check(CmdToggleExpanded, L"Make this video the focus", expandedPane_ == pane);
+        }
+        menu.separator();
 
-        HMENU speed = CreatePopupMenu();
+        PanelMenu speed;
         const auto speedItem = [&](unsigned id, double value, const wchar_t* text) {
-            AppendMenuW(speed, MF_STRING | (std::abs(playbackRates_[index] - value) < 0.001 ? MF_CHECKED : 0), id, text);
+            speed.option(id, text, std::abs(playbackRates_[index] - value) < 0.001);
         };
         speedItem(CmdSpeed025, 0.25, L"0.25x"); speedItem(CmdSpeed050, 0.5, L"0.5x");
         speedItem(CmdSpeed100, 1.0, L"1.0x"); speedItem(CmdSpeed150, 1.5, L"1.5x");
         speedItem(CmdSpeed200, 2.0, L"2.0x");
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(speed), L"Playback speed");
+        menu.submenu(L"Playback speed", std::move(speed));
 
-        HMENU view = CreatePopupMenu();
-        AppendMenuW(view, MF_STRING | (paneViews_[index].mode == ViewMode::Fit ? MF_CHECKED : 0), CmdViewFit, L"Fit");
-        AppendMenuW(view, MF_STRING | (paneViews_[index].mode == ViewMode::Fill ? MF_CHECKED : 0), CmdViewFill, L"Fill");
-        AppendMenuW(view, MF_STRING | (paneViews_[index].mode == ViewMode::Stretch ? MF_CHECKED : 0), CmdViewStretch, L"Stretch");
-        AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(view, MF_STRING, CmdZoomIn, L"Zoom in");
-        AppendMenuW(view, MF_STRING, CmdZoomOut, L"Zoom out");
-        AppendMenuW(view, MF_STRING, CmdZoomReset, L"Reset zoom");
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(view), L"View / zoom");
+        PanelMenu view;
+        view.option(CmdViewFit, L"Fit", paneViews_[index].mode == ViewMode::Fit)
+            .option(CmdViewFill, L"Fill", paneViews_[index].mode == ViewMode::Fill)
+            .option(CmdViewStretch, L"Stretch", paneViews_[index].mode == ViewMode::Stretch)
+            .separator()
+            .option(CmdZoomIn, L"Zoom in")
+            .option(CmdZoomOut, L"Zoom out")
+            .option(CmdZoomReset, L"Reset zoom");
+        menu.submenu(L"View / zoom", std::move(view));
 
-        HMENU audioTracks = CreatePopupMenu();
+        PanelMenu audioTracks;
         const std::size_t listedTracks = appendAudioTrackMenu(audioTracks, index);
-        AppendMenuW(menu, MF_POPUP | (listedTracks > 1 ? 0 : MF_GRAYED),
-                    reinterpret_cast<UINT_PTR>(audioTracks), L"Audio track");
+        menu.submenu(L"Audio track", std::move(audioTracks), listedTracks > 1);
         // Never greyed: with nothing on offer it is still where a subtitle
         // file is loaded from.
-        HMENU subtitles = CreatePopupMenu();
+        PanelMenu subtitles;
         appendSubtitleMenu(subtitles, index);
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(subtitles), L"Subtitles");
+        menu.submenu(L"Subtitles", std::move(subtitles));
 
-        HMENU paneLoop = CreatePopupMenu();
+        PanelMenu paneLoop;
         const double paneDuration = sources_[index] ? sources_[index]->duration() : 0.0;
-        AppendMenuW(paneLoop, MF_STRING, CmdPaneLoopSetA, L"Set A at current video time  (loops to the end until B is set)");
-        AppendMenuW(paneLoop, MF_STRING, CmdPaneLoopSetB, L"Set B at current video time");
-        AppendMenuW(paneLoop, MF_STRING | (sourceLoopEnabled_[index] ? MF_CHECKED : 0) |
-                    (loopArmed(sourceLoopA_[index], sourceLoopB_[index], paneDuration) ? 0 : MF_GRAYED),
-                    CmdPaneLoopToggle, L"Enable A-B loop");
-        AppendMenuW(paneLoop, MF_STRING, CmdPaneLoopClear, L"Clear A-B loop");
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(paneLoop), L"This video A-B loop");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        paneLoop.option(CmdPaneLoopSetA, L"Set A at current video time  (loops to the end until B is set)")
+            .option(CmdPaneLoopSetB, L"Set B at current video time")
+            .check(CmdPaneLoopToggle, L"Enable A-B loop", sourceLoopEnabled_[index], {},
+                   loopArmed(sourceLoopA_[index], sourceLoopB_[index], paneDuration))
+            .option(CmdPaneLoopClear, L"Clear A-B loop");
+        menu.submenu(L"This video A-B loop", std::move(paneLoop));
+        menu.separator();
     }
-
 
     const bool group = severalPanesLoaded();
-    AppendMenuW(menu, MF_STRING, CmdPlayPause, group
-                ? (playbackIntended() ? L"Pause all\tSpace" : L"Play all\tSpace")
-                : (playbackIntended() ? L"Pause\tSpace" : L"Play\tSpace"));
-    AppendMenuW(menu, MF_STRING, CmdStop, group ? L"Stop all" : L"Stop");
-    AppendMenuW(menu, MF_STRING | (audio_.muted() ? MF_CHECKED : 0), CmdMute,
-                group ? L"Mute all\tM" : L"Mute\tM");
-    HMENU order = CreatePopupMenu();
+    menu.option(CmdPlayPause, group ? (playbackIntended() ? L"Pause all" : L"Play all")
+                                    : (playbackIntended() ? L"Pause" : L"Play"), false, L"Space");
+    menu.option(CmdStop, group ? L"Stop all" : L"Stop");
+    menu.check(CmdMute, group ? L"Mute all" : L"Mute", audio_.muted(), L"M");
+    PanelMenu order;
     for (int i = 0; i < kPlayOrderCount; ++i) {
         const PlayOrder value = clampPlayOrder(i);
-        AppendMenuW(order, MF_STRING | (playOrder_ == value ? MF_CHECKED : 0),
-                    CmdPlayOrderFirst + static_cast<unsigned>(i), playOrderName(value));
+        order.option(CmdPlayOrderFirst + static_cast<unsigned>(i), playOrderName(value), playOrder_ == value);
     }
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(order), L"When a video ends");
-    HMENU masterLoop = CreatePopupMenu();
-    AppendMenuW(masterLoop, MF_STRING, CmdMasterLoopSetA, L"Set A at master time  (loops to the end until B is set)\t[");
-    AppendMenuW(masterLoop, MF_STRING, CmdMasterLoopSetB, L"Set B at master time\t]");
-    AppendMenuW(masterLoop, MF_STRING | (masterLoopEnabled_ ? MF_CHECKED : 0) |
-                (loopArmed(masterLoopA_, masterLoopB_, duration_) ? 0 : MF_GRAYED), CmdMasterLoopToggle,
-                L"Enable master A-B loop\tL");
-    AppendMenuW(masterLoop, MF_STRING, CmdMasterLoopClear, L"Clear master loop");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(masterLoop), L"Master A-B loop");
+    menu.submenu(L"When a video ends", std::move(order));
+    PanelMenu masterLoop;
+    masterLoop.option(CmdMasterLoopSetA, L"Set A at master time  (loops to the end until B is set)", false, L"[")
+        .option(CmdMasterLoopSetB, L"Set B at master time", false, L"]")
+        .check(CmdMasterLoopToggle, L"Enable master A-B loop", masterLoopEnabled_, L"L",
+               loopArmed(masterLoopA_, masterLoopB_, duration_))
+        .option(CmdMasterLoopClear, L"Clear master loop");
+    menu.submenu(L"Master A-B loop", std::move(masterLoop));
     if (severalPanesLoaded()) {
         // The two states changed while watching several videos. The other
         // states -- decoder, shader, presets -- stay in the sheet.
-        HMENU arrangement = CreatePopupMenu();
+        PanelMenu arrangement;
         appendLayoutMenu(arrangement);
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(arrangement), L"Arrangement");
-        HMENU seekBars = CreatePopupMenu();
+        menu.submenu(L"Arrangement", std::move(arrangement));
+        PanelMenu seekBars;
         appendSeekModeMenu(seekBars);
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(seekBars), L"Seek bars");
+        menu.submenu(L"Seek bars", std::move(seekBars));
     }
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    menu.separator();
 
-    if (pane < 0) AppendMenuW(menu, MF_STRING, CmdOpenEmby, L"Open from Emby...\tCtrl+E");
-    AppendMenuW(menu, MF_STRING, CmdSessionOpen, L"Open session...\tCtrl+O");
-    AppendMenuW(menu, MF_STRING, CmdSessionSave, L"Save session...\tCtrl+S");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (fullscreen_ ? MF_CHECKED : 0), CmdFullscreen, L"Fullscreen\tAlt+Enter");
-    AppendMenuW(menu, MF_STRING, CmdSettings, L"Settings...\tF5");
-    const unsigned command = TrackPopupMenuEx(
-        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, window_, nullptr);
-    if (command) handleContextCommand(command, pane);
-    DestroyMenu(menu);
+    // Away from any pane, the whole empty window too: a file, as O, and
+    // Emby. Over a pane its own section opens them, into that pane.
+    if (pane < 0) {
+        menu.option(CmdOpenFiles, L"Open file...", false, L"O");
+        menu.option(CmdOpenEmby, L"Open from Emby...", false, L"Ctrl+E");
+    }
+    menu.option(CmdSessionOpen, L"Open session...", false, L"Ctrl+O");
+    menu.option(CmdSessionSave, L"Save session...", false, L"Ctrl+S");
+    menu.separator();
+    menu.check(CmdFullscreen, L"Fullscreen", fullscreen_, L"Alt+Enter");
+    menu.option(CmdSettings, L"Settings...", false, L"F5");
+    // The pane's lists as they were listed go with the menu, for its command.
+    openWindowMenu(std::move(menu), anchor,
+                   [this, snapshot = takePaneMenuSnapshot(), pane](unsigned command) {
+                       runPaneMenuCommand(snapshot, command, pane);
+                   },
+                   pane);
+}
+
+App::PaneMenuSnapshot App::takePaneMenuSnapshot() {
+    PaneMenuSnapshot snapshot{std::move(subtitleMenuOptions_), subtitleMenuPane_, subtitleMenuSerial_,
+                              std::move(audioMenuTracks_), audioMenuPane_, audioMenuSerial_,
+                              std::move(embyFavoriteMenuOffer_)};
+    clearPaneMenuSnapshot();
+    return snapshot;
+}
+
+void App::clearPaneMenuSnapshot() {
     subtitleMenuOptions_.clear();
     subtitleMenuPane_ = -1;
     subtitleMenuSerial_ = 0;
@@ -196,11 +197,21 @@ void App::showContextMenu(int pane, POINT screenPoint) {
     audioMenuPane_ = -1;
     audioMenuSerial_ = 0;
     embyFavoriteMenuOffer_.reset();
-    contextMenuOpen_ = false;
-    contextPane_ = -1;
 }
 
-std::size_t App::appendAudioTrackMenu(HMENU menu, std::size_t pane) {
+void App::runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command, int pane) {
+    subtitleMenuOptions_ = snapshot.subtitleOptions;
+    subtitleMenuPane_ = snapshot.subtitlePane;
+    subtitleMenuSerial_ = snapshot.subtitleSerial;
+    audioMenuTracks_ = snapshot.audioTracks;
+    audioMenuPane_ = snapshot.audioPane;
+    audioMenuSerial_ = snapshot.audioSerial;
+    embyFavoriteMenuOffer_ = snapshot.favorite;
+    handleContextCommand(command, pane);
+    clearPaneMenuSnapshot();
+}
+
+std::size_t App::appendAudioTrackMenu(PanelMenu& menu, std::size_t pane) {
     const auto tracks = sources_[pane] ? sources_[pane]->audioTracks() : std::vector<AudioTrackInfo>{};
     const int activeTrack = sources_[pane] ? sources_[pane]->activeAudioTrack() : -1;
     // Kept for the command the menu returns, as the subtitle entries are:
@@ -209,8 +220,8 @@ std::size_t App::appendAudioTrackMenu(HMENU menu, std::size_t pane) {
     audioMenuPane_ = static_cast<int>(pane);
     audioMenuSerial_ = subtitleSerial_[pane];
     for (std::size_t track = 0; track < tracks.size() && track < 32; ++track) {
-        AppendMenuW(menu, MF_STRING | (tracks[track].streamIndex == activeTrack ? MF_CHECKED : 0),
-                    CmdAudioTrackFirst + static_cast<unsigned>(track), audioTrackLabel(tracks[track]).c_str());
+        menu.option(CmdAudioTrackFirst + static_cast<unsigned>(track), audioTrackLabel(tracks[track]),
+                    tracks[track].streamIndex == activeTrack);
         audioMenuTracks_.push_back(tracks[track].streamIndex);
     }
     return tracks.size();
@@ -225,7 +236,7 @@ std::optional<std::size_t> App::menuCommandPane(int menuPane, std::uint64_t menu
     return std::nullopt;
 }
 
-void App::appendEmbyFavoriteMenu(HMENU menu, std::size_t pane) const {
+void App::appendEmbyFavoriteMenu(PanelMenu& menu, std::size_t pane) const {
     embyFavoriteMenuOffer_.reset();
     if (!embyPaneAccountMatches(pane) || embyPanes_[pane]->itemId.empty()) return;
     const auto& state = *embyPanes_[pane];
@@ -233,8 +244,8 @@ void App::appendEmbyFavoriteMenu(HMENU menu, std::size_t pane) const {
     // change to it is on its way.
     const bool known = state.favorite.has_value();
     const bool asking = embyFavoriteAsking_.contains(state.itemId);
-    AppendMenuW(menu, MF_STRING | (known && !asking ? 0 : MF_GRAYED), CmdEmbyFavorite,
-                known && *state.favorite ? L"Remove from Emby favorites" : L"Add to Emby favorites");
+    menu.option(CmdEmbyFavorite, known && *state.favorite ? L"Remove from Emby favorites" : L"Add to Emby favorites",
+                false, {}, known && !asking);
     if (known && !asking) {
         embyFavoriteMenuOffer_ = EmbyFavoriteOffer{embyAccountSerial_, static_cast<int>(pane), state.itemId,
                                                    state.title, !*state.favorite};
@@ -259,6 +270,7 @@ void App::handleContextCommand(unsigned command, int pane) {
         realignPaneAfterMappingChange(index, timeline, before);
     };
     if (command == CmdOpenPane && validPane) openFileForPane(index);
+    else if (command == CmdOpenFiles) openFilesDialog();
     else if (command == CmdOpenEmby) embyOpenBrowser();
     else if (command == CmdEmbyFavorite && validPane) {
         // The item the menu offered, for the account it was offered under,
@@ -528,7 +540,12 @@ void App::changeDecodeMode(DecodeMode mode) {
     if (wasPlaying && !deviceRecoveryPending_) togglePlayback();
 }
 
+// O and the empty window's Open file. Into an empty window the videos open
+// as a launch from Explorer does (openExternalDeck): one deck from zero,
+// started together; beside others they join the deck as it is, playing or
+// paused.
 void App::openFilesDialog() {
+    std::vector<std::wstring> files;
     IFileOpenDialog* dialog = nullptr;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                                 IID_PPV_ARGS(&dialog)))) {
@@ -547,7 +564,6 @@ void App::openFilesDialog() {
         if (SUCCEEDED(dialog->GetResults(&results))) {
             DWORD count{};
             results->GetCount(&count);
-            std::vector<std::wstring> files;
             for (DWORD index = 0; index < count && index < kMaxPanes; ++index) {
                 IShellItem* item = nullptr;
                 if (SUCCEEDED(results->GetItemAt(index, &item))) {
@@ -560,12 +576,17 @@ void App::openFilesDialog() {
                 }
             }
             results->Release();
-            if (!files.empty()) {
-                addFiles(files);
-            }
         }
     }
     dialog->Release();
+    if (files.empty()) return;
+    if (anyPaneLoaded()) {
+        addFiles(files);
+        return;
+    }
+    loadFiles(files);
+    // loadFiles leaves the deck paused at zero; this is Space's start.
+    togglePlayback();
 }
 
 // Which pane a keyboard command applies to when it did not come from the
@@ -586,7 +607,11 @@ int App::commandPane() const {
 }
 
 void App::openAdjacentFile(int step, int pane) {
+    // A key names no pane. The only video is the one it steps, as the
+    // bar's buttons do, though the pointer has not been on it: a media
+    // key is pressed away from the mouse.
     if (pane < 0) pane = commandPane();
+    if (pane < 0) pane = singleLoadedPane();
     if (pane < 0 || pane >= static_cast<int>(kMaxPanes)) return;
     const auto index = static_cast<std::size_t>(pane);
     if (paths_[index].empty()) return;
@@ -660,8 +685,9 @@ bool App::siblingFiles(const std::wstring& path, std::vector<std::wstring>& file
     const std::wstring directory = localDirectory(path);
     if (directory.empty()) return true;
     std::vector<LocalEntry> entries;
-    if (sameLocalDirectory(directory, localDirectory_) && !localList_.empty()) {
-        // The list the sheet shows is the list that is walked.
+    if (localListCovers(path) && !localList_.empty()) {
+        // The list the sheet shows is the list that is walked, every video
+        // under its folder when it lists those.
         entries = localList_;
     } else {
         // Read and found empty counts as unread: the share may be back.
@@ -804,34 +830,24 @@ void App::chooseSeekMode(SeekMode choice) {
     scheduleAppSettingsSave();
 }
 
-void App::appendLayoutMenu(HMENU menu) const {
+void App::appendLayoutMenu(PanelMenu& menu) const {
     for (unsigned i = 0; i < 6; ++i) {
         const auto mode = static_cast<LayoutMode>(i);
-        AppendMenuW(menu, MF_STRING | (layoutMode_ == mode ? MF_CHECKED : 0), CmdLayoutGrid + i,
-                    layoutModeName(mode));
+        menu.option(CmdLayoutGrid + i, layoutModeName(mode), layoutMode_ == mode);
     }
 }
 
-void App::appendSeekModeMenu(HMENU menu) const {
+void App::appendSeekModeMenu(PanelMenu& menu) const {
     const SeekMode current = perPaneTimelines() ? browserSeekMode_ : seekMode_;
-    AppendMenuW(menu, MF_STRING | (current == SeekMode::Linked ? MF_CHECKED : 0), CmdSeekLinked,
-                L"Linked  (one seek bar moves every video)");
-    AppendMenuW(menu, MF_STRING | (current == SeekMode::Independent ? MF_CHECKED : 0), CmdSeekIndependent,
-                L"Independent  (each video seeks alone)");
+    menu.option(CmdSeekLinked, L"Linked  (one seek bar moves every video)", current == SeekMode::Linked);
+    menu.option(CmdSeekIndependent, L"Independent  (each video seeks alone)", current == SeekMode::Independent);
 }
 
-// The bar's arrangement button: the Arrangement submenu on its own.
-void App::showLayoutMenu(POINT screenPoint) {
-    contextPane_ = -1;
-    contextMenuOpen_ = true;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) { contextMenuOpen_ = false; return; }
+void App::showLayoutMenu() {
+    PanelMenu menu;
     appendLayoutMenu(menu);
-    const unsigned command = TrackPopupMenuEx(
-        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, window_, nullptr);
-    if (command) handleContextCommand(command, -1);
-    DestroyMenu(menu);
-    contextMenuOpen_ = false;
+    openWindowMenu(std::move(menu), WindowMenuAnchor{{}, static_cast<int>(BarItem::Layout), -1},
+                   [this](unsigned command) { handleContextCommand(command, -1); });
 }
 
 bool App::linkedBrowserSeekBars() const {

@@ -113,9 +113,11 @@ inline EmbyBrowserPrefs clampEmbyBrowserPrefs(EmbyBrowserPrefs value) {
 // shares of the picture's height -- 0 is the script's own place. Lines a
 // script places itself stay where it put them. The background is the dark
 // box behind plain subtitles; without it they are white letters with a
-// black outline. An ASS script draws its own.
+// black outline. An ASS script draws its own. Each pane's lines are shown or
+// hidden on their own: `shown` has a bit for each pane, by its storage index,
+// as the per-pane volume and repeat are kept.
 struct SubtitleSettings {
-    bool show{true};
+    unsigned shown{kAllPaneMask};
     int language{};        // SubtitleLanguage: 0 automatic, then the languages it names
     float size{1.0F};
     float position{};
@@ -127,7 +129,18 @@ inline constexpr float kSubtitleSizeMinimum = 0.5F;
 inline constexpr float kSubtitleSizeMaximum = 2.5F;
 inline constexpr float kSubtitlePositionMaximum = 0.8F;
 
+inline bool subtitlesShownFor(const SubtitleSettings& settings, std::size_t pane) {
+    return pane < kMaxPanes && (settings.shown & (1U << pane)) != 0;
+}
+
+inline void setSubtitlesShownFor(SubtitleSettings& settings, std::size_t pane, bool shown) {
+    if (pane >= kMaxPanes) return;
+    if (shown) settings.shown |= 1U << pane;
+    else settings.shown &= ~(1U << pane);
+}
+
 inline SubtitleSettings clampSubtitleSettings(SubtitleSettings value) {
+    value.shown &= kAllPaneMask;
     value.language = std::clamp(value.language, 0, 5);
     value.size = std::isfinite(value.size)
         ? std::clamp(value.size, kSubtitleSizeMinimum, kSubtitleSizeMaximum) : 1.0F;

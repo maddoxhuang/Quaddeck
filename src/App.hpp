@@ -31,6 +31,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -90,11 +91,16 @@ private:
     }
     void applyDpi(unsigned dpi);
     // The drawn interface (AppChrome.cpp).
-    // The pill's video number, e.g. "V1". The only video has no pill.
+    // The tag's video number, e.g. "V1". The only video has no tag.
     std::wstring paneLabel(std::size_t pane) const;
     // How much of the cell's bottom the transport bar covers now, or -- with
     // `settled` -- will cover once it is fully in.
     float paneCoveredBottom(const RectF& cell, bool settled = false) const;
+    // How far above a pane's bottom edge its bottom subtitle lines stand
+    // clear of the bar and of the pane's strip, as they slide and fade; or,
+    // `settled`, of each once it is more than half in, so a line libass
+    // places moves once and not with every frame.
+    float paneSubtitleClearance(std::size_t pane, bool settled = false) const;
     void refreshChromeGeometry(const RECT& client);
     OverlayHit hitTestAt(POINT local) const;
     void buildOverlayScene();
@@ -116,10 +122,12 @@ private:
     // A point in the video window on the caption's strip while it is up.
     bool onCaptionStrip(POINT local) const;
     void activateCaptionItem(CaptionItem item);
-    // The empty window's drop hint and its Open Emby button: there while
-    // nothing is loaded, the button only while signed in to Emby; it fades
-    // under the sheet and answers the pointer only while no sheet takes it.
+    // The empty window's drop hint and its Open file and Open Emby buttons:
+    // there while nothing is loaded, Open Emby only while signed in to
+    // Emby; they fade under the sheet and answer the pointer only while no
+    // sheet takes it.
     bool emptyHintShown() const;
+    bool emptyOpenButtonActive() const;
     bool emptyEmbyButtonActive() const;
     // The control at `local` whose clicks add up or set what is under the
     // pointer: an Offset, delay or zoom stepper, Previous and Next, a rail
@@ -156,8 +164,23 @@ private:
     // local video (AppLocal.cpp).
     enum class BrowserSource { Emby, Local };
     void openLocalList();
+    // Shows the folder of a file, or a folder; read off this thread, and not
+    // again for the same folder and arrangement unless forced.
     void refreshLocalList(const std::wstring& path, bool force = false);
-    void applyLocalList(std::uint64_t serial, std::wstring directory, std::vector<LocalEntry> entries, std::wstring error = {});
+    void listLocalFolder(const std::wstring& directory, bool force = false);
+    // The list follows the video it is opened for to its folder, unless it
+    // already holds that video or was taken elsewhere since it last
+    // followed the same one.
+    void localFollowVideo(const std::wstring& path);
+    // Whether the list shown is of the file's folder, or of one it is under
+    // with every video under it; and whether the file is among its videos.
+    bool localListCovers(const std::wstring& path) const;
+    bool localListHolds(const std::wstring& path) const;
+    void localOpenFolder(const std::wstring& directory);
+    // Folders, or every video under the folder with its folders left out.
+    void localSetFlat(bool flat);
+    void applyLocalList(std::uint64_t serial, std::wstring directory, std::vector<LocalEntry> entries,
+                        std::wstring error = {}, std::vector<std::wstring> folders = {}, bool capped = false);
     void showLocalToolbarMenu(int part);
     void retryLocalList();
     void embyToolbarAction(int part);
@@ -168,10 +191,13 @@ private:
     void orderLocalList();
     // What a browser list row's marks come from besides its own entry,
     // gathered once a frame: the items and files being played, and whether
-    // a search still reads (its items take no press until it is whole).
+    // a search still reads (its items take no press until it is whole). An
+    // item is marked in the colour of the first video playing it by place
+    // on the screen: the place of each pane's file, -1 where it plays none.
     struct ListRowMarks {
-        std::set<std::string> embyPlaying;
+        std::map<std::string, int> embyPlaying;
         PaneArray<int> localPlaying{};
+        PaneArray<int> localPositions{};
         bool embyItemsEnabled{true};
     };
     std::vector<PanelRow> buildLocalRows(float sheetWidth, std::vector<PanelListRun>* runs = nullptr) const;
@@ -211,7 +237,14 @@ private:
     void localApplyAdoptedQueue(std::uint64_t serial, const std::wstring& path, std::vector<LocalEntry> queue);
     void localConfirmReplacement(std::size_t pane);
     std::vector<PanelRow> buildLocalReplacementRows(float sheetWidth) const;
-    static std::vector<LocalEntry> scanLocalFolder(const std::wstring& directory, std::wstring* error = nullptr);
+    // The videos of a folder, and with `folders` the folders in it; `walking`
+    // leaves out a link to a folder elsewhere, as All videos does.
+    static std::vector<LocalEntry> scanLocalFolder(const std::wstring& directory, std::wstring* error = nullptr,
+                                                   std::vector<std::wstring>* folders = nullptr, bool walking = false);
+    // What the list shows of a folder: its videos and folders, or every
+    // video under it. A walk under way ends when `token` is no longer `serial`.
+    static LocalListing scanLocalListing(const std::wstring& directory, bool flat,
+                                         const std::atomic<std::uint64_t>* token = nullptr, std::uint64_t serial = 0);
     // Explorer's file types: registered at the user's request only.
     void refreshFileTypesStatus();
     void fileTypesAction(int part);
@@ -234,7 +267,8 @@ private:
     std::vector<PanelRow> withListRuns(std::vector<PanelRow> rows, std::vector<PanelListRun> listRuns,
                                        std::vector<PanelListRun>* runs) const;
     void composePanelRows(std::vector<PanelRow> rows, std::vector<PanelListRun> runs);
-    void fillListWindow();
+    void fillListWindow(const ListRowMarks& marks);
+    void placePanelScrollMarks(const ListRowMarks& marks);
     void refreshPanelGeometry(const RECT& client);
     // Whether the sheet takes the pointer: only while it is open and
     // drawn. Closing, it still fades out for a moment, but a click, a
@@ -245,7 +279,74 @@ private:
     void scrollSettingsPanel(int wheelDelta);
     void applyPanelSlider(int rowIndex, float fraction);
     void activatePanelHit(const PanelHit& hit);
-    unsigned showPanelMenu(HMENU menu, SettingId id, int part, int param = -1);
+    // The sheet's drop-down (PanelMenu.hpp), drawn in the sheet: opened
+    // under the `part`-th box of the row with this id (and param, when it
+    // is not -1), or at a point of the sheet. It is not modal: `choose`
+    // runs later with the command of the item picked, and not at all when
+    // it closes unpicked.
+    void openPanelMenu(PanelMenu menu, SettingId id, int part, int param, std::function<void(unsigned)> choose);
+    void openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose);
+    // What a menu over the picture hangs from: a bar button (a BarItem), a
+    // pane's tag, a button on a pane's strip (`chip` of `chipPane`), or
+    // else a point of the client -- a right-click's.
+    struct WindowMenuAnchor {
+        POINT point{};
+        int barItem{-1};
+        int pillPane{-1};
+        int chipPane{-1};
+        int chip{-1};
+    };
+    // A menu over the picture -- its right-click and a pane's tag, the
+    // Subtitles menu of a strip's or the bar's subtitle button, the bar's
+    // arrangement menu -- drawn in the window under the caption's strip, not
+    // in the sheet, with the shorter lines of PanelMenuMetrics::compact. It
+    // hangs from a bar button, a tag or a strip's button, followed as they
+    // move and closed when they go, or at a point.
+    // Otherwise it is the sheet's drop-down: not modal, `choose` later or
+    // not at all. A menu about one pane's video is lit in that video's
+    // colour.
+    void openWindowMenu(PanelMenu menu, WindowMenuAnchor anchor, std::function<void(unsigned)> choose,
+                        int pane = -1);
+    void takePointerAndKeysForPanelMenu();
+    void closePanelMenu();
+    // Each frame and on opening: where it stands now, under its button; it
+    // closes when the button has gone (another page, the sheet closed) or
+    // left the sheet's view. Its open submenus stand beside their lines.
+    void layoutPanelMenu();
+    // The sheet under its caption's strip, or for a menu over the picture
+    // the whole window under the strip.
+    OverlayRect panelMenuBounds() const;
+    OverlayRect windowMenuBounds() const;
+    // While it is open the pointer and the keyboard are its own, as a
+    // Windows menu's are: a press elsewhere only closes it. The wheel
+    // scrolls one cut to a short window, and nothing else.
+    void panelMenuHover(POINT local);
+    void panelMenuPress(POINT local);
+    void panelMenuRelease(POINT local);
+    void panelMenuRightClick(POINT local);
+    void panelMenuKey(WPARAM key);
+    void scrollPanelMenu(int wheelDelta);
+    // Opens the submenu a line rested on and closes those the pointer has
+    // left, once the menu delay has passed; every frame.
+    void panelMenuTick();
+    // The pointer now on line `line` of the card at `depth` (-1 between
+    // lines): what panelMenuTick waits to open or close, if anything.
+    void panelMenuRest(std::size_t depth, int line);
+    // The item at `index` of the card at `depth` (0 the menu, k its k-th
+    // open submenu): a submenu's line opens it, any other choice closes the
+    // menu and runs `choose`.
+    void choosePanelMenuItem(int index, std::size_t depth = 0);
+    // The submenu of line `index` of the card at `depth` opened beside it,
+    // any other past that card closed; by the keyboard, its first line lit
+    // and the keys in it.
+    void openPanelSubmenu(std::size_t depth, int index, bool byKeyboard);
+    // Keeps the card at `depth` and those before it.
+    void closePanelSubmenus(std::size_t depth);
+    // The deepest open card a point is on: 0 the menu, k its k-th
+    // submenu; -1 off them all.
+    int panelMenuCardAt(POINT local) const;
+    // A menu over the picture keeps its button lit: the bar's, a pill.
+    OverlayHit panelMenuAnchorHit() const;
     void selectSettingsTab(SettingsTab tab);
     // The header's switches in their order, each the face it leads to; a
     // press on the `part`-th shows that face. Emby is shown as Ctrl+E shows
@@ -401,6 +502,9 @@ private:
     // Folders, or every video under the page with its folders left out.
     void embySetFlat(bool flat);
     void embyToggleFlat();
+    // A choice of order or arrangement made while the Emby list is hidden
+    // retires its page, so that showing it again asks for that choice once.
+    void embyRetireHiddenList();
     bool embyPageAcceptsFlat() const;
     bool embyPageAcceptsFilters() const;
     // Lists and TV hierarchy pages are asked for page by page.
@@ -767,15 +871,16 @@ private:
     // else the only video, else the first with subtitles on offer; -1.
     int subtitlePane() const;
     std::wstring subtitleLabel(std::size_t pane) const;
-    // Every pane's lines shown or hidden: the Show subtitles setting.
-    void toggleSubtitlesShown();
-    // The bar's subtitle switch and Alt+H. On, it hides the lines and keeps
-    // each pane's choice; off, it shows them, choosing for the video the
-    // keys act on when it has nothing chosen.
-    void toggleSubtitles();
-    // Whether the switch is on: lines shown and, with a video, one chosen
-    // for the video the keys act on.
-    bool subtitlesSwitchedOn() const;
+    // One pane's lines shown or hidden, its choice kept.
+    void toggleSubtitlesShown(std::size_t pane);
+    std::wstring subtitleNoticeName(std::size_t pane) const;
+    // A video's subtitle switch: the button on its strip, the bar's with one
+    // video, its row in the sheet, and Alt+H for `subtitlePane()`. On, it
+    // hides that video's lines and keeps its choice; off, it shows them,
+    // choosing for it when it has nothing chosen. Other videos keep theirs.
+    void toggleSubtitles(int pane);
+    // Whether a video's switch is on: its lines shown and one chosen.
+    bool subtitlesSwitchedOn(int pane) const;
     void cycleSubtitle(std::size_t pane);
     // Positive shows the lines later. PotPlayer's `,` `.` and `/`.
     void nudgeSubtitleDelay(std::size_t pane, double seconds);
@@ -808,10 +913,10 @@ private:
     std::shared_ptr<const SubtitleBitmap> renderAssSubtitles(std::size_t pane, double seconds, bool& drawn,
                                                              POINT& origin);
     // The Subtitles submenu, shared by the pane menu and the bar's button.
-    void appendSubtitleMenu(HMENU menu, std::size_t pane) const;
-    void showSubtitleMenu(int pane, POINT screenPoint);
+    void appendSubtitleMenu(PanelMenu& menu, std::size_t pane) const;
+    void showSubtitleMenu(int pane, WindowMenuAnchor anchor);
     // The pane menu's audio tracks; returns how many it lists.
-    std::size_t appendAudioTrackMenu(HMENU menu, std::size_t pane);
+    std::size_t appendAudioTrackMenu(PanelMenu& menu, std::size_t pane);
     // The pane a menu's command acts on: the one playing the video the menu
     // was built for (`menuSerial`), wherever a swap moved it, or nothing --
     // said -- when that video has gone. A command for a pane no menu
@@ -819,11 +924,12 @@ private:
     std::optional<std::size_t> menuCommandPane(int menuPane, std::uint64_t menuSerial, int pane);
     // The arrangement and seek-bar states, changed from the sheet, the
     // popup menu and the bar's arrangement button alike.
-    void appendLayoutMenu(HMENU menu) const;
-    void appendSeekModeMenu(HMENU menu) const;
+    void appendLayoutMenu(PanelMenu& menu) const;
+    void appendSeekModeMenu(PanelMenu& menu) const;
     // The pane menu's Emby favorite line, for a pane playing an Emby item.
-    void appendEmbyFavoriteMenu(HMENU menu, std::size_t pane) const;
-    void showLayoutMenu(POINT screenPoint);
+    void appendEmbyFavoriteMenu(PanelMenu& menu, std::size_t pane) const;
+    // The bar's arrangement button: the Arrangement submenu on its own.
+    void showLayoutMenu();
     void chooseLayout(LayoutMode mode);
     void chooseSeekMode(SeekMode mode);
     bool handleAltKey(WPARAM key);
@@ -906,6 +1012,8 @@ private:
     bool shouldOutputAudio(std::size_t pane, double timeline, bool playing) const;
     bool playbackIntended() const;
     void adjustVolumeFromWheel(short wheelDelta);
+    // The master volume by 5 percent a step, up for positive steps.
+    void stepVolume(int steps);
     void selectNextUnfinishedAudio(double timelinePosition);
     void createControls();
     void layoutControls(unsigned width, unsigned height);
@@ -967,8 +1075,11 @@ private:
     void updateEmptyHint();
     void layoutPaneTimelineControls(unsigned width, unsigned height);
     void updateAutoHideControls();
+    void updateAutoHideControls(POINT cursor);
     void setControlsVisible(bool visible);
-    void showContextMenu(int pane, POINT screenPoint);
+    // The picture's menu (its contents are ARCHITECTURE.md's inventory),
+    // for a pane or, at -1, for none.
+    void showContextMenu(int pane, WindowMenuAnchor anchor);
     void handleContextCommand(unsigned command, int pane);
     void saveSessionDialog();
     void loadSessionDialog();
@@ -1105,6 +1216,17 @@ private:
     std::uint64_t localListSerial_{};
     bool localListLoading_{};
     std::wstring localListError_;
+    // The folders in it, in Explorer's order; none for every video under it.
+    std::vector<std::wstring> localFolders_;
+    // The list shown is of every video under the folder; the one asked for
+    // last is (it is the list shown once it arrives); it stopped at
+    // kLocalFlatLimit.
+    bool localListFlat_{};
+    bool localListRequestFlat_{};
+    bool localListCapped_{};
+    // The video the list last followed to its folder; the viewer may have
+    // taken the list elsewhere since.
+    std::wstring localFollowedPath_;
     // The folders of videos opened by hand (they have no F6 queue: giving
     // them one would put a linked deck on per-pane timelines) when F6 shows
     // another: read off the window thread when the video opens, kept as
@@ -1253,9 +1375,37 @@ private:
     std::vector<int> audioMenuTracks_;
     int audioMenuPane_{-1};
     std::uint64_t audioMenuSerial_{};
+    // What a menu over the picture listed of a pane -- its subtitles, audio
+    // tracks and Emby mark -- kept with the menu for the command it returns.
+    // Its building fills the members above; on opening, the menu takes
+    // them, leaving them empty while it is open, and hands them back for its
+    // command alone: a command from no menu acts on the pane as it is.
+    struct PaneMenuSnapshot {
+        std::vector<SubtitleOption> subtitleOptions;
+        int subtitlePane{-1};
+        std::uint64_t subtitleSerial{};
+        std::vector<int> audioTracks;
+        int audioPane{-1};
+        std::uint64_t audioSerial{};
+        std::optional<EmbyFavoriteOffer> favorite;
+    };
+    PaneMenuSnapshot takePaneMenuSnapshot();
+    void clearPaneMenuSnapshot();
+    void runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command, int pane);
     // An Alt+letter subtitle key was taken: its character message, which
     // would only make the default handler beep, is dropped.
     bool altCharTaken_{};
+    // The last left press was a drop-down's: the second of two quick clicks,
+    // which the window class makes a double-click, is a press too, not the
+    // picture's double-click (Solo) once the first has closed the menu.
+    bool menuTookPress_{};
+    // Space chose in a drop-down: the character TranslateMessage queued for
+    // it is dropped, not typed into a box the choice focused. Cleared at the
+    // next key.
+    bool menuSpaceTaken_{};
+    // A right press on the frame closed a drop-down: its release, which
+    // would open the system menu, is dropped.
+    bool ncRightUpTaken_{};
     // Retired whenever the pane's media changes, so a scan or a read that
     // finishes late finds the pane has moved on.
     PaneArray<std::uint64_t> subtitleSerial_{};
@@ -1330,8 +1480,6 @@ private:
     PaneArray<bool> autoLayoutActivePanes_{};
     int hoverPane_{-1};
     int lastPointerPane_{-1};
-    int contextPane_{-1};
-    bool contextMenuOpen_{};
     int dragSourcePane_{-1};
     bool draggingPane_{};
     POINT dragStart_{};
@@ -1350,6 +1498,8 @@ private:
     int hotCaptionItem_{-1};
     int pressedCaptionItem_{-1};
     EmptyHintLayout emptyHint_{};
+    bool hotEmptyOpen_{};
+    bool pressedEmptyOpen_{};
     bool hotEmptyEmby_{};
     bool pressedEmptyEmby_{};
     // What updateTitle last gave the window, also drawn on the caption.
@@ -1358,11 +1508,15 @@ private:
     PaneArray<RectF> chromeCells_{};
     PaneArray<std::wstring> pillLabels_{};
     PaneArray<float> pillWidths_{-1.0F, -1.0F, -1.0F, -1.0F, -1.0F};
+    // A pane's tag fades with paneChromeAlpha_, the rest of its strip --
+    // rail, buttons, time -- with paneTimelineAlpha_.
     PaneArray<float> paneChromeAlpha_{};
     PaneArray<bool> paneChromeWanted_{};
     PaneArray<float> paneTimelineAlpha_{};
     PaneArray<bool> paneTimelineWanted_{};
     bool volumeOpen_{};
+    // The pane whose volume rail is unfolded beside its speaker, -1 none.
+    int paneVolumeOpen_{-1};
     int hotBarItem_{-1};
     int pressedBarItem_{-1};
     int hotChipPane_{-1};
@@ -1395,6 +1549,9 @@ private:
     std::vector<PanelListRun> panelRuns_;
     std::vector<std::size_t> panelFilledRows_;
     PanelLayout panelLayout_{};
+    // The videos being played, marked on the scrollbar where the list shows
+    // them; laid out with it.
+    std::vector<PanelScrollMark> panelScrollMarks_;
     PanelHitKind hotPanelKind_{PanelHitKind::None};
     int hotPanelRow_{-1};
     int hotPanelPart_{-1};
@@ -1415,6 +1572,77 @@ private:
     // underneath the pointer does not act on a different item.
     SettingId pressedPanelId_{SettingId::None};
     int pressedPanelParam_{-1};
+    // The menu that is open, the sheet's drop-down or one over the picture:
+    // its items, what it hangs from -- the row and box of the sheet
+    // (SettingId::None at a point), or a bar button, a pane's pill or a
+    // point of the window -- what a choice does, where it stands, and the
+    // item under the pointer or the keyboard and pressed.
+    struct OpenPanelMenu {
+        PanelMenu menu;
+        // Drawn in the sheet and kept to it, closed with it; otherwise over
+        // the picture, in the window under the caption's strip.
+        bool inSheet{true};
+        SettingId id{SettingId::None};
+        int part{-1};
+        int param{-1};
+        int anchorRow{-1};
+        int barItem{-1};
+        int pillPane{-1};
+        int chipPane{-1};
+        int chip{-1};
+        // The pane whose video it is about, -1 for none.
+        int pane{-1};
+        PanelMenuPlacement placement{PanelMenuPlacement::Below};
+        PanelMenuMetrics metrics{};
+        OverlayRect anchor{};
+        std::function<void(unsigned)> choose;
+        PanelMenuLayout layout{};
+        int highlighted{-1};
+        int pressed{-1};
+        // The card `pressed` is a line of: 0 the menu, k its k-th submenu.
+        std::size_t pressedDepth{};
+        bool pressing{};
+        // Where it was pressed: a submenu's line scrolled into view under
+        // the press has moved from under a pointer let go there unmoved.
+        POINT pressedAt{};
+        // The pointer's place when last looked at: only a moved pointer
+        // takes the highlight from the keyboard.
+        POINT pointer{};
+        ULONGLONG openedAt{};
+        // Its submenus that are open, outermost first: the line of the card
+        // before each that opened it, where it stands, its lit line.
+        struct Submenu {
+            int from{-1};
+            PanelMenuLayout layout{};
+            int highlighted{-1};
+            ULONGLONG openedAt{};
+        };
+        std::vector<Submenu> submenus;
+        // The card the keys walk: 0 the menu, k its k-th submenu.
+        std::size_t keyDepth{};
+        // A line the pointer rests on: once it has rested the menu delay
+        // (SPI_GETMENUSHOWDELAY), as a Windows menu waits, the submenu of
+        // `restLine` opens or, with no line, those past card `restDepth`
+        // close. restSince is 0 with nothing waiting.
+        std::size_t restDepth{};
+        int restLine{-1};
+        ULONGLONG restSince{};
+        ULONGLONG delay{400};
+
+        const std::vector<PanelMenuItem>& itemsAt(std::size_t depth) const {
+            const std::vector<PanelMenuItem>* items = &menu.items;
+            for (std::size_t d = 0; d < depth && d < submenus.size(); ++d) {
+                items = &(*items)[static_cast<std::size_t>(submenus[d].from)].children;
+            }
+            return *items;
+        }
+        PanelMenuLayout& layoutAt(std::size_t depth) { return depth == 0 ? layout : submenus[depth - 1].layout; }
+        const PanelMenuLayout& layoutAt(std::size_t depth) const {
+            return depth == 0 ? layout : submenus[depth - 1].layout;
+        }
+        int& highlightedAt(std::size_t depth) { return depth == 0 ? highlighted : submenus[depth - 1].highlighted; }
+    };
+    std::optional<OpenPanelMenu> panelMenu_;
     // Where the last click let go, for the double-click that follows it.
     std::optional<RepeatControl> releasedControl_;
     int panelDragRow_{-1};

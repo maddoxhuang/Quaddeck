@@ -2,6 +2,75 @@
 
 Public releases start at 1.0.0. See [README.md](README.md) for current usage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation and file-format details.
 
+## 1.3.0 (2026-10-20)
+
+This release organises multi-video controls around each video, draws every
+menu inside the window and extends the F6 folder list. Settings are now
+`QCONFIG 15`, which 1.2.0 and earlier cannot read, so back up
+`settings.qconfig` before trying this version. Sessions and styles remain
+`QDECK 6` and `QSTYLE 3`.
+
+### Multi-video controls
+
+- Give each video a control strip along its bottom edge: its seek bar, a
+  coloured tag that opens its menu, pause and time on the left, and volume,
+  sound, subtitles, repeat, Solo and close on the right. Tags show on every
+  pane while the pointer moves; the rest of the strip shows over the hovered
+  pane and stays up while in use. Narrow panes drop controls in a fixed order,
+  and subtitles rise above the strip.
+- Give each video its own subtitle switch: on its strip, in its rows of the
+  Subtitles settings page, and `Alt+H` for the video last under the pointer.
+  The switches are saved and follow videos when panes are swapped; an older
+  settings file's single switch applies to every video. The bottom bar's
+  subtitle button remains only for a single video.
+- Replace the bottom bar with a centred **All** capsule (play, stop, master
+  volume, arrangement and fullscreen) when several videos have no shared
+  timeline. It stays centred beside a docked browser, appears when the pointer
+  reaches it, and lifts the subtitles of the panes beneath it.
+- Colour each video by position (V1 blue, V2 orange, V3 green, V4 purple, V5
+  pink) across its tag, seek and volume bars, lit buttons, outlines, menus,
+  settings rows and its playing marks in the F6 and Emby lists. A single video
+  keeps the accent blue.
+
+### Menus
+
+- Draw the right-click, subtitle and arrangement menus and the browser's
+  drop-downs inside the window, with submenus, keyboard navigation and
+  scrolling in short windows. A browser opened from the right edge no longer
+  closes while the pointer is over a menu, the system menu or an input-method
+  candidate list.
+- Remove the Ascending / Descending row from the Sort menus; choosing the
+  checked order again reverses it, as its shortcut does.
+
+### Browsing and opening
+
+- Let the F6 list open subfolders and go back with **↑ Up**, leaving out
+  hidden and system folders, and list **All videos** under a folder in one
+  list (up to 5,000 videos and 16 levels), sharing the Emby browser's
+  Folders / All videos choice. Previous / next follow the expanded list.
+- Mark playing videos on the F6 and Emby list scrollbars; clicking a mark
+  scrolls that video to the middle of the list. An Emby list keeps loading
+  pages until a video played from that list appears.
+- Add an **Open file** button to the empty window and **Open file...** to its
+  right-click menu. Videos opened into an empty window with `O` now start
+  playing together from the beginning.
+- Keep fades running in an empty window, where a closed settings sheet or
+  Emby browser stayed drawn. Every fade runs on one clock that showing or
+  hiding the controls no longer restarts.
+
+### Keyboard
+
+- Change the master volume by 5% with `↑` / `↓`, unmuting on `↑`. Step videos
+  with the media previous / next track keys as with `Page Up` / `Page Down`,
+  which now also work for a single video the pointer has not visited.
+- Pass application-command keys to Windows' default handling, so media and
+  volume keys keep working while QuadDeck is in front.
+
+The new controls, menus and keys have not yet been exercised by hand in the
+running player. Real-media playback, live Emby, input methods, physical media
+keys, NAS interruption, physical audio, HDR and display-transition acceptance
+remain unverified.
+
 ## 1.2.0 (2026-10-15)
 
 This release simplifies playback controls and expands Emby browsing. Existing

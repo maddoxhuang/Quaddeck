@@ -185,11 +185,16 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
         const auto index = static_cast<std::size_t>(-(param + 1));
         return index < embyResume_.size() ? &embyResume_[index] : nullptr;
     };
+    // The item being played, marked wherever it appears, in its video's colour.
+    const auto playingPosition = [&](const emby::Item& entry) {
+        const auto playing = marks.embyPlaying.find(entry.id);
+        return playing == marks.embyPlaying.end() ? -1 : playing->second;
+    };
     if (row.kind == PanelRowKind::Item) {
         const emby::Item* entry = entryAt(row.param);
         if (!entry) return;
-        // The item being played, marked wherever it appears.
-        row.current = marks.embyPlaying.contains(entry->id);
+        row.playingPosition = playingPosition(*entry);
+        row.current = row.playingPosition >= 0;
         row.addAvailable = emby::isPlayableVideo(*entry);
         row.label = itemLabel(*entry);
         row.value = itemValue(*entry);
@@ -209,6 +214,7 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
     row.tileTags.clear();
     row.tileFavorites.clear();
     row.tileAddAvailable.clear();
+    row.tilePlaying.clear();
     for (std::size_t part = 0; part < count; ++part) {
         const emby::Item* entry = entryAt(row.tileParams[part]);
         if (!entry) {
@@ -219,10 +225,12 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
             row.tileTags.emplace_back();
             row.tileFavorites.push_back(false);
             row.tileAddAvailable.push_back(false);
+            row.tilePlaying.push_back(-1);
             continue;
         }
         row.tileAddAvailable.push_back(emby::isPlayableVideo(*entry));
-        if (marks.embyPlaying.contains(entry->id)) row.selected = static_cast<int>(part);
+        row.tilePlaying.push_back(playingPosition(*entry));
+        if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
         row.options[part] = itemLabel(*entry);
         row.tileKeys.push_back(emby::imageKey(*entry, imageWidth));
         row.tileBadges.push_back(tileBadge(*entry));
@@ -411,8 +419,17 @@ void App::embyEdgeHover(POINT local, const RECT& client, bool inside) {
     const int single = singleLoadedPane();
     const bool localPlaying = single >= 0 && !paths_[static_cast<std::size_t>(single)].empty() &&
                               !emby::isLocator(paths_[static_cast<std::size_t>(single)]);
+    // A menu open is the pointer at work too: ours, drawn in the sheet or
+    // over the picture, and the system menu Windows opens from the caption,
+    // over which the pointer is on another window altogether. So is an
+    // input method's composition in the search box: its candidate list is
+    // another program's window over the sheet.
+    GUITHREADINFO gui{sizeof(GUITHREADINFO)};
+    const bool windowsMenu = GetGUIThreadInfo(GetCurrentThreadId(), &gui) &&
+                             (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0;
+    const bool composing = fieldTyping() != TextFieldId::None && !fieldComposition_.empty();
     const bool busy = controlDrag_ != ControlDrag::None || draggingPane_ || pressedBarItem_ >= 0 ||
-                      pressedPanelKind_ != PanelHitKind::None;
+                      pressedPanelKind_ != PanelHitKind::None || panelMenu_.has_value() || windowsMenu || composing;
     const float edge = std::max(2.0F, 6.0F * uiScale_);
     // The caption's strip is left out: a pointer heading for Close in the
     // top-right corner is not asking for the list.
@@ -631,66 +648,54 @@ void App::embyToolbarAction(int part) {
     const auto libraryType = embyLibraryType(libraryId);
     const bool libraryDetails = libraryType == "movies" || libraryType == "tvshows";
     if ((part == 1 && !arrange) || (part == 2 && !arrange && !libraryDetails)) return;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    const auto option = [&](unsigned command, const wchar_t* label, bool selected = false) {
-        AppendMenuW(menu, MF_STRING | (selected ? MF_CHECKED : 0), command, label);
-    };
+    PanelMenu menu;
     if (part == 0) {
-        option(1, L"List", embyBrowser_.view == 0);
-        option(2, L"Posters", embyBrowser_.view == 1);
-        option(3, L"Thumbnails", embyBrowser_.view == 2);
+        menu.option(1, L"List", embyBrowser_.view == 0)
+            .option(2, L"Posters", embyBrowser_.view == 1)
+            .option(3, L"Thumbnails", embyBrowser_.view == 2);
     } else if (part == 1) {
-        if (playlist) option(1, L"Playlist order", ownOrder);
+        if (playlist) menu.option(1, L"Playlist order", ownOrder);
         for (int index = 0; index < emby::kSortKeyCount; ++index) {
-            std::wstring caption = emby::sortKeyName(emby::sortKeyFromIndex(index));
-            const wchar_t* shortcut = index == 0 ? L"\tCtrl+4" : index == 4 ? L"\tCtrl+9"
-                : index == 6 ? L"\tCtrl+6" : index == 1 ? L"\tCtrl+7" : index == 3 ? L"\tCtrl+8" : L"";
-            caption += shortcut;
-            option(10 + index, caption.c_str(), !ownOrder && embyBrowser_.sort == index);
-        }
-        if (!ownOrder && emby::sortKeyFromIndex(embyBrowser_.sort) != emby::SortKey::Random) {
-            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            option(30, L"Ascending", !embyBrowser_.descending);
-            option(31, L"Descending", embyBrowser_.descending);
+            const wchar_t* shortcut = index == 0 ? L"Ctrl+4" : index == 4 ? L"Ctrl+9"
+                : index == 6 ? L"Ctrl+6" : index == 1 ? L"Ctrl+7" : index == 3 ? L"Ctrl+8" : L"";
+            menu.option(static_cast<unsigned>(10 + index), emby::sortKeyName(emby::sortKeyFromIndex(index)),
+                        !ownOrder && embyBrowser_.sort == index, shortcut);
         }
     } else {
         if (arrange) {
-            option(1, L"Unplayed only", embyBrowser_.unplayed);
+            menu.check(1, L"Unplayed only", embyBrowser_.unplayed);
             if (embyPageAcceptsFlat()) {
-                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                option(2, L"Folders", !embyBrowser_.flat);
-                option(3, L"All videos", embyBrowser_.flat);
+                menu.separator()
+                    .segment(2, L"Folders", !embyBrowser_.flat)
+                    .segment(3, L"All videos", embyBrowser_.flat);
             }
         }
         if (libraryDetails) {
-            if (arrange) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            option(4, L"Information pages", embyLibraryDetailsEnabled(
+            menu.separator().check(4, L"Information pages", embyLibraryDetailsEnabled(
                 embyLibraries_, emby_.session().serverId, libraryId, libraryType));
         }
     }
-    const unsigned command = showPanelMenu(menu, SettingId::EmbyToolbar, part);
-    // A nested menu loop can receive replies or leave the current account/page.
-    if (!command || account != embyAccountSerial_ || embyDetails_ || embyPages_.empty() ||
-        pageKey != embyPageKey(embyPages_.back()) || !settingsOpen_ || !embyBrowserOpen_ ||
-        browserSource_ != BrowserSource::Emby) return;
-    if (part == 0 && command <= 3) embySetView(static_cast<int>(command) - 1);
-    else if (part == 1) {
-        if (command == 1 && playlist) embyChooseSort(0);
-        else if (command >= 10 && command < 10 + emby::kSortKeyCount) {
-            const int sort = static_cast<int>(command) - 10;
-            if (ownOrder || sort != embyBrowser_.sort || emby::sortKeyFromIndex(sort) == emby::SortKey::Random) {
-                embyChooseSort(sort + (playlist ? 1 : 0));
+    openPanelMenu(std::move(menu), SettingId::EmbyToolbar, part, -1,
+                  [this, part, account, pageKey, playlist, arrange, libraryDetails, libraryId](unsigned command) {
+        // Chosen later: replies may have moved the account or the page on.
+        if (!command || account != embyAccountSerial_ || embyDetails_ || embyPages_.empty() ||
+            pageKey != embyPageKey(embyPages_.back()) || !settingsOpen_ || !embyBrowserOpen_ ||
+            browserSource_ != BrowserSource::Emby) return;
+        if (part == 0 && command <= 3) embySetView(static_cast<int>(command) - 1);
+        else if (part == 1) {
+            if (command == 1 && playlist) embyChooseSort(0);
+            // The checked order chosen again reverses it, as its key does;
+            // Random reshuffles.
+            else if (command >= 10 && command < 10 + emby::kSortKeyCount) {
+                embyChooseSort(static_cast<int>(command) - 10 + (playlist ? 1 : 0));
             }
-        } else if ((command == 30 || command == 31) && embyBrowser_.descending != (command == 31)) {
-            embySetSort(embyBrowser_.sort);
+        } else if (part == 2) {
+            if (command == 1 && arrange) embyToggleUnplayed();
+            else if ((command == 2 || command == 3) && embyPageAcceptsFlat()) embySetFlat(command == 3);
+            else if (command == 4 && libraryDetails) embyToggleLibraryDetails(libraryId);
         }
-    } else if (part == 2) {
-        if (command == 1 && arrange) embyToggleUnplayed();
-        else if ((command == 2 || command == 3) && embyPageAcceptsFlat()) embySetFlat(command == 3);
-        else if (command == 4 && libraryDetails) embyToggleLibraryDetails(libraryId);
-    }
-    scheduleAppSettingsSave();
+        scheduleAppSettingsSave();
+    });
 }
 
 void App::embySetView(int view) {
@@ -743,13 +748,17 @@ void App::embySetSort(int sort) {
         const auto pane = embyPlaybackTarget();
         if (embyPaneAccountMatches(pane)) embyPanes_[pane]->queueReorderSerial = embyRequestSerial_;
     } else {
-        ++embyRequestSerial_;
-        embyItems_.clear();
-        embyTotal_ = 0;
-        embyLoading_ = embyLoadingMore_ = embyRefreshing_ = embyRefreshQuiet_ = false;
-        embyListAskedTick_ = 0;
-        embyPendingScroll_ = -1.0F;
+        embyRetireHiddenList();
     }
+}
+
+void App::embyRetireHiddenList() {
+    ++embyRequestSerial_;
+    embyItems_.clear();
+    embyTotal_ = 0;
+    embyLoading_ = embyLoadingMore_ = embyRefreshing_ = embyRefreshQuiet_ = false;
+    embyListAskedTick_ = 0;
+    embyPendingScroll_ = -1.0F;
 }
 
 void App::sortListBy(int sort) {
@@ -1054,8 +1063,21 @@ void App::embyLoadMoreNearEnd() {
         embyItems_.size() >= static_cast<std::size_t>(kEmbyEpisodeAutoLimit)) return;
     if (!emby_.session().signedIn()) return;
     // Within a sheet's height of the list's end: the next page is there by
-    // the time the scroll reaches it.
-    if (settingsScroll_ < panelLayout_.maxScroll - panelLayout_.content.height) return;
+    // the time the scroll reaches it. Or while a video played from this list
+    // has yet to come -- sorted again, it may be pages down -- so the
+    // scrollbar can mark it without the list being scrolled to it.
+    const auto playedFromHereStillToCome = [&] {
+        const std::string page = embyPageKey(embyPages_.back());
+        for (std::size_t pane = 0; pane < embyPanes_.size(); ++pane) {
+            if (!embyPaneAccountMatches(pane)) continue;
+            const auto& slot = *embyPanes_[pane];
+            if (slot.itemId.empty() || slot.queue.page != page) continue;
+            if (std::none_of(embyItems_.begin(), embyItems_.end(),
+                             [&](const emby::Item& item) { return item.id == slot.itemId; })) return true;
+        }
+        return false;
+    };
+    if (settingsScroll_ < panelLayout_.maxScroll - panelLayout_.content.height && !playedFromHereStillToCome()) return;
     embyRequestPage(static_cast<int>(embyItems_.size()));
 }
 
@@ -1605,25 +1627,16 @@ void App::showEmbyItemMenu(POINT local) {
     // A copy: the lists can be replaced by a reply while the menu is up.
     const auto item = embyItemAt(local);
     if (!item || item->id.empty()) return;
-    POINT screenPoint = local;
-    ClientToScreen(videoWindow_, &screenPoint);
     const auto account = embyAccountSerial_;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    contextPane_ = -1;
-    contextMenuOpen_ = true;
-    const bool asking = embyFavoriteAsking_.contains(item->id);
-    AppendMenuW(menu, MF_STRING | (asking ? MF_GRAYED : 0), CmdEmbyFavorite,
-                item->favorite ? L"Remove from favorites" : L"Add to favorites");
-    const unsigned command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y,
-                                              window_, nullptr);
-    DestroyMenu(menu);
-    contextMenuOpen_ = false;
-    // What the menu offered, for the account it was offered under.
-    if (command == CmdEmbyFavorite && account == embyAccountSerial_) {
-        embySetFavorite(item->id, wide(emby::displayTitle(*item)), !item->favorite);
-    }
-    updateHoverControls();
+    PanelMenu menu;
+    menu.option(CmdEmbyFavorite, item->favorite ? L"Remove from favorites" : L"Add to favorites");
+    menu.items.back().enabled = !embyFavoriteAsking_.contains(item->id);
+    openPanelMenuAt(std::move(menu), local, [this, account, item = *item](unsigned command) {
+        // What the menu offered, for the account it was offered under.
+        if (command == CmdEmbyFavorite && account == embyAccountSerial_) {
+            embySetFavorite(item.id, wide(emby::displayTitle(item)), !item.favorite);
+        }
+    });
 }
 
 void App::embyActivateItem(int param) {

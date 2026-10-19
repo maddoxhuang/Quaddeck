@@ -106,6 +106,12 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
                 continue;
             }
             if (message.message == WM_MOUSEWHEEL) {
+                // An open drop-down holds the sheet still under it, and
+                // scrolls itself where a short window cut it.
+                if (panelMenu_) {
+                    scrollPanelMenu(GET_WHEEL_DELTA_WPARAM(message.wParam));
+                    continue;
+                }
                 // The wheel scrolls the settings sheet while the pointer is on
                 // it and is the volume control everywhere else on the player.
                 POINT local = message.pt;
@@ -316,6 +322,24 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         onDrop(reinterpret_cast<HDROP>(wParam), -1);
         return 0;
     case WM_KEYDOWN: {
+        // A Space a drop-down took has had its character by now.
+        menuSpaceTaken_ = false;
+        // A keyboard's media, volume and browser keys are application
+        // commands; what the player does with one is under WM_APPCOMMAND.
+        // The key down goes on to the default handler, which is where
+        // Windows can make the command of it: kept here, Next track might
+        // never arrive and the volume keys might not reach the system. A
+        // held media step or toggle is dropped, as a held Page Down is.
+        if (wParam >= VK_BROWSER_BACK && wParam <= VK_LAUNCH_APP2) {
+            if ((lParam & (1LL << 30)) && wParam >= VK_MEDIA_NEXT_TRACK && wParam <= VK_MEDIA_PLAY_PAUSE) return 0;
+            return DefWindowProcW(window_, message, wParam, lParam);
+        }
+        // An open drop-down has the keyboard, as a Windows menu does: the
+        // arrows, Enter and Escape are its own, every other key nothing.
+        if (panelMenu_) {
+            panelMenuKey(wParam);
+            return 0;
+        }
         // A text box, while it is typed into, has every key but F5 and F6
         // before the shortcuts: a letter, a space or an arrow is text
         // there, and a held one repeats.
@@ -323,11 +347,12 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             fieldKey(wParam, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
             return 0;
         }
-        // A held key repeats, and only the steps -- seeking, the subtitle
-        // delay -- are meant to: a held toggle would flip back and forth,
-        // a held Page Down open one file after another. Bit 30 says the
-        // key was already down.
+        // A held key repeats, and only the steps -- seeking, the volume,
+        // the subtitle delay -- are meant to: a held toggle would flip back
+        // and forth, a held Page Down open one file after another. Bit 30
+        // says the key was already down.
         if ((lParam & (1LL << 30)) && wParam != VK_LEFT && wParam != VK_RIGHT &&
+            wParam != VK_UP && wParam != VK_DOWN &&
             wParam != VK_OEM_PERIOD && wParam != VK_OEM_COMMA) {
             return 0;
         }
@@ -336,6 +361,9 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case VK_SPACE: togglePlayback(); break;
         case VK_LEFT: seekRelative(GetKeyState(VK_CONTROL) < 0 ? -30.0 : -5.0); break;
         case VK_RIGHT: seekRelative(GetKeyState(VK_CONTROL) < 0 ? 30.0 : 5.0); break;
+        // PotPlayer's volume keys, a wheel notch a press.
+        case VK_UP: stepVolume(1); break;
+        case VK_DOWN: stepVolume(-1); break;
         case VK_HOME:
         case 'R':
             if (perPaneTimelines()) {
@@ -408,7 +436,13 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
     case WM_CHAR:
-        fieldCharacter(static_cast<wchar_t>(wParam));
+        // The space of a Space that chose in a drop-down comes after the menu
+        // has closed; it is not typed into a box the choice may have focused.
+        if (menuSpaceTaken_ && wParam == L' ') {
+            menuSpaceTaken_ = false;
+            return 0;
+        }
+        if (!panelMenu_) fieldCharacter(static_cast<wchar_t>(wParam));
         return 0;
     // An input method's composition, drawn by the text box itself while
     // it is typed into; anywhere else Windows shows it as before.
@@ -436,6 +470,8 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         fieldLostKeyboard();
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_SYSKEYDOWN:
+        // Alt closes an open drop-down, as it does a Windows menu.
+        closePanelMenu();
         if (wParam == VK_RETURN && (lParam & (1LL << 29)) && !(lParam & (1LL << 30))) {
             toggleFullscreen();
             return 0;
@@ -473,8 +509,26 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if ((wParam & 0xFFF0) == SC_KEYMENU && lParam == 0) return 0;
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_MOUSEWHEEL:
-        adjustVolumeFromWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        if (panelMenu_) scrollPanelMenu(GET_WHEEL_DELTA_WPARAM(wParam));
+        else adjustVolumeFromWheel(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
+    // A press on the frame or the caption's strip, which Windows handles,
+    // only closes an open drop-down, as one off a Windows menu does: it
+    // does not move, size or maximise the window under it.
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+    case WM_NCRBUTTONDOWN:
+    case WM_NCMBUTTONDOWN:
+        if (panelMenu_) {
+            closePanelMenu();
+            ncRightUpTaken_ = message == WM_NCRBUTTONDOWN;
+            return 0;
+        }
+        ncRightUpTaken_ = false;
+        return DefWindowProcW(window_, message, wParam, lParam);
+    case WM_NCRBUTTONUP:
+        if (std::exchange(ncRightUpTaken_, false)) return 0;
+        return DefWindowProcW(window_, message, wParam, lParam);
     case WM_APPCOMMAND:
         switch (GET_APPCOMMAND_LPARAM(lParam)) {
         case APPCOMMAND_MEDIA_PLAY_PAUSE:
@@ -489,14 +543,27 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case APPCOMMAND_MEDIA_STOP:
             stopPlayback();
             return TRUE;
+        // Next and previous track are Page Down and Page Up. An open
+        // drop-down closes first: a pane's menu lists the subtitles and
+        // tracks of the video being replaced.
+        case APPCOMMAND_MEDIA_NEXTTRACK:
+            closePanelMenu();
+            openAdjacentFile(1);
+            return TRUE;
+        case APPCOMMAND_MEDIA_PREVIOUSTRACK:
+            closePanelMenu();
+            openAdjacentFile(-1);
+            return TRUE;
         default:
             break;
         }
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_ACTIVATE:
         // Back from another program -- the server's own client, where
-        // something may just have been watched or changed.
+        // something may just have been watched or changed. Going to one
+        // closes an open drop-down, as it does a Windows menu.
         if (LOWORD(wParam) != WA_INACTIVE) embyWantRefresh();
+        else closePanelMenu();
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_ERASEBKGND:
         return 1;

@@ -148,7 +148,7 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
 
 // The settings file version this build writes. A build reads every version up
 // to its own and refuses a newer one, so it must not save over a newer file.
-inline constexpr int kAppSettingsVersion = 14;
+inline constexpr int kAppSettingsVersion = 15;
 
 // The version a settings document names in its first line, or 0 when it
 // names none. Reads only the header, so it answers for a file the full
@@ -187,7 +187,7 @@ inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
     output << L"playorder " << static_cast<int>(state.playOrder) << L'\n';
     output << L"keyframeseek " << state.keyframeSeek << L'\n';
     const auto subtitles = clampSubtitleSettings(state.subtitles);
-    output << L"subtitles " << subtitles.show << L' ' << subtitles.language << L' '
+    output << L"subtitles " << subtitles.shown << L' ' << subtitles.language << L' '
            << subtitles.size << L' ' << subtitles.position << L' ' << subtitles.background << L'\n';
     auto libraries = state.embyLibraries.entries;
     std::sort(libraries.begin(), libraries.end(), [](const auto& a, const auto& b) {
@@ -273,11 +273,17 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
     if (version >= 10 && (!(input >> key) || key != L"keyframeseek" || !(input >> state.keyframeSeek)))
         return false;
     // Older files predate the subtitle choices: shown, in the language
-    // Windows names, at the default size and place.
-    if (version >= 11 && (!(input >> key) || key != L"subtitles" ||
-                          !(input >> state.subtitles.show >> state.subtitles.language >>
-                            state.subtitles.size >> state.subtitles.position)))
-        return false;
+    // Windows names, at the default size and place. Before 15 one switch
+    // showed or hid every pane's lines; it now has a bit for each pane, and
+    // an old switch is each pane's.
+    if (version >= 11) {
+        unsigned shown{};
+        if (!(input >> key) || key != L"subtitles" || !(input >> shown) ||
+            (version < 15 && shown > 1U) ||
+            !(input >> state.subtitles.language >> state.subtitles.size >> state.subtitles.position))
+            return false;
+        state.subtitles.shown = version < 15 ? (shown != 0U ? kAllPaneMask : 0U) : shown;
+    }
     // QCONFIG 11 drew a dark box behind every line and had no word for it;
     // the line gained one with 12, and an 11 is read as without the box.
     if (version >= 12 && !(input >> state.subtitles.background)) return false;

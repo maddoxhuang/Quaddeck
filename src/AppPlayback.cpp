@@ -603,7 +603,10 @@ void App::adjustVolumeFromWheel(short wheelDelta) {
     wheelDeltaRemainder_ += wheelDelta;
     const int steps = wheelDeltaRemainder_ / WHEEL_DELTA;
     wheelDeltaRemainder_ %= WHEEL_DELTA;
-    if (steps == 0) return;
+    if (steps != 0) stepVolume(steps);
+}
+
+void App::stepVolume(int steps) {
     const float volume = std::clamp(audio_.volume() + steps * 0.05F, 0.0F, 1.0F);
     audio_.setVolume(volume);
     if (volume > 0.0F && audio_.muted()) audio_.setMuted(false);

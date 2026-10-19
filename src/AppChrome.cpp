@@ -27,6 +27,9 @@ constexpr float kRailInset = 12.0F;
 constexpr float kBarSeekInset = 8.0F;
 constexpr float kVolumeInset = 10.0F;
 constexpr float kPanelSlideMs = 200.0F;
+// A sheet's drop-down fades in and slides this far from its button.
+constexpr float kPanelMenuFadeMs = 110.0F;
+constexpr float kPanelMenuSlide = 6.0F;
 
 const wchar_t* barItemName(BarItem item) {
     switch (item) {
@@ -60,6 +63,7 @@ const wchar_t* chipName(PaneChip chip) {
     case PaneChip::Solo: return L"Solo this video / back to grid";
     case PaneChip::Repeat: return L"Repeat this video  (Independent mode)";
     case PaneChip::Close: return L"Close this video";
+    case PaneChip::Subtitles: return L"This video's subtitles on / off  (Alt+H)  ·  right-click to choose";
     default: return L"";
     }
 }
@@ -121,9 +125,9 @@ void App::toggleControls() {
 }
 
 void App::setControlsVisible(bool visible) {
-    if (controlsVisible_ == visible) return;
+    // The fades' clock is updateDockAnimation's alone: restarted here, a
+    // change made every frame left them no time to move.
     controlsVisible_ = visible;
-    dockAnimationTick_ = GetTickCount64();
 }
 
 void App::updateDockAnimation() {
@@ -145,6 +149,11 @@ void App::updateAutoHideControls() {
     if (!window_) return;
     POINT cursor{};
     GetCursorPos(&cursor);
+    updateAutoHideControls(cursor);
+}
+
+void App::updateAutoHideControls(POINT cursor) {
+    if (!window_) return;
     POINT local = cursor;
     ScreenToClient(window_, &local);
     RECT client{};
@@ -159,8 +168,12 @@ void App::updateAutoHideControls() {
     // its strip keeps it up.
     const float captionZone = dockProgress_ > 0.05F ? captionInset() : static_cast<float>(dp(kControlRevealZone));
     const bool inCaptionBand = inside && static_cast<float>(local.y) < captionZone;
+    // The "All" capsule wakes where it stands too, not only from the edge
+    // below the strips.
+    const bool onCapsuleSpot = inside && capsuleRevealWanted(barLayout_, static_cast<float>(local.x),
+                                                             static_cast<float>(local.y), 8.0F * uiScale_);
     const ULONGLONG now = GetTickCount64();
-    if (contextMenuOpen_) {
+    if (panelMenu_) {
         pointerLastMoved_ = controlsLastInteraction_ = now;
         if (cursorHidden_) { ShowCursor(TRUE); cursorHidden_ = false; }
         return;
@@ -183,17 +196,19 @@ void App::updateAutoHideControls() {
         pressedCaptionItem_ >= 0 || hotCaptionItem_ >= 0) {
         controlsLastInteraction_ = now;
     }
-    if (moved && !editing && (inInteractiveBand || inCaptionBand)) {
+    if (moved && !editing && (inInteractiveBand || inCaptionBand || onCapsuleSpot)) {
         controlsLastInteraction_ = now;
         setControlsVisible(true);
     }
-    if (!controlsPinned_ && !editing && controlsVisible_ &&
+    // PotPlayer hides its skin only while there is video to look at: an
+    // empty window keeps its title and its controls, never hidden first
+    // and shown again.
+    const bool keepControls = controlsPinned_ || !anyPaneLoaded();
+    if (!keepControls && !editing && controlsVisible_ &&
         now - controlsLastInteraction_ >= kControlHideDelayMs) {
         setControlsVisible(false);
     }
-    // PotPlayer hides its skin only while there is video to look at: an
-    // empty window keeps its title and its controls.
-    if (controlsPinned_ || !anyPaneLoaded()) setControlsVisible(true);
+    if (keepControls) setControlsVisible(true);
     if (inside && GetForegroundWindow() == window_ && !cursorHidden_ && !editing &&
         now - pointerLastMoved_ >= kPointerHideDelayMs) {
         ShowCursor(FALSE);
@@ -210,6 +225,9 @@ std::wstring App::paneLabel(std::size_t pane) const {
 
 float App::paneCoveredBottom(const RectF& cell, bool settled) const {
     if ((!settled && dockProgress_ <= 0.001F) || !barLayout_.row.visible()) return 0.0F;
+    // The capsule is over the panes it is beside only.
+    if (barLayout_.capsule &&
+        (cell.x >= barLayout_.row.right() || cell.x + cell.width <= barLayout_.row.x)) return 0.0F;
     const float clearance = 8.0F * uiScale_;
     const auto active = activePanes();
     const bool multiple = std::count(active.begin(), active.end(), true) > 1;
@@ -218,6 +236,19 @@ float App::paneCoveredBottom(const RectF& cell, bool settled) const {
     const float cellBottom = cell.y + cell.height;
     if (cellBottom <= rowTop) return 0.0F;
     return (cellBottom - rowTop) * (settled ? 1.0F : dockProgress_);
+}
+
+float App::paneSubtitleClearance(std::size_t pane, bool settled) const {
+    if (pane >= kMaxPanes) return 0.0F;
+    const RectF& cell = chromeCells_[pane];
+    const float bar = settled ? (dockProgress_ > 0.5F ? paneCoveredBottom(cell, true) : 0.0F)
+                              : paneCoveredBottom(cell);
+    // The strip stands on what the bar covers; the capsule stands over it.
+    const OverlayRect& strip = paneChrome_[pane].strip;
+    if (!strip.visible()) return bar;
+    const float alpha = std::clamp(paneTimelineAlpha_[pane], 0.0F, 1.0F);
+    const float lifted = strip.height * (settled ? (alpha > 0.5F ? 1.0F : 0.0F) : alpha);
+    return barLayout_.capsule ? std::max(bar, lifted) : bar + lifted;
 }
 
 float App::captionAlpha() const {
@@ -238,6 +269,10 @@ bool App::emptyHintShown() const {
         if (paneLogicallyLoaded(pane)) return false;
     }
     return true;
+}
+
+bool App::emptyOpenButtonActive() const {
+    return emptyHintShown() && !sheetTakesPointer() && emptyHint_.open.visible();
 }
 
 bool App::emptyEmbyButtonActive() const {
@@ -265,21 +300,21 @@ void App::refreshChromeGeometry(const RECT& client) {
         static_cast<float>(client.right), static_cast<float>(client.bottom), aspects);
     captionLayout_ = captionLayout(static_cast<float>(client.right), static_cast<float>(client.bottom), uiScale_);
     // The docked Emby browser lies over the right part of the video; the
-    // bar keeps to the uncovered part so its buttons stay reachable.
+    // bar keeps to the uncovered part so its buttons stay reachable. The
+    // capsule stays in the window's middle, moving left only to keep clear.
     barLayout_ = transportBarLayout(videoAreaWidth(static_cast<float>(client.right)),
                                     static_cast<float>(client.bottom), uiScale_, volumeOpen_,
                                     singleLoadedPane() >= 0, BarMetrics{}, bottomTimelineVisible(),
-                                    severalPanesLoaded());
-    // Signed out there is no Open Emby button: the hint's F6 and the menu
-    // still reach the sign-in page.
+                                    severalPanesLoaded(), static_cast<float>(client.right) * 0.5F);
+    // Open file is always there; signed out there is no Open Emby beside
+    // it: the hint's F6 and the menu still reach the sign-in page.
     emptyHint_ = emptyHintLayout(static_cast<float>(client.right), static_cast<float>(client.bottom), uiScale_,
                                  barLayout_.row.visible() ? barLayout_.row.y : static_cast<float>(client.bottom),
                                  emby_.session().signedIn());
     const auto active = activePanes();
     // Count loaded sources before Solo filters the visible cells. A single
-    // source uses the master rail; Solo still needs its own local timeline.
-    const bool showPaneTimeline = std::count(active.begin(), active.end(), true) > 1;
-    const bool onlyVideo = !showPaneTimeline;
+    // source uses the master rail; Solo still needs its own strip.
+    const bool onlyVideo = std::count(active.begin(), active.end(), true) <= 1;
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
         if (!active[pane]) {
             paneChrome_[pane] = {};
@@ -289,38 +324,38 @@ void App::refreshChromeGeometry(const RECT& client) {
             const std::wstring label = paneLabel(pane);
             if (label != pillLabels_[pane] || pillWidths_[pane] < 0.0F) {
                 pillLabels_[pane] = label;
+                // Before the overlay can measure, about what "V1" measures.
                 pillWidths_[pane] = overlay_.ready()
                     ? overlay_.measureText(label, OverlayTextStyle::BodyBold, uiScale_)
-                    : 90.0F * uiScale_;
+                    : 20.0F * uiScale_;
             }
         }
-        const bool expanded = static_cast<int>(pane) == hoverPane_ ||
-                              pressedChipPane_ == static_cast<int>(pane) ||
-                              (controlDrag_ == ControlDrag::PaneVolume && dragPane_ == static_cast<int>(pane));
-        // The only video wears nothing in its corner: its pill and repeat,
-        // close and Solo chips are the right-click menu's, its volume, sound
-        // and pause the bar's. Sound and pause come back while they are
-        // off, as a pane silenced or paused beside others is left, so it can
-        // be set back here: the bar's play does not resume it.
-        std::array<bool, kPaneChipCount> chips = kEveryPaneChip;
+        PaneChromeOptions options;
+        options.pillTextWidth = pillWidths_[pane];
+        // The only video wears no strip: its tag and its repeat, close and
+        // Solo are the right-click menu's, its rail, time, volume, sound,
+        // subtitles and pause the bar's. Sound and pause come back while
+        // they are off, as a pane silenced or paused beside others is left,
+        // so it can be set back here: the bar's play does not resume it.
+        options.withPill = options.withTime = options.withTimeline = !onlyVideo;
+        options.withVolume = audioPaneEnabled(pane) && !onlyVideo;
+        options.volumeOpen = paneVolumeOpen_ == static_cast<int>(pane);
+        // The strips keep to their bottom edges under the capsule.
+        options.coveredBottom = barLayout_.capsule ? 0.0F : paneCoveredBottom(chromeCells_[pane]);
+        // Below the caption's strip whether or not it is up.
+        options.coveredTop = std::max(0.0F, captionInset() - chromeCells_[pane].y);
         if (onlyVideo) {
-            chips.fill(false);
-            chips[static_cast<std::size_t>(PaneChip::Audio)] = !audioPaneEnabled(pane);
-            chips[static_cast<std::size_t>(PaneChip::Pause)] = sourcePaused_[pane];
+            options.chipsShown.fill(false);
+            options.chipsShown[static_cast<std::size_t>(PaneChip::Audio)] = !audioPaneEnabled(pane);
+            options.chipsShown[static_cast<std::size_t>(PaneChip::Pause)] = sourcePaused_[pane];
         }
-        // The pill sits below the caption's strip whether or not it is up,
-        // so it never runs from a pointer that wakes the caption.
-        paneChrome_[pane] = paneChromeLayout(
-            chromeCells_[pane], uiScale_, pillWidths_[pane], expanded,
-            paneCoveredBottom(chromeCells_[pane]), audioPaneEnabled(pane) && !onlyVideo, PaneChromeMetrics{},
-            std::max(0.0F, captionInset() - chromeCells_[pane].y), chips, !onlyVideo);
-        if (!showPaneTimeline) {
-            // Rendering and hit testing share this geometry.
-            paneChrome_[pane].timeline = {};
-            paneChrome_[pane].timeLabel = {};
-        }
+        // Rendering and hit testing share this geometry.
+        paneChrome_[pane] = paneChromeLayout(chromeCells_[pane], uiScale_, options);
     }
     if (settingsOpen_ || settingsAlpha_ > 0.0F) refreshPanelGeometry(client);
+    // Which lays an open menu out; one over the picture follows its button
+    // without the sheet too.
+    else layoutPanelMenu();
 }
 
 OverlayHit App::hitTestAt(POINT local) const {
@@ -328,6 +363,10 @@ OverlayHit App::hitTestAt(POINT local) const {
                                        captionLayout_, captionAlpha() > 0.05F);
         item >= 0) {
         return {OverlayHitKind::CaptionItem, -1, item};
+    }
+    if (emptyOpenButtonActive() &&
+        emptyHint_.open.contains(static_cast<float>(local.x), static_cast<float>(local.y))) {
+        return {OverlayHitKind::EmptyOpen, -1, -1};
     }
     if (emptyEmbyButtonActive() &&
         emptyHint_.emby.contains(static_cast<float>(local.x), static_cast<float>(local.y))) {
@@ -372,9 +411,14 @@ void App::updateHoverControls(POINT cursor) {
 
     const bool barUp = dockProgress_ > 0.05F;
     // The bar's footprint is its row and the margin beneath it; the scrim
-    // above the row is still the video.
+    // above the row is still the video. The capsule's is the capsule and its
+    // volume: beside it, beneath it, the strips are the panes'.
+    bool onCapsule = barLayout_.row.contains(static_cast<float>(local.x), static_cast<float>(local.y));
+    for (const auto& item : barLayout_.items) {
+        onCapsule = onCapsule || item.contains(static_cast<float>(local.x), static_cast<float>(local.y));
+    }
     const bool overBar = barUp && barLayout_.row.visible() && pointerInsidePlayer &&
-                         static_cast<float>(local.y) >= barLayout_.row.y;
+                         (barLayout_.capsule ? onCapsule : static_cast<float>(local.y) >= barLayout_.row.y);
     const bool overCaption = captionAlpha() > 0.05F && pointerInsidePlayer &&
                              captionLayout_.row.contains(static_cast<float>(local.x), static_cast<float>(local.y));
     // Keyboard targeting follows the pointer even while the bar hides the
@@ -388,7 +432,8 @@ void App::updateHoverControls(POINT cursor) {
     // has to outlive that: a keyboard command aimed at "the pane I am looking
     // at" would otherwise stop working after the pointer sat still.
     if (geometricPane >= 0) lastPointerPane_ = geometricPane;
-    hoverPane_ = pointerFresh && pointerInsidePlayer ? geometricPane : -1;
+    // Under an open menu the pane it was opened over keeps its chrome.
+    if (!panelMenu_) hoverPane_ = pointerFresh && pointerInsidePlayer ? geometricPane : -1;
 
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
         const bool eligible = active[pane] && chromeCells_[pane].width > 0.0F &&
@@ -401,18 +446,38 @@ void App::updateHoverControls(POINT cursor) {
 
     // The settings sheet, when up, takes the pointer before anything under
     // it; only the caption's strip stands above its column.
-    const PanelHit panelHit = pointerInsidePlayer && !overCaption ? panelHitAt(local) : PanelHit{};
+    PanelHit panelHit = pointerInsidePlayer && !overCaption ? panelHitAt(local) : PanelHit{};
+    // An open menu holds the pointer: nothing under it lights, and the
+    // button it hangs from stays lit until it closes.
+    if (panelMenu_) {
+        panelMenuHover(local);
+        panelMenuTick();
+    }
+    if (panelMenu_ && panelMenu_->inSheet) {
+        panelHit = panelMenu_->anchorRow >= 0
+            ? PanelHit{PanelHitKind::Button, panelMenu_->anchorRow, panelMenu_->part}
+            : PanelHit{PanelHitKind::Sheet, -1, -1};
+    } else if (panelMenu_) {
+        panelHit = sheetTakesPointer() ? PanelHit{PanelHitKind::Sheet, -1, -1} : PanelHit{};
+    }
     const bool overSheet = panelHit.kind != PanelHitKind::None && panelHit.kind != PanelHitKind::Outside;
     const bool panelChanged = hotPanelRow_ != (overSheet ? panelHit.row : -1) ||
         hotPanelKind_ != (overSheet ? panelHit.kind : PanelHitKind::None) ||
         hotPanelPart_ != (overSheet ? panelHit.part : -1);
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
+        const int index = static_cast<int>(pane);
+        const PaneChromeLayout& chrome = paneChrome_[pane];
+        bool controls = chrome.timeline.visible() || chrome.volume.visible();
+        for (const auto& chip : chrome.chips) controls = controls || chip.visible();
+        // The pane's strip is up under the pointer, and held up by a drag or
+        // a press on it, or a menu opened from it or over its pane.
+        const bool held = ((controlDrag_ == ControlDrag::PaneSeek || controlDrag_ == ControlDrag::PaneVolume) &&
+                           dragPane_ == index) ||
+                          pressedChipPane_ == index || pressedPillPane_ == index ||
+                          (panelMenu_ && !panelMenu_->inSheet && panelMenu_->pane == index);
         paneTimelineWanted_[pane] = paneTimelineRevealWanted(
-            active[pane] && paneChrome_[pane].timeline.visible(), pointerFresh, pointerInsidePlayer,
-            playerForeground, controlDrag_ == ControlDrag::PaneSeek && dragPane_ == static_cast<int>(pane),
-            geometricPane == static_cast<int>(pane) && paneTimelineRevealContains(paneChrome_[pane],
-                static_cast<float>(local.x), static_cast<float>(local.y), uiScale_),
-            overSheet || overBar || overCaption);
+            active[pane] && controls, pointerFresh, pointerInsidePlayer, playerForeground, held,
+            geometricPane == index, overSheet || overBar || overCaption || panelMenu_.has_value());
     }
     hotPanelKind_ = overSheet ? panelHit.kind : PanelHitKind::None;
     hotPanelRow_ = overSheet ? panelHit.row : -1;
@@ -424,7 +489,8 @@ void App::updateHoverControls(POINT cursor) {
     if (controlDrag_ == ControlDrag::PanelScrollbar) hotPanelKind_ = PanelHitKind::Scrollbar;
 
     // Hot states. A drag keeps its own target hot regardless of the pointer.
-    const OverlayHit hit = pointerInsidePlayer && !overSheet ? hitTestAt(local) : OverlayHit{};
+    const OverlayHit hit = panelMenu_ ? panelMenuAnchorHit()
+                         : pointerInsidePlayer && !overSheet ? hitTestAt(local) : OverlayHit{};
     int hotBar = -1;
     int hotCaption = -1;
     int hotChipPane = -1;
@@ -432,6 +498,7 @@ void App::updateHoverControls(POINT cursor) {
     int hotPill = -1;
     int hotRail = -1;
     int hotVolume = -1;
+    const bool hotEmptyOpen = hit.kind == OverlayHitKind::EmptyOpen;
     const bool hotEmptyEmby = hit.kind == OverlayHitKind::EmptyEmby;
     switch (hit.kind) {
     case OverlayHitKind::BarItem: hotBar = hit.item; break;
@@ -448,9 +515,11 @@ void App::updateHoverControls(POINT cursor) {
     if (controlDrag_ == ControlDrag::PaneVolume) hotVolume = dragPane_;
     const bool hotChanged = panelChanged || hotBar != hotBarItem_ || hotCaption != hotCaptionItem_ || hotChipPane != hotChipPane_ ||
                             hotChip != hotChip_ || hotPill != hotPillPane_ || hotRail != hotRailPane_ ||
-                            hotVolume != hotVolumePane_ || hotEmptyEmby != hotEmptyEmby_;
+                            hotVolume != hotVolumePane_ || hotEmptyOpen != hotEmptyOpen_ ||
+                            hotEmptyEmby != hotEmptyEmby_;
     hotBarItem_ = hotBar;
     hotCaptionItem_ = hotCaption;
+    hotEmptyOpen_ = hotEmptyOpen;
     hotEmptyEmby_ = hotEmptyEmby;
     hotChipPane_ = hotChipPane;
     hotChip_ = hotChip;
@@ -469,8 +538,16 @@ void App::updateHoverControls(POINT cursor) {
     const bool wantVolume = hotBar == static_cast<int>(BarItem::Audio) ||
                             hotBar == static_cast<int>(BarItem::Volume) ||
                             controlDrag_ == ControlDrag::Volume;
-    if (wantVolume != volumeOpen_) {
+    // A heard video's volume unfolds beside its speaker the same way. Its
+    // rail reaches the speaker, so the pointer crosses no gap between them.
+    int wantPaneVolume = controlDrag_ == ControlDrag::PaneVolume ? dragPane_ : hotVolume;
+    if (wantPaneVolume < 0 && hotChipPane >= 0 && hotChip == static_cast<int>(PaneChip::Audio) &&
+        audioPaneEnabled(static_cast<std::size_t>(hotChipPane))) {
+        wantPaneVolume = hotChipPane;
+    }
+    if (wantVolume != volumeOpen_ || wantPaneVolume != paneVolumeOpen_) {
         volumeOpen_ = wantVolume;
+        paneVolumeOpen_ = wantPaneVolume;
         refreshChromeGeometry(client);
     }
 
@@ -479,7 +556,7 @@ void App::updateHoverControls(POINT cursor) {
     tooltipText_.clear();
     tooltipAnchor_ = {};
     if (controlDrag_ == ControlDrag::None && pressedBarItem_ < 0 && pressedCaptionItem_ < 0 &&
-        !pressedEmptyEmby_ && now - hotSince_ >= kTooltipDelayMs) {
+        !pressedEmptyOpen_ && !pressedEmptyEmby_ && !panelMenu_ && now - hotSince_ >= kTooltipDelayMs) {
         if (overSheet) {
             const int row = panelHit.row;
             if (row >= 0 && row < static_cast<int>(panelRows_.size()) &&
@@ -491,6 +568,9 @@ void App::updateHoverControls(POINT cursor) {
             tooltipText_ = captionItemName(static_cast<CaptionItem>(hotCaption), window_ && IsZoomed(window_),
                                            fullscreen_);
             tooltipAnchor_ = captionLayout_.items[static_cast<std::size_t>(hotCaption)];
+        } else if (hotEmptyOpen) {
+            tooltipText_ = L"Open video files  (O)";
+            tooltipAnchor_ = emptyHint_.open;
         } else if (hotEmptyEmby) {
             tooltipText_ = L"Emby browser  (Ctrl+E)";
             tooltipAnchor_ = emptyHint_.emby;
@@ -536,8 +616,10 @@ void App::buildOverlayScene() {
     scene.anyLoaded = anyLoaded;
     scene.showEmptyHint = !anyLoaded;
     scene.emptyHint = emptyHint_;
-    // The sheet lies over the button, the browser over the whole window.
-    scene.emptyEmbyAlpha = 1.0F - settingsAlpha_;
+    // The sheet lies over the buttons, the browser over the whole window.
+    scene.emptyButtonsAlpha = 1.0F - settingsAlpha_;
+    scene.emptyOpenHot = hotEmptyOpen_;
+    scene.emptyOpenPressed = pressedEmptyOpen_;
     scene.emptyEmbyHot = hotEmptyEmby_;
     scene.emptyEmbyPressed = pressedEmptyEmby_;
 
@@ -560,6 +642,9 @@ void App::buildOverlayScene() {
         ? dragFraction_ * shownDuration : shownTimeline;
     scene.seek01 = shownDuration > 0.0
         ? static_cast<float>(std::clamp(shownMaster / shownDuration, 0.0, 1.0)) : 0.0F;
+    // One video's own rail, or the one video's, is in its colour.
+    const int seekPane = barShown.pane >= 0 ? barShown.pane : singleLoadedPane();
+    scene.seekPosition = seekPane >= 0 ? static_cast<int>(positionForPane(static_cast<std::size_t>(seekPane))) : -1;
     scene.seekHot = seekHot_;
     scene.seekDragging = controlDrag_ == ControlDrag::MasterSeek;
     scene.seekHoverX = -1.0F;
@@ -588,7 +673,8 @@ void App::buildOverlayScene() {
     scene.subtitleSize = subtitleSettings_.size;
     scene.subtitlePosition = subtitleSettings_.position;
     scene.subtitleBackground = subtitleSettings_.background;
-    scene.subtitlesOn = subtitlesSwitchedOn();
+    // The bar's switch is the only video's; beside others each has its own.
+    scene.subtitlesOn = subtitlesSwitchedOn(singleLoadedPane());
     scene.subtitleLocale = subtitleLocale();
 
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
@@ -604,6 +690,7 @@ void App::buildOverlayScene() {
         out.timelineAlpha = paneTimelineAlpha_[pane];
         out.hovered = static_cast<int>(pane) == hoverPane_;
         out.targeted = pane == embyPlaybackTarget();
+        out.position = static_cast<int>(positionForPane(pane));
         out.label = pillLabels_[pane];
         out.audioOn = audioPaneEnabled(pane);
         out.paused = sourcePaused_[pane];
@@ -615,7 +702,6 @@ void App::buildOverlayScene() {
         out.repeatIdle = paneRepeatSavedButIdle(pane);
         const bool usable = sources_[pane] && sources_[pane]->ready() && sources_[pane]->duration() > 0.0;
         out.seekable = usable;
-        const std::wstring position = L"V" + std::to_wstring(positionForPane(pane) + 1) + L"  ";
         if (usable) {
             const double sourceDuration = sources_[pane]->duration();
             const bool isActive = sourceIsActive(timeline, startDelays_[pane],
@@ -628,7 +714,7 @@ void App::buildOverlayScene() {
                 shown = std::clamp(mappedSourceTime(pane, timeline), 0.0, sourceDuration);
             }
             out.position01 = static_cast<float>(shown / sourceDuration);
-            if (subtitleSettings_.show && isActive) {
+            if (subtitlesShownFor(subtitleSettings_, pane) && isActive) {
                 const double at = shown - subtitleDelay_[pane];
                 // As their script draws them, where libass can.
                 bool drawn = false;
@@ -648,7 +734,7 @@ void App::buildOverlayScene() {
                     }
                     out.subtitle = std::move(lines.bottom);
                     out.subtitleTop = std::move(lines.top);
-                    out.subtitleLift = paneCoveredBottom(chromeCells_[pane]);
+                    out.subtitleLift = paneSubtitleClearance(pane);
                 }
             }
             const auto cache = sources_[pane]->cacheStats();
@@ -656,18 +742,27 @@ void App::buildOverlayScene() {
                 out.buffered01 = static_cast<float>(
                     std::min(sourceDuration, shown + cache.aheadSeconds) / sourceDuration);
             }
-            std::wstring state;
-            if (!isActive) state = L"wait  ";
-            else if (sourcePaused_[pane]) state = L"paused  ";
-            const double target = controlDrag_ == ControlDrag::PaneSeek && dragPane_ == static_cast<int>(pane)
-                ? shown : hotRailPane_ == static_cast<int>(pane)
-                    ? railFraction(static_cast<float>(lastLocalPointer_.x), paneChrome_[pane].timeline, 12.0F * uiScale_) * sourceDuration
-                    : shown;
-            out.timeText = position + (paneSeekAffectsAll(pane, target) ? L"· All linked  " : L"only  ") +
-                state + formatTime(shown) + L" / " + formatTime(sourceDuration);
+            // The row's time, without its duration where the row is narrow.
+            out.timeText = (isActive ? L"" : L"wait  ") + formatTime(shown) +
+                (paneChrome_[pane].timeShort ? L"" : L" / " + formatTime(sourceDuration));
+            // Over the rail, where the pointer is on it or drags it: the time
+            // there, and what a seek there reaches -- this video or all.
+            const OverlayRect& rail = paneChrome_[pane].timeline;
+            const bool dragging = controlDrag_ == ControlDrag::PaneSeek && dragPane_ == static_cast<int>(pane);
+            if ((dragging || hotRailPane_ == static_cast<int>(pane)) && rail.visible()) {
+                const float inset = kRailInset * uiScale_;
+                const float fraction = dragging
+                    ? dragFraction_ : railFraction(static_cast<float>(lastLocalPointer_.x), rail, inset);
+                const double target = fraction * sourceDuration;
+                out.railX = rail.x + inset + (rail.width - 2.0F * inset) * fraction;
+                out.railText = (paneSeekAffectsAll(pane, target) ? std::wstring(L"All linked  ")
+                                                                 : paneLabel(pane) + L" only  ") +
+                               formatTime(target);
+            }
         } else {
-            out.timeText = position + L"—";
+            out.timeText = L"\x2014";
         }
+        out.subtitlesOn = subtitlesSwitchedOn(static_cast<int>(pane));
         out.railHot = hotRailPane_ == static_cast<int>(pane);
         out.railDragging = controlDrag_ == ControlDrag::PaneSeek && dragPane_ == static_cast<int>(pane);
         out.hotChip = hotChipPane_ == static_cast<int>(pane) ? hotChip_ : -1;
@@ -720,6 +815,44 @@ void App::buildOverlayScene() {
     panel.dragRow = controlDrag_ == ControlDrag::PanelSlider ? panelDragRow_ : -1;
     panel.scrollbarHot = hotPanelKind_ == PanelHitKind::Scrollbar;
     panel.scrollbarDragging = controlDrag_ == ControlDrag::PanelScrollbar;
+    if (shown) panel.scrollMarks = panelScrollMarks_;
+    else panel.scrollMarks.clear();
+
+    OverlayPanelMenuScene& menu = scene.panelMenu;
+    if (panelMenu_ && (shown || !panelMenu_->inSheet)) {
+        const auto& open = *panelMenu_;
+        const ULONGLONG now = GetTickCount64();
+        const auto fadeIn = [&](ULONGLONG since) {
+            const float t = std::clamp(static_cast<float>(now - since) / kPanelMenuFadeMs, 0.0F, 1.0F);
+            return 1.0F - (1.0F - t) * (1.0F - t);
+        };
+        const float eased = fadeIn(open.openedAt);
+        // The sheet's drop-down fades with the sheet.
+        const float alpha = open.inSheet ? settingsAlpha_ : 1.0F;
+        menu.items = open.menu.items;
+        menu.layout = open.layout;
+        menu.anchor = open.anchor;
+        menu.bounds = panelMenuBounds();
+        menu.placement = open.placement;
+        menu.metrics = open.metrics;
+        menu.highlighted = open.highlighted;
+        menu.pressed = open.pressedDepth == 0 ? open.pressed : -1;
+        menu.position = open.pane >= 0 && open.pane < static_cast<int>(kMaxPanes)
+            ? static_cast<int>(positionForPane(static_cast<std::size_t>(open.pane))) : -1;
+        menu.alpha = eased * alpha;
+        // Out of its button: down from one above it, up from one below.
+        menu.offset = (1.0F - eased) * kPanelMenuSlide * uiScale_ * (open.layout.above ? 1.0F : -1.0F);
+        // Its submenus fade in where they stand.
+        menu.submenus.clear();
+        for (std::size_t depth = 1; depth <= open.submenus.size(); ++depth) {
+            const auto& submenu = open.submenus[depth - 1];
+            menu.submenus.push_back({submenu.from, submenu.layout, submenu.highlighted,
+                                     open.pressedDepth == depth ? open.pressed : -1,
+                                     fadeIn(submenu.openedAt) * alpha});
+        }
+    } else {
+        menu = {};
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,27 +1124,19 @@ void App::activateBarItem(BarItem item) {
     case BarItem::Next: openAdjacentFile(1, singleLoadedPane()); break;
     case BarItem::Stop: stopPlayback(); break;
     case BarItem::Audio: toggleMute(); break;
-    // A switch; its menu is on the right button.
-    case BarItem::Subtitles: toggleSubtitles(); break;
-    case BarItem::Layout: {
-        const auto& box = barLayout_[BarItem::Layout];
-        POINT point{static_cast<LONG>(box.x), static_cast<LONG>(box.y)};
-        ClientToScreen(videoWindow_, &point);
-        showLayoutMenu(point);
-        break;
-    }
+    // The only video's switch; its menu is on the right button.
+    case BarItem::Subtitles: toggleSubtitles(singleLoadedPane()); break;
+    case BarItem::Layout: showLayoutMenu(); break;
     case BarItem::Fullscreen: toggleFullscreen(); break;
     default: break;
     }
 }
 
-// The bar's subtitle button's right click: the Subtitles menu, at the button.
+// The bar's subtitle button's right click: the Subtitles menu, over the
+// button.
 void App::showBarSubtitleMenu() {
     controlsLastInteraction_ = GetTickCount64();
-    const auto& box = barLayout_[BarItem::Subtitles];
-    POINT point{static_cast<LONG>(box.x), static_cast<LONG>(box.y)};
-    ClientToScreen(videoWindow_, &point);
-    showSubtitleMenu(subtitlePane(), point);
+    showSubtitleMenu(singleLoadedPane(), WindowMenuAnchor{{}, static_cast<int>(BarItem::Subtitles), -1});
 }
 
 void App::activateCaptionItem(CaptionItem item) {
@@ -1050,6 +1175,9 @@ void App::activateChip(std::size_t pane, PaneChip chip) {
         break;
     }
     case PaneChip::Close: closePane(pane); break;
+    // A switch, as the bar's is for the only video; its menu is on the
+    // right button.
+    case PaneChip::Subtitles: toggleSubtitles(static_cast<int>(pane)); break;
     }
     updateTitle();
     scheduleAppSettingsSave();
@@ -1130,12 +1258,24 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN: {
         SetFocus(window_);
         const POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        // An open drop-down takes the press: on it an item's, anywhere else
+        // only its closing. Its button may have gone since the last frame.
+        if (panelMenu_) {
+            layoutPanelMenu();
+            if (panelMenu_) {
+                menuTookPress_ = true;
+                panelMenuPress(local);
+                return 0;
+            }
+        }
+        menuTookPress_ = false;
         // A press anywhere but on the box typed into or its clear button
         // takes the typing away from it.
         if (typingField_ != TextFieldId::None && fieldAt(panelHitAt(local)) != typingField_) blurField();
         updateHoverControls([&] { POINT p = local; ClientToScreen(videoWindow_, &p); return p; }());
         pressedBarItem_ = -1;
         pressedCaptionItem_ = -1;
+        pressedEmptyOpen_ = false;
         pressedEmptyEmby_ = false;
         pressedChipPane_ = pressedChip_ = -1;
         pressedPillPane_ = -1;
@@ -1171,10 +1311,9 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 return 0;
             case PanelHitKind::Scrollbar: {
                 // On the thumb it is grabbed where it is; on the track the
-                // thumb jumps under the pointer.
-                const OverlayRect thumb = panelScrollThumb(panelLayout_, uiScale_);
-                const float y = static_cast<float>(local.y);
-                panelThumbGrab_ = y >= thumb.y && y <= thumb.bottom() ? y - thumb.y : thumb.height * 0.5F;
+                // thumb jumps under the pointer; on a playing video's mark,
+                // to that video.
+                panelThumbGrab_ = panelThumbGrab(panelLayout_, uiScale_, static_cast<float>(local.y), panelScrollMarks_);
                 beginControlDrag(ControlDrag::PanelScrollbar, -1, local);
                 return 0;
             }
@@ -1233,6 +1372,10 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 SetCapture(videoWindow_);
             }
             controlsLastInteraction_ = GetTickCount64();
+            return 0;
+        case OverlayHitKind::EmptyOpen:
+            pressedEmptyOpen_ = true;
+            SetCapture(videoWindow_);
             return 0;
         case OverlayHitKind::EmptyEmby:
             pressedEmptyEmby_ = true;
@@ -1316,6 +1459,10 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_LBUTTONUP: {
         const POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (panelMenu_) {
+            panelMenuRelease(local);
+            return 0;
+        }
         // Read before the click acts: what it opens may stand here next.
         releasedControl_ = repeatControlAt(local);
         const bool sheetPress = panelPressArmed_;
@@ -1353,6 +1500,15 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (pressedEmptyOpen_) {
+            pressedEmptyOpen_ = false;
+            if (GetCapture() == videoWindow_) ReleaseCapture();
+            if (hit.kind == OverlayHitKind::EmptyOpen) {
+                controlsLastInteraction_ = GetTickCount64();
+                openFilesDialog();
+            }
+            return 0;
+        }
         if (pressedEmptyEmby_) {
             pressedEmptyEmby_ = false;
             if (GetCapture() == videoWindow_) ReleaseCapture();
@@ -1377,10 +1533,7 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             pressedPillPane_ = -1;
             if (GetCapture() == videoWindow_) ReleaseCapture();
             if (hit.kind == OverlayHitKind::PanePill && hit.pane == pane) {
-                const auto& pill = paneChrome_[static_cast<std::size_t>(pane)].pill;
-                POINT point{static_cast<LONG>(pill.x), static_cast<LONG>(pill.bottom() + 4.0F * uiScale_)};
-                ClientToScreen(videoWindow_, &point);
-                showContextMenu(pane, point);
+                showContextMenu(pane, WindowMenuAnchor{{}, -1, pane});
             }
             return 0;
         }
@@ -1411,6 +1564,7 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (controlDrag_ != ControlDrag::None) endControlDrag(false);
             pressedBarItem_ = -1;
             pressedCaptionItem_ = -1;
+            pressedEmptyOpen_ = false;
             pressedEmptyEmby_ = false;
             pressedChipPane_ = pressedChip_ = -1;
             pressedPillPane_ = -1;
@@ -1420,11 +1574,19 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             dragSourcePane_ = -1;
             draggingPane_ = false;
             dropTargetPane_ = -1;
+            if (panelMenu_) {
+                panelMenu_->pressing = false;
+                panelMenu_->pressed = -1;
+            }
         }
         return 0;
     case WM_RBUTTONUP: {
         SetFocus(window_);
         const POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (panelMenu_) {
+            panelMenuRightClick(local);
+            return 0;
+        }
         if (sheetTakesPointer()) {
             if (panelHitAt(local).kind != PanelHitKind::Outside) {
                 // On an Emby item: mark or unmark it. Anywhere else on the
@@ -1433,10 +1595,15 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
         }
-        // The subtitle switch's choices are on its right button.
+        // A subtitle switch's choices are on its right button: the bar's for
+        // the only video, a strip's for its own.
         if (const OverlayHit hit = hitTestAt(local);
             hit.kind == OverlayHitKind::BarItem && hit.item == static_cast<int>(BarItem::Subtitles)) {
             showBarSubtitleMenu();
+            return 0;
+        } else if (hit.kind == OverlayHitKind::PaneChip && hit.item == static_cast<int>(PaneChip::Subtitles)) {
+            embySelectTarget(static_cast<std::size_t>(hit.pane));
+            showSubtitleMenu(hit.pane, WindowMenuAnchor{{}, -1, -1, hit.pane, hit.item});
             return 0;
         }
         RECT client{};
@@ -1446,14 +1613,16 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             static_cast<float>(client.right), static_cast<float>(client.bottom), activePanes(),
             layoutMode_, expandedPane_, soloPane_, paneAspectRatios(),
             autoLayoutFocus_, autoLayoutFocusPane_);
-        POINT screenPoint{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        ClientToScreen(videoWindow_, &screenPoint);
         if (pane >= 0) embySelectTarget(static_cast<std::size_t>(pane));
-        showContextMenu(pane, screenPoint);
+        showContextMenu(pane, WindowMenuAnchor{local});
         return 0;
     }
     case WM_LBUTTONDBLCLK: {
         const POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        // The second of two quick clicks is a press for an open drop-down,
+        // and after one the first click closed: a Windows menu took that
+        // click in its own window, so it was never half a double-click.
+        if (panelMenu_ || menuTookPress_) return handleVideoMessage(WM_LBUTTONDOWN, wParam, lParam);
         // The window class asks for double-clicks, so the second of two
         // quick clicks comes here rather than as a press. On the stepper
         // or rail the first one let go on, it is a second click like the
@@ -1483,7 +1652,7 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return SendMessageW(window_, message, wParam, lParam);
     case WM_SETCURSOR:
         // The text cursor over a text box.
-        if (LOWORD(lParam) == HTCLIENT && sheetTakesPointer()) {
+        if (LOWORD(lParam) == HTCLIENT && sheetTakesPointer() && !panelMenu_) {
             POINT pointer{};
             GetCursorPos(&pointer);
             ScreenToClient(videoWindow_, &pointer);
