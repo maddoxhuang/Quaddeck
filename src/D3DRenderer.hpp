@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Core.hpp"
+#include "VideoOutput.hpp"
 #include "VideoSource.hpp"
 
 #include <array>
@@ -36,6 +37,28 @@ struct RenderStats {
     std::uint64_t softwareFrameUploads{};
     std::uint64_t softwareNv12Uploads{};
 };
+
+// Whether a device D3D11CreateDevice did not make is asked for again without
+// D3D11_CREATE_DEVICE_VIDEO_SUPPORT. That is so when the flag is what it
+// refused: DXGI_ERROR_UNSUPPORTED, from WARP and from the Microsoft Basic
+// Render Driver, which D3D11 takes for the card where no vendor driver is (a
+// VM, a fresh install, a driver being installed). WARP is asked again after
+// any failure, as before. Any other failure on a card (E_FAIL, out of memory,
+// a hung device) is returned, so a device made on it later keeps its video
+// processor.
+inline bool retryWithoutVideoSupport(HRESULT hr, D3D_DRIVER_TYPE driver) {
+    return hr == DXGI_ERROR_UNSUPPORTED || driver == D3D_DRIVER_TYPE_WARP;
+}
+
+// Whether a device made on a software adapter (the Basic Render Driver, or
+// WARP) stands. A rebuild after a device on a card does not settle on one:
+// during a driver update it fails, and App tries again until the card is
+// back, where a device made on the software adapter would stay on the CPU.
+// The first build takes it, where the window would not open otherwise, and
+// so do a rebuild after a software device and the WARP choice.
+inline bool deviceAdapterAcceptable(bool softwareAdapter, bool previousOnCard, VideoRenderer chosen) {
+    return !softwareAdapter || !previousOnCard || chosen == VideoRenderer::Warp;
+}
 
 class D3DRenderer {
 public:
@@ -79,6 +102,18 @@ public:
     // switches the swap chain to 10-bit PQ when the display is in HDR mode.
     void setVideoEnhancements(const VideoEnhancementSettings& settings);
     VideoEnhancementStatus enhancementStatus() const;
+    // The Video tab's settings (VideoOutput.hpp); they survive a device
+    // rebuild. Before initialize() they only decide what it builds. After,
+    // true says the device must be built again for them, on another
+    // renderer or card: the caller then does what a lost device needs,
+    // requestRebuild() and its own recovery, the videos opened again on the
+    // new device. Everything else takes effect on the next frame.
+    bool setVideoOutput(const VideoOutputSettings& settings);
+    // Raises the lost-device latch without a failure, so the caller's
+    // recovery builds the device again as the settings now say.
+    void requestRebuild();
+    // What was built, for the line under the Video tab's choices.
+    VideoRendererStatus rendererStatus() const;
     // A display was added, removed or changed (WM_DISPLAYCHANGE): the next
     // frame looks at it rather than within two seconds.
     void noteDisplayChange();
@@ -86,8 +121,11 @@ public:
     std::string error() const { return error_; }
     // Signalled by the swap chain when it can accept another frame. The main
     // loop waits on this instead of on a timer, and does so outside the device
-    // lock. Null when the swap chain is not waitable.
-    HANDLE frameLatencyWaitableObject() const { return frameLatencyWaitable_; }
+    // lock. The bitblt chain has none; a timer set for the display's next
+    // refresh stands in for it. Null when there is neither.
+    HANDLE frameLatencyWaitableObject() const {
+        return frameLatencyWaitable_ ? frameLatencyWaitable_ : paceTimer_;
+    }
     ID3D11Device* device() const { return device_.Get(); }
     ID3D11DeviceContext* deviceContext() const { return context_.Get(); }
     std::recursive_mutex& deviceMutex() const { return deviceMutex_; }
@@ -111,6 +149,15 @@ private:
         bool hdrOutputMode{};
         // Per processor, never the most recently created pane's global status.
         bool rtxHdrApplied{};
+        // The output is PQ: an HDR10 stream passed through, or RTX Video
+        // HDR's. A 10-bit SDR output is R10G10B10A2 as well, so the format
+        // alone does not say it.
+        bool pqOutput{};
+        bool tenBitOutputMode{};
+        // Built to deinterlace. Once a stream has shown an interlaced frame
+        // its processor stays so: the progressive frames among them are
+        // told so one by one, and nothing is rebuilt between the two.
+        bool interlaced{};
         std::uint64_t serial{};
         bool hardware{};
     };
@@ -123,6 +170,18 @@ private:
         bool failed{};
         int failedOutputWidth{};
         int failedOutputHeight{};
+        // The stream has shown an interlaced frame: every frame of it goes
+        // through the video processor from then on, which deinterlaces.
+        bool interlaced{};
+    };
+    // The user's shader at the converted picture's size, for the output
+    // pass to enlarge with its own scaler afterwards.
+    struct PostTexture {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+        int width{};
+        int height{};
     };
     struct SoftwarePqTexture {
         Microsoft::WRL::ComPtr<ID3D11Texture2D> effects;
@@ -136,6 +195,15 @@ private:
     };
 
     bool createDevice(HWND window);
+    // The device on the chosen card or WARP, else on the one D3D11 picks,
+    // else on WARP; a rebuild after a device on a card refuses a software
+    // adapter (deviceAdapterAcceptable).
+    bool createD3DDevice();
+    // One device on the adapter or driver type into device_ and context_:
+    // without the debug layer when it is missing, and without video support
+    // when the device refuses that (retryWithoutVideoSupport).
+    HRESULT createDeviceOn(IDXGIAdapter* adapter, D3D_DRIVER_TYPE driver);
+    bool createSwapChain(HWND window, IDXGIFactory2* factory);
     bool createPipeline();
     bool compilePixelShader(const char* source, std::size_t length, const char* name);
     bool compilePixelShaderFile(const std::wstring& path);
@@ -160,11 +228,25 @@ private:
     void refreshDisplayFactory(bool force = false);
     // Asks the driver once per device whether it honours the two extensions.
     void probeVideoEnhancements();
-    // Moves the swap chain between 8-bit sRGB and 10-bit PQ to match what the
-    // settings and the display allow. Rebuilds the back buffer and drops every
-    // slot, whose output format changed with it.
+    // Moves the swap chain between 8-bit sRGB, 10-bit sRGB and 10-bit PQ to
+    // match what the settings and the display allow. Rebuilds the back
+    // buffer and drops every slot, whose output format changed with it.
     bool applyOutputMode();
     bool wantHdrOutput() const;
+    bool wantTenBitOutput() const;
+    // Lets every pane's converted picture go, to be made again on the next
+    // frame as the settings now say.
+    void dropSlots();
+    // Sets the bitblt chain's pacing timer for the display's next refresh.
+    void armPaceTimer();
+    // The user's shader at the converted picture's size, into the pane's
+    // post texture.
+    bool runEffectsPass(std::size_t slot);
+    // The pane's picture into the back buffer through the chosen scaler,
+    // then the colour controls and the levels; the viewport and the UV
+    // transform are already set.
+    void drawOutputPass(ID3D11ShaderResourceView* view, int width, int height,
+                        VideoScaling scaling, bool color);
     void applyStreamExtensions(std::size_t slot, bool hdrSource);
     void bindVibranceColorSpace(std::size_t slot);
     bool compositeOverlayLayer();
@@ -210,6 +292,31 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Query> frameQuery_;
     HANDLE frameQueryTimer_{};
     bool hdrOutput_{};
+    // A 10-bit sRGB back buffer, the Video tab's choice in SDR.
+    bool tenBitOutput_{};
+    VideoOutputSettings videoOutput_;
+    // What the device was asked to be when it was built, and what it is.
+    VideoRendererChoice builtChoice_;
+    VideoRenderer builtRenderer_{VideoRenderer::Direct3D11};
+    bool adapterFallback_{};
+    bool adapterMissing_{};
+    // The last device made was on a hardware adapter, so a rebuild waits
+    // for a card rather than settle on a software one. Kept through
+    // releaseDeviceResources(); false before the first build.
+    bool deviceOnCard_{};
+    // A flip-model chain; false for bitblt, which presents without vsync
+    // into DWM's copy of the window and is paced by paceTimer_.
+    bool flipModel_{true};
+    HANDLE paceTimer_{};
+    // The scalers and the colour controls: a shader, its parameters, and
+    // the point sampler the kernels take their taps through.
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> outputShader_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> outputParamsBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> pointSampler_;
+    PaneArray<PostTexture> postTextures_{};
+    // The shader in pixelShader_ changes the picture (not the plain copy),
+    // so the output pass needs its result first.
+    bool effectShaderActive_{};
     unsigned framesSinceDisplayStatus_{};
     // The interface layer and the pass that blends it in PQ output mode.
     Microsoft::WRL::ComPtr<ID3D11Texture2D> overlayLayer_;

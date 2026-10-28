@@ -2,7 +2,8 @@
 // page like the others -- AppEmbyBrowser.cpp asks the libraries and lays
 // the results out under their sections -- and the box is a text box like
 // the sign-in's (AppTextFields.cpp). This file is what makes it a search:
-// the page it opens, its clear button, and the pause after which what was
+// the page it opens, its clear button, where it searches -- the folder it
+// was opened in or every library -- and the pause after which what was
 // typed is searched for.
 
 #include "App.hpp"
@@ -31,12 +32,22 @@ void App::embyOpenSearch() {
     if (embyPendingPlay_) embyCancelReplacement();
     // On the Search page already, or on an information page over it, the
     // box takes the typing again with what it holds selected; from any
-    // other page a new Search page opens, empty.
+    // other page a new Search page opens, empty. Opened in a library, a
+    // folder, a show or a season, it searches what is under that page
+    // (emby::searchableUnder says which do hold what they list).
     if (embyPages_.size() > 1 && embyPages_.back().kind == EmbyPage::Kind::Search) {
         embyCloseDetails();
     } else {
         EmbyPage page;
         page.kind = EmbyPage::Kind::Search;
+        const EmbyPage* from = embyPages_.size() > 1 ? &embyPages_.back() : nullptr;
+        if (from &&
+            (from->kind == EmbyPage::Kind::Library || from->kind == EmbyPage::Kind::Folder ||
+             from->kind == EmbyPage::Kind::Series || from->kind == EmbyPage::Kind::Season) &&
+            emby::searchableUnder(embyListPage(*from))) {
+            page.scopeId = from->id;
+            page.scopeTitle = from->title;
+        }
         embyPushPage(std::move(page));
     }
     focusField(TextFieldId::EmbySearch, true);
@@ -62,11 +73,36 @@ PanelRow App::embySearchRow() const {
     PanelRow row;
     row.kind = PanelRowKind::TextField;
     row.id = SettingId::EmbySearch;
-    row.field.placeholder = L"Search titles in every library";
+    const auto& page = embyPages_.back();
+    row.field.placeholder = page.searchesScope() ? L"Search titles in " + utf8ToWideText(page.scopeTitle)
+                                                 : L"Search titles in every library";
     row.field.magnifier = true;
     row.field.clearable = true;
     fieldDecorate(row, TextFieldId::EmbySearch);
     return row;
+}
+
+PanelRow App::embySearchScopeRow() const {
+    const auto& page = embyPages_.back();
+    PanelRow row;
+    row.kind = PanelRowKind::Buttons;
+    row.id = SettingId::EmbySearchScope;
+    row.options = {L"In " + utf8ToWideText(page.scopeTitle), L"Every library"};
+    row.buttonMinWidth = 80.0F;
+    row.buttonsOn = {!page.everyLibrary, page.everyLibrary};
+    return row;
+}
+
+void App::embyChooseSearchScope(int part) {
+    if (embyPages_.size() <= 1 || part < 0 || part > 1) return;
+    auto& page = embyPages_.back();
+    if (page.kind != EmbyPage::Kind::Search || page.scopeId.empty() || page.everyLibrary == (part == 1)) return;
+    page.everyLibrary = part == 1;
+    // What the box holds is searched for there at once, its pause or not.
+    embySearchEditedTick_ = 0;
+    page.term = wideToUtf8Text(textFieldTrimmed(page.field.text));
+    page.title = page.term;
+    embyRequestPage();
 }
 
 void App::embySearchEdited() {

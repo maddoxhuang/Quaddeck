@@ -33,8 +33,6 @@ namespace quaddeck {
 using namespace app_internal;
 
 namespace {
-unsigned windowDpi(HWND window);
-int resizeFrameThickness(unsigned dpi);
 void leaveAutoHideTaskbarEdges(HWND window, RECT& client);
 }  // namespace
 
@@ -46,6 +44,9 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
     instance_ = instance;
     singleInstance_ = singleInstance;
     externalOpenReady_ = false;
+    // WM_CREATE builds the renderer; the Video tab's choice of renderer and
+    // card is read first, so it is built once, as chosen.
+    primeVideoOutput();
     if (!initializeWindow(instance, showCommand)) {
         if (singleInstance_) singleInstance_->stopAccepting();
         singleInstance_ = nullptr;
@@ -99,9 +100,11 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
                 break;
             }
             // Route these application-wide gestures here so they work
-            // whichever HWND has focus.
-            if (message.message == WM_SYSKEYDOWN && message.wParam == VK_RETURN &&
-                (message.lParam & (1LL << 29)) && !(message.lParam & (1LL << 30))) {
+            // whichever HWND has focus: the Alt key of fullscreen, unless a
+            // key box waits for it.
+            if (message.message == WM_SYSKEYDOWN && (message.lParam & (1LL << 29)) &&
+                !(message.lParam & (1LL << 30)) && !capturingKey() &&
+                keyActionFor(keyBindings_, keyChordOf(message.wParam, true)) == KeyAction::Fullscreen) {
                 toggleFullscreen();
                 continue;
             }
@@ -112,8 +115,28 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
                     scrollPanelMenu(GET_WHEEL_DELTA_WPARAM(message.wParam));
                     continue;
                 }
-                // The wheel scrolls the settings sheet while the pointer is on
-                // it and is the volume control everywhere else on the player.
+                // A settings drop-down's list, open in a window of its own,
+                // takes the wheel wherever the pointer is, as a Windows combo
+                // box's does.
+                if (settingsWindow_.dropDown) {
+                    scrollSettingsWindow(GET_WHEEL_DELTA_WPARAM(message.wParam));
+                    continue;
+                }
+                // Over the sync panel it steps the offset of the video whose
+                // row it is on.
+                if (syncPanel_) {
+                    POINT local = message.pt;
+                    ScreenToClient(videoWindow_, &local);
+                    if (syncPanelWheel(local, GET_WHEEL_DELTA_WPARAM(message.wParam))) continue;
+                }
+                // Over the settings window the wheel scrolls its tab, whichever
+                // of the two windows has the keys.
+                if (pointerOverSettingsWindow(message.pt)) {
+                    scrollSettingsWindow(GET_WHEEL_DELTA_WPARAM(message.wParam));
+                    continue;
+                }
+                // The wheel scrolls the sheet while the pointer is on it and
+                // is the volume control everywhere else on the player.
                 POINT local = message.pt;
                 ScreenToClient(videoWindow_, &local);
                 const PanelHit hit = panelHitAt(local);
@@ -273,7 +296,8 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             MessageBoxA(window_, renderer_.error().c_str(), "D3D11 initialization failed", MB_ICONERROR);
             return -1;
         }
-        if (!audio_.initialize()) appendDiagnostic("Audio output unavailable: " + audio_.error());
+        noticeWarpFallbackWhenClear();
+        startAudioOutput();
         createControls();
         controlsLastInteraction_ = GetTickCount64();
         pointerLastMoved_ = controlsLastInteraction_;
@@ -282,7 +306,15 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case WM_DPICHANGED: {
         applyDpi(HIWORD(wParam));
-        if (const auto* suggested = reinterpret_cast<const RECT*>(lParam)) {
+        // Going into or out of fullscreen on a display of another DPI sends
+        // this from inside the move, before fullscreen_ says which way it
+        // went; the rectangle that move asked for is the one wanted.
+        if (placingWindow_) return 0;
+        // Fullscreen covers its monitor whatever the DPI; Windows' rectangle
+        // is the window scaled, which would leave it short or overhanging.
+        if (fullscreen_) {
+            placeFullscreen();
+        } else if (const auto* suggested = reinterpret_cast<const RECT*>(lParam)) {
             SetWindowPos(window_, nullptr, suggested->left, suggested->top,
                          suggested->right - suggested->left, suggested->bottom - suggested->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
@@ -303,6 +335,12 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         // at the display on the next frame: it may have gone in or out of HDR.
         nextDeviceRecovery_ = {};
         renderer_.noteDisplayChange();
+        // Cards and displays may have come or gone: the Video tab lists them
+        // again, a chosen card back now is used, and fullscreen covers its
+        // monitor as it now is, or the window's own if that one has gone.
+        refreshVideoDevices();
+        reclaimVideoAdapter();
+        if (fullscreen_) placeFullscreen();
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_TIMER:
         if (wParam == kSettingsSaveTimer) {
@@ -334,105 +372,35 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if ((lParam & (1LL << 30)) && wParam >= VK_MEDIA_NEXT_TRACK && wParam <= VK_MEDIA_PLAY_PAUSE) return 0;
             return DefWindowProcW(window_, message, wParam, lParam);
         }
+        // Alt is down with a key here only beside Ctrl; alone it makes
+        // WM_SYSKEYDOWN.
+        const bool alt = GetKeyState(VK_MENU) < 0;
+        // A key box of the Keys tab waiting for a key takes the next one,
+        // whatever it does now.
+        if (capturingKey()) {
+            captureKey(wParam, lParam, alt);
+            return 0;
+        }
         // An open drop-down has the keyboard, as a Windows menu does: the
         // arrows, Enter and Escape are its own, every other key nothing.
         if (panelMenu_) {
             panelMenuKey(wParam);
             return 0;
         }
-        // A text box, while it is typed into, has every key but F5 and F6
-        // before the shortcuts: a letter, a space or an arrow is text
-        // there, and a held one repeats.
-        if (fieldTyping() != TextFieldId::None && wParam != VK_F5 && wParam != VK_F6) {
+        // The sync panel leaves the keys to the player, but for Escape,
+        // which closes it.
+        if (syncPanel_ && wParam == VK_ESCAPE) {
+            closeSyncPanel();
+            return 0;
+        }
+        // A text box, while it is typed into, has every key before the
+        // shortcuts but a function key of the settings or the list: a
+        // letter, a space or an arrow is text there, and a held one repeats.
+        if (fieldTyping() != TextFieldId::None && !keyChordLeavesTextBox(keyBindings_, keyChordOf(wParam, alt))) {
             fieldKey(wParam, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
             return 0;
         }
-        // A held key repeats, and only the steps -- seeking, the volume,
-        // the subtitle delay -- are meant to: a held toggle would flip back
-        // and forth, a held Page Down open one file after another. Bit 30
-        // says the key was already down.
-        if ((lParam & (1LL << 30)) && wParam != VK_LEFT && wParam != VK_RIGHT &&
-            wParam != VK_UP && wParam != VK_DOWN &&
-            wParam != VK_OEM_PERIOD && wParam != VK_OEM_COMMA) {
-            return 0;
-        }
-        const bool ctrl = GetKeyState(VK_CONTROL) < 0;
-        switch (wParam) {
-        case VK_SPACE: togglePlayback(); break;
-        case VK_LEFT: seekRelative(GetKeyState(VK_CONTROL) < 0 ? -30.0 : -5.0); break;
-        case VK_RIGHT: seekRelative(GetKeyState(VK_CONTROL) < 0 ? 30.0 : 5.0); break;
-        // PotPlayer's volume keys, a wheel notch a press.
-        case VK_UP: stepVolume(1); break;
-        case VK_DOWN: stepVolume(-1); break;
-        case VK_HOME:
-        case 'R':
-            if (perPaneTimelines()) {
-                const auto pane = embyPlaybackTarget();
-                if (embyPanes_[pane]) {
-                    embyPanes_[pane]->fromBeginning = true;
-                    embyPanes_[pane]->resumeTicks = 0;
-                }
-                seekPaneTo(pane, 0.0);
-            } else {
-                seekAbsolute(0.0);
-            }
-            break;
-        case VK_ESCAPE:
-            if (settingsOpen_) closeSettingsPanel();
-            else if (soloPane_ >= 0) { soloPane_ = -1; layoutHoverControls(); }
-            else if (fullscreen_) toggleFullscreen();
-            break;
-        case VK_F5: toggleSettingsPanel(); break;
-        case VK_F6: toggleEmbyBrowser(); break;
-        case 'E': if (ctrl) embyOpenBrowser(); break;
-        case 'F':
-            // The search box, from any page of the Emby browser.
-            if (ctrl && settingsOpen_ && embyBrowserOpen_ && browserSource_ == BrowserSource::Emby) embyOpenSearch();
-            break;
-        case VK_PRIOR: openAdjacentFile(-1); break;
-        case VK_NEXT: openAdjacentFile(1); break;
-        case 'O':
-            if (GetKeyState(VK_CONTROL) < 0) loadSessionDialog();
-            else openFilesDialog();
-            break;
-        case 'S': if (GetKeyState(VK_CONTROL) < 0) saveSessionDialog(); break;
-        case 'L':
-        case VK_OEM_5:  // backslash, PotPlayer's A-B switch
-            toggleMasterLoop();
-            break;
-        case VK_OEM_4:
-            setMasterLoopA(clock_.position());
-            break;
-        case VK_OEM_6:
-            setMasterLoopB(clock_.position());
-            break;
-        case 'M': toggleMute(); break;
-        case 'U': toggleControls(); break;
-        case '0': resetAllOffsets(); break;
-        case '1': if (!ctrl) toggleAudioPane(paneForPosition(0)); break;
-        case '2': if (!ctrl) toggleAudioPane(paneForPosition(1)); break;
-        case '3': if (!ctrl) toggleAudioPane(paneForPosition(2)); break;
-        // PotPlayer's playlist sorts on its keys (Ctrl+5 is "by extension"
-        // there, which a library has no use for).
-        case '4': if (ctrl) sortListBy(static_cast<int>(emby::SortKey::Name)); else toggleAudioPane(paneForPosition(3)); break;
-        case '5': if (!ctrl) toggleAudioPane(paneForPosition(4)); break;
-        case '6': if (ctrl) sortListBy(static_cast<int>(emby::SortKey::Size)); break;
-        case '7': if (ctrl) sortListBy(static_cast<int>(emby::SortKey::DateAdded)); break;
-        case '8': if (ctrl) sortListBy(static_cast<int>(emby::SortKey::Runtime)); break;
-        case '9': if (ctrl) sortListBy(static_cast<int>(emby::SortKey::Random)); break;
-        // PotPlayer's subtitle timing: . shows the lines earlier, , later,
-        // / as their file says.
-        case VK_OEM_PERIOD:
-            if (const int pane = subtitlePane(); pane >= 0) nudgeSubtitleDelay(static_cast<std::size_t>(pane), -0.5);
-            break;
-        case VK_OEM_COMMA:
-            if (const int pane = subtitlePane(); pane >= 0) nudgeSubtitleDelay(static_cast<std::size_t>(pane), 0.5);
-            break;
-        case VK_OEM_2:
-            if (const int pane = subtitlePane(); pane >= 0) resetSubtitleDelay(static_cast<std::size_t>(pane));
-            break;
-        default: break;
-        }
+        runShortcut(wParam, lParam, alt);
         return 0;
     }
     case WM_CHAR:
@@ -445,7 +413,8 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (!panelMenu_) fieldCharacter(static_cast<wchar_t>(wParam));
         return 0;
     // An input method's composition, drawn by the text box itself while
-    // it is typed into; anywhere else Windows shows it as before.
+    // it is typed into. Anywhere else the input method is off
+    // (fieldSyncIme); what still comes is Windows' to show.
     case WM_IME_SETCONTEXT:
         if (fieldTyping() != TextFieldId::None) lParam &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW);
         return DefWindowProcW(window_, message, wParam, lParam);
@@ -468,29 +437,27 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_KILLFOCUS:
         fieldLostKeyboard();
+        // A key box stops waiting when the keyboard goes elsewhere.
+        keyCapture_.reset();
         return DefWindowProcW(window_, message, wParam, lParam);
-    case WM_SYSKEYDOWN:
-        // Alt closes an open drop-down, as it does a Windows menu.
+    case WM_SYSKEYDOWN: {
+        // Alt closes an open drop-down, as it does a Windows menu, and the
+        // sync panel.
         closePanelMenu();
-        if (wParam == VK_RETURN && (lParam & (1LL << 29)) && !(lParam & (1LL << 30))) {
-            toggleFullscreen();
-            return 0;
-        }
-        // PotPlayer's subtitle keys are Alt keys: H, L, O, the size and the
-        // place. Bit 29 says Alt is down with the key. The letters, held,
-        // do not repeat; the steps of the size and the place do.
-        if ((lParam & (1LL << 29)) && (lParam & (1LL << 30)) && (wParam == 'H' || wParam == 'L' || wParam == 'O')) {
+        closeSyncPanel();
+        // Bit 29 says Alt is down with the key; F10 comes here without it.
+        // A key taken here -- by a waiting key box or as a shortcut, held
+        // or not -- has its character message follow, which is dropped:
+        // whatever the keyboard layout makes of the key, it is this key's.
+        // Windows' own chords, Alt+F4 and Alt+Space, still reach Windows.
+        const bool alt = (lParam & (1LL << 29)) != 0;
+        if (capturingKey() ? captureKey(wParam, lParam, alt) : runShortcut(wParam, lParam, alt)) {
             altCharTaken_ = true;
-            return 0;
-        }
-        if ((lParam & (1LL << 29)) && handleAltKey(wParam)) {
-            // A letter's character message follows; whatever the keyboard
-            // layout makes of the letter, it is this key's.
-            altCharTaken_ = wParam >= 'A' && wParam <= 'Z';
             return 0;
         }
         altCharTaken_ = false;
         return DefWindowProcW(window_, message, wParam, lParam);
+    }
     case WM_SYSCHAR:
         // The character of an Alt key taken above: there is no menu bar to
         // look it up in, and the default would only beep.
@@ -508,10 +475,15 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         // request carries the space.
         if ((wParam & 0xFFF0) == SC_KEYMENU && lParam == 0) return 0;
         return DefWindowProcW(window_, message, wParam, lParam);
-    case WM_MOUSEWHEEL:
+    case WM_MOUSEWHEEL: {
+        POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        if (videoWindow_) ScreenToClient(videoWindow_, &local);
         if (panelMenu_) scrollPanelMenu(GET_WHEEL_DELTA_WPARAM(wParam));
-        else adjustVolumeFromWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        else if (!syncPanelWheel(local, GET_WHEEL_DELTA_WPARAM(wParam))) {
+            adjustVolumeFromWheel(GET_WHEEL_DELTA_WPARAM(wParam));
+        }
         return 0;
+    }
     // A press on the frame or the caption's strip, which Windows handles,
     // only closes an open drop-down, as one off a Windows menu does: it
     // does not move, size or maximise the window under it.
@@ -519,8 +491,9 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_NCLBUTTONDBLCLK:
     case WM_NCRBUTTONDOWN:
     case WM_NCMBUTTONDOWN:
-        if (panelMenu_) {
+        if (panelMenu_ || syncPanel_) {
             closePanelMenu();
+            closeSyncPanel();
             ncRightUpTaken_ = message == WM_NCRBUTTONDOWN;
             return 0;
         }
@@ -560,11 +533,22 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return DefWindowProcW(window_, message, wParam, lParam);
     case WM_ACTIVATE:
         // Back from another program -- the server's own client, where
-        // something may just have been watched or changed. Going to one
-        // closes an open drop-down, as it does a Windows menu.
-        if (LOWORD(wParam) != WA_INACTIVE) embyWantRefresh();
-        else closePanelMenu();
+        // something may just have been watched or changed; back from the
+        // settings window is not. Going to either closes an open drop-down,
+        // as it does a Windows menu.
+        if (LOWORD(wParam) != WA_INACTIVE) {
+            if (!settingsWindow_.window || reinterpret_cast<HWND>(lParam) != settingsWindow_.window) {
+                embyWantRefresh();
+            }
+        } else {
+            closePanelMenu();
+            closeSyncPanel();
+        }
         return DefWindowProcW(window_, message, wParam, lParam);
+    case WM_ENABLE:
+        // A modal dialog over the player holds the settings window too.
+        if (settingsWindow_.window) EnableWindow(settingsWindow_.window, wParam ? TRUE : FALSE);
+        return 0;
     case WM_ERASEBKGND:
         return 1;
     case WM_DESTROY:
@@ -588,6 +572,7 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
         // As before, the window waits here for every source to close.
         sourceReaper_.drain();
+        audioDevices_.stop();
         if (cursorHidden_) { ShowCursor(TRUE); cursorHidden_ = false; }
         PostQuitMessage(0);
         return 0;
@@ -597,23 +582,6 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 }
 
 namespace {
-
-// The resize border Windows gives a window at this DPI, the band at the top
-// of the client that resizes it, and what a maximized window hangs off the
-// monitor.
-int resizeFrameThickness(unsigned dpi) {
-    using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
-    static const auto forDpi = [] {
-        const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        return user32 ? reinterpret_cast<GetSystemMetricsForDpiFn>(
-                            GetProcAddress(user32, "GetSystemMetricsForDpi"))
-                      : nullptr;
-    }();
-    if (forDpi && dpi > 0) {
-        return forDpi(SM_CYSIZEFRAME, dpi) + forDpi(SM_CXPADDEDBORDER, dpi);
-    }
-    return GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-}
 
 // An auto-hide taskbar comes up when the pointer reaches its edge of the
 // monitor. A maximized window reaching that edge too would keep it hidden
@@ -635,30 +603,6 @@ void leaveAutoHideTaskbarEdges(HWND window, RECT& client) {
         default: break;
         }
     }
-}
-
-// Per-monitor DPI without a minimum SDK: both calls exist since Windows 10
-// 1607, and a build without them reports 96, which keeps the 1x layout.
-unsigned windowDpi(HWND window) {
-    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
-    using GetDpiForSystemFn = UINT(WINAPI*)();
-    if (user32 && window) {
-        if (const auto fn = reinterpret_cast<GetDpiForWindowFn>(
-                GetProcAddress(user32, "GetDpiForWindow"))) {
-            if (const UINT dpi = fn(window)) return dpi;
-        }
-    }
-    if (user32) {
-        if (const auto fn = reinterpret_cast<GetDpiForSystemFn>(
-                GetProcAddress(user32, "GetDpiForSystem"))) {
-            if (const UINT dpi = fn()) return dpi;
-        }
-    }
-    HDC screen = GetDC(nullptr);
-    const int dpi = screen ? GetDeviceCaps(screen, LOGPIXELSX) : 96;
-    if (screen) ReleaseDC(nullptr, screen);
-    return dpi > 0 ? static_cast<unsigned>(dpi) : 96U;
 }
 
 }  // namespace
@@ -846,6 +790,11 @@ void App::recoverLostDevice() {
     // device is let go, and a new swap chain allowed, only once they are gone.
     sourceReaper_.drain();
     overlay_.releaseDeviceResources();
+    // The settings window's chains and painter too; it paints again on the
+    // new device when there is one (renderSettingsWindow).
+    settingsWindow_.surface.release();
+    settingsWindow_.listSurface.release();
+    settingsWindow_.overlay.releaseDeviceResources();
     if (!renderer_.recover(videoWindow_)) {
         appendDiagnostic("Device recovery failed: " + renderer_.error() + "; next attempt in " +
                          std::to_string(delay.count()) + " s");
@@ -874,6 +823,9 @@ void App::recoverLostDevice() {
     if (wasPlaying) togglePlayback();
     updateTitle();
     updateControls();
+    // Once no notice is up -- a shader file not loaded, "Playing" -- so that
+    // it and they do not hide one another.
+    noticeWarpFallbackWhenClear();
     appendDiagnostic("Device recovery complete");
 }
 
@@ -1009,12 +961,7 @@ void App::tick() {
         processExternalFiles();
     }
     adoptEmbeddedSubtitles();
-    if (const long audioFailure = audio_.takeCriticalError()) {
-        std::ostringstream message;
-        message << "Audio engine stopped: 0x" << std::hex << static_cast<unsigned long>(audioFailure)
-                << "; no sound until QuadDeck restarts";
-        appendDiagnostic(message.str());
-    }
+    serviceAudioOutput();
     double readyDuration = 0.0;
     bool sourceOpening = false;
     for (std::size_t index = 0; index < sources_.size(); ++index) {
@@ -1123,6 +1070,7 @@ void App::tick() {
     // may finish or resolve its successor while every other pane keeps moving.
     finishEmbyPanes();
     finishLocalPanes();
+    finishLinkedBrowserSet();
     finishMasterTimeline(sourceOpening, hasRepeatingSource);
     // A keyframe seek landed near its target, not on it: the timeline
     // follows the picture, and the audio, re-aimed by the source, starts
@@ -1273,6 +1221,7 @@ void App::tick() {
             recoverLostDevice();
             return;
         }
+        renderSettingsWindow();
     }
     if (completeBarrierAfterRender) completeSeekBarrier();
     reportPerformance();
@@ -1302,6 +1251,12 @@ void App::updateTitle() {
         names += embyPanes_[pane] && !embyPanes_[pane]->title.empty()
             ? embyPanes_[pane]->title
             : std::filesystem::path(paths_[pane]).stem().wstring();
+        // Where it stands in the list it plays from, and how long that is.
+        int position = -1;
+        std::size_t count = 0;
+        if (playlistPlace(pane, position, count)) {
+            if (const auto place = listPlaceText(position, count); !place.empty()) names += L"  (" + place + L")";
+        }
     }
 
     if (loaded > 0) {
@@ -1370,10 +1325,11 @@ LRESULT App::frameHitTest(POINT screen) const {
 
 void App::toggleFullscreen() {
     const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(window_, GWL_STYLE));
+    placingWindow_ = true;
     if (!fullscreen_) {
         MONITORINFO monitor{sizeof(monitor)};
         if (GetWindowPlacement(window_, &previousPlacement_) &&
-            GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTOPRIMARY), &monitor)) {
+            GetMonitorInfoW(fullscreenMonitor(), &monitor)) {
             SetWindowLongPtrW(window_, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
             SetWindowPos(window_, HWND_TOP,
                 monitor.rcMonitor.left, monitor.rcMonitor.top,
@@ -1391,6 +1347,23 @@ void App::toggleFullscreen() {
         fullscreen_ = false;
         RECT client{}; GetClientRect(window_, &client); layoutControls(client.right, client.bottom);
     }
+    placingWindow_ = false;
+}
+
+void App::placeFullscreen() {
+    MONITORINFO monitor{sizeof(monitor)};
+    if (!fullscreen_ || !GetMonitorInfoW(fullscreenMonitor(), &monitor)) return;
+    RECT current{};
+    GetWindowRect(window_, &current);
+    if (EqualRect(&current, &monitor.rcMonitor)) return;
+    placingWindow_ = true;
+    SetWindowPos(window_, HWND_TOP,
+        monitor.rcMonitor.left, monitor.rcMonitor.top,
+        monitor.rcMonitor.right - monitor.rcMonitor.left,
+        monitor.rcMonitor.bottom - monitor.rcMonitor.top,
+        SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+    placingWindow_ = false;
+    RECT client{}; GetClientRect(window_, &client); layoutControls(client.right, client.bottom);
 }
 
 }  // namespace quaddeck

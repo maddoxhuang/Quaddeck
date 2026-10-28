@@ -122,6 +122,8 @@ void App::embyConfigure(const emby::Session& session) {
         // Those out are dropped by the account serial when they come.
         embySubtitleQuestions_.clear();
         embySubtitleQuestionsOut_ = 0;
+        // So is a shape question; the shapes go with the pictures below.
+        embyShapeQuestionOut_ = false;
         // A favorite change still out was the old account's; its answer is
         // dropped by the account serial.
         embyFavoriteAsking_.clear();
@@ -154,7 +156,7 @@ bool App::embySignInShown() const { return settingsOpen_ && embySignInPage(); }
 
 void App::embyOpenSignIn() {
     if (settingsOpen_) rememberSheetScroll();
-    if (!settingsOpen_) toggleSettingsPanel();
+    openSheet();
     embyBrowserOpen_ = true;
     browserSource_ = BrowserSource::Emby;
     restoreSheetScroll();
@@ -244,7 +246,7 @@ void App::embySignIn(const std::string& serverUrl, const std::string& userName, 
     embyNoteError_ = false;
     embyLoading_ = true;
     if (settingsOpen_) rememberSheetScroll();
-    if (!settingsOpen_) toggleSettingsPanel();
+    openSheet();
     embyBrowserOpen_ = true;
     browserSource_ = BrowserSource::Emby;
     settingsScroll_ = 0.0F;
@@ -322,6 +324,9 @@ void App::embySignOut() {
     session.userId.clear();
     embyConfigure(session);
     embySaveAuth();
+    // The sheet showing the browser closes: there is no settings face
+    // behind it to fall back on any more.
+    if (settingsOpen_ && embyBrowserOpen_) closeSettingsPanel();
     embyBrowserOpen_ = false;
     embyPages_.clear();
     embyItems_.clear();
@@ -342,6 +347,9 @@ void App::embySessionExpired() {
     session.userId.clear();
     embyConfigure(session);
     embySaveAuth();
+    // The sheet showing the browser closes: there is no settings face
+    // behind it to fall back on any more.
+    if (settingsOpen_ && embyBrowserOpen_) closeSettingsPanel();
     embyBrowserOpen_ = false;
     embyPages_.clear();
     embyItems_.clear();
@@ -380,19 +388,30 @@ bool App::paneOpening(std::size_t pane) const {
     return embyPanes_[pane].has_value() && embyPanes_[pane]->resolving;
 }
 
-void App::resetPaneMediaState(std::size_t pane) {
+void App::resetPaneMediaState(std::size_t pane, bool sameMedia) {
     if (pane >= sources_.size()) return;
     embyClearPane(pane);
     localPanes_[pane].reset();
     subtitles_[pane].reset();
-    subtitleSelection_[pane] = {};
-    subtitleFiles_[pane].clear();
-    subtitleFilesFailed_[pane].clear();
+    // The player's own subtitle choice is made again for the new source; a
+    // kept one of the viewer's is given to it by the caller. Kept, the
+    // player's would read as already made: an Emby reply would ask nothing
+    // of the server, and the pane would show no lines.
+    if (!sameMedia || !subtitleChosenByViewer_[pane]) subtitleSelection_[pane] = {};
+    if (!sameMedia) {
+        subtitleFiles_[pane].clear();
+        subtitleFilesFailed_[pane].clear();
+        subtitleChosenByViewer_[pane] = false;
+        subtitleDelay_[pane] = 0.0;
+        audioDelays_[pane] = 0.0;
+        audioTrackChoices_[pane] = -1;
+    }
     subtitleCycleAnchor_[pane] = {};
-    subtitleChosenByViewer_[pane] = false;
     subtitleEmbeddedPending_[pane] = false;
-    subtitleDelay_[pane] = 0.0;
-    subtitleSerial_[pane] = ++subtitleSerialCounter_;
+    // New media retires the serial. The same video opened again keeps it;
+    // its libass is made again all the same, as it counts the events of the
+    // source it was fed by.
+    if (!sameMedia || subtitleSerial_[pane] == 0) subtitleSerial_[pane] = ++subtitleSerialCounter_;
     assPanes_[pane] = {};
 }
 
@@ -567,8 +586,21 @@ void App::embySubtitleRead(std::size_t pane, int streamIndex, bool ass, Subtitle
 }
 
 void App::selectAudioTrack(std::size_t pane, int streamIndex) {
-    if (pane >= sources_.size() || !sources_[pane]) return;
+    if (pane >= sources_.size()) return;
+    if (!sources_[pane]) {
+        // The video is being opened again -- an Emby item asked of the
+        // server once more, one waiting for the device -- and an audio menu
+        // left open over it was answered: there is no source to switch, so
+        // the one it is given starts on the track (startSourceStream).
+        if (paths_[pane].empty() || streamIndex < 0) return;
+        audioTrackChoices_[pane] = streamIndex;
+        appendDiagnostic("Audio track requested: stream " + std::to_string(streamIndex) + " pane=" +
+                         std::to_string(pane + 1) + ", for the source it opens with");
+        showNotice(L"Audio track " + std::to_wstring(streamIndex));
+        return;
+    }
     sources_[pane]->setAudioTrack(streamIndex);
+    audioTrackChoices_[pane] = streamIndex;
     std::wstring label = L"Audio track " + std::to_wstring(streamIndex);
     for (const auto& track : sources_[pane]->audioTracks()) {
         if (track.streamIndex == streamIndex) label = audioTrackLabel(track);
@@ -584,14 +616,7 @@ void App::selectAudioTrack(std::size_t pane, int streamIndex) {
     }
     // The worker swaps decoders on its next seek; give it one at the
     // current time, the way an audio-output change does.
-    const double position = clock_.position();
-    sources_[pane]->setAudioEnabled(false);
-    const auto generation = sources_[pane]->requestAudioSeek(currentSourceTime(pane));
-    audio_.flush(pane, generation);
-    const bool useAudio = shouldOutputAudio(pane, position, clock_.isPlaying());
-    sources_[pane]->setAudioEnabled(useAudio);
-    audio_.setRate(pane, static_cast<float>(playbackRates_[pane]));
-    if (useAudio) audio_.play(pane);
+    reaimPaneAudio(pane);
     showNotice(label);
 }
 

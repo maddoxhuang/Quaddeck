@@ -1,13 +1,16 @@
 #pragma once
 
-// QuadDeck's menus: the sheet's drop-downs -- the browser toolbars' View,
-// Sort and Filters, an information page's Play and Add choices, an Emby
+// QuadDeck's menus: the sheet's drop-downs -- the Emby browser's View, the
+// browsers' Sort, an information page's Play and Add choices, an Emby
 // item's right-click -- and the menus over the picture -- its right-click
 // (also a pane's pill), the bar's Subtitles and arrangement menus. They are
 // drawn by the Overlay, as the rest of the window is, not shown as Windows
 // popup menus: a popup menu is a window of its own, and over it the pointer
 // had left the player, so a browser the right edge had opened closed under a
-// menu being read.
+// menu being read. The settings window's drop-downs, which nothing closes
+// for the pointer leaving, hang their lists in a window of their own, drawn
+// by the Overlay too, so a list can reach past the window's edge as a
+// Windows combo box's does (panelMenuWindowFrame).
 //
 // Pure geometry and keyboard navigation on floats, as OverlayLayout.hpp:
 // App builds the items and hit-tests the layout, Overlay measures the text
@@ -16,6 +19,7 @@
 #include "OverlayLayout.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <string>
 #include <utility>
@@ -29,8 +33,9 @@ enum class PanelMenuItemKind {
     Option,
     // On or off by itself: it wears a switch.
     Check,
-    // Segments in a row share one line, the chosen one filled: a sort's
-    // direction, Folders or All videos.
+    // Segments in a row share one line, the chosen one filled. No menu has
+    // them now: the sort's direction is gone, and the browsers' Folders /
+    // All videos is a toolbar button of its own.
     Segment,
     Separator,
     // A line that opens a card of its own beside it, its `children`, as a
@@ -124,13 +129,17 @@ struct PanelMenuMetrics {
     float inset{12.0F};
     // Between a label and its key, switch or a submenu's chevron.
     float trailingGap{32.0F};
-    float switchWidth{32.0F};
-    float switchHeight{18.0F};
+    // A switch as the sheet's and the settings window's (PanelMetrics).
+    float switchWidth{40.0F};
+    float switchHeight{20.0F};
     float chevronWidth{12.0F};
     float minWidth{176.0F};
     // Between the button and the card, and the card and its bounds' edge.
     float gap{6.0F};
     float margin{8.0F};
+    // Between a drop-down's box and its list in a window of its own, which
+    // hangs from the box as a Windows combo box's does.
+    float windowGap{2.0F};
     // How far a submenu's card lies over the edge of the one it opened from.
     float submenuOverlap{4.0F};
     // A character's width where no font measured it: before DWrite is
@@ -161,6 +170,10 @@ enum class PanelMenuPlacement {
     // no room there, on the left; fitting neither, under or over that line,
     // never on it: a submenu.
     Beside,
+    // Filling its bounds from their top, no taller than its lines: a
+    // drop-down's list in a window of its own, the window its card
+    // (panelMenuWindowFrame).
+    Fill,
 };
 
 struct PanelMenuLayout {
@@ -264,7 +277,12 @@ inline PanelMenuLayout panelMenuLayout(const std::vector<PanelMenuItem>& items,
         y = anchor.y - pad;
     }
     const float content = height;
-    if (bounds.visible()) {
+    if (placement == PanelMenuPlacement::Fill) {
+        x = bounds.x;
+        y = bounds.y;
+        width = bounds.width;
+        height = std::min(height, bounds.height);
+    } else if (bounds.visible()) {
         width = std::min(width, std::max(1.0F, bounds.width - 2.0F * margin));
         const float leftmost = bounds.x + margin;
         const float rightmost = bounds.right() - margin;
@@ -365,6 +383,34 @@ inline PanelMenuLayout panelMenuLayout(const std::vector<PanelMenuItem>& items,
         ++i;
     }
     return layout;
+}
+
+// Where a drop-down's list stands in a window of its own, in screen pixels,
+// as a Windows combo box's does: its left edge at its box's and its top
+// just under it, `width` by `height` (the card panelMenuLayout gives it with
+// no bounds). Over the box instead where the screen -- `work`, the work
+// area of the box's monitor -- has no room for it under the box and more
+// over it; cut to the room on the side it takes, its lines to scroll, where
+// it fits neither way; moved in from the screen's right edge only where it
+// would cross it. Whole pixels, a window's: one as wide as its box covers
+// the pixels the box's edges are drawn on.
+inline OverlayRect panelMenuWindowFrame(const OverlayRect& box, const OverlayRect& work, float width, float height,
+                                        float scale, const PanelMenuMetrics& metrics = {}) {
+    const float s = scale > 0.0F ? scale : 1.0F;
+    const float gap = std::round(metrics.windowGap * s);
+    if (std::abs(width - box.width) <= 0.5F) width = std::round(box.right()) - std::round(box.x);
+    width = std::ceil(std::max(1.0F, std::min(width, work.width)));
+    height = std::ceil(std::max(1.0F, height));
+    const float x = std::max(std::round(work.x), std::min(std::round(box.x), std::floor(work.right() - width)));
+    const float below = std::round(box.bottom()) + gap;
+    const float above = std::round(box.y) - gap;
+    const float roomBelow = std::floor(work.bottom()) - below;
+    const float roomAbove = above - std::ceil(work.y);
+    if (height <= roomBelow || roomBelow >= roomAbove) {
+        return {x, below, width, std::max(1.0F, std::min(height, roomBelow))};
+    }
+    height = std::max(1.0F, std::min(height, roomAbove));
+    return {x, above - height, width, height};
 }
 
 // What the submenu opened from line `index` of `parent` hangs from (with

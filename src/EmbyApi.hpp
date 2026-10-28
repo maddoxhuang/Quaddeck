@@ -108,6 +108,12 @@ struct Item {
     // A folder without a picture of its own borrows a child's.
     std::string primaryImageItemId;
     double primaryImageAspect{};
+    // The first video stream's shape, width over height: its frame as
+    // stored (Width/Height) and as shown (AspectRatio), 0 where not said;
+    // `streamsRead` once a reply carried MediaStreams at all.
+    bool streamsRead{};
+    float storedAspect{};
+    float displayAspect{};
     // Optional information for a detail page; list replies often omit it.
     std::string overview, officialRating, originalTitle, videoInfo, audioInfo;
     std::optional<double> communityRating, criticRating;
@@ -332,7 +338,7 @@ struct ItemsQuery {
     std::string nameStartsWith;
     std::string searchTerm;
     std::string fields;
-    std::string filters;       // "IsUnplayed"
+    std::string filters;       // "IsUnplayed", "IsFavorite,IsUnplayed"
     std::string personIds;     // what a person is credited in
     bool recursive{};
     int startIndex{};
@@ -428,8 +434,16 @@ struct ListArrangement {
     SortKey sort{SortKey::Name};
     bool descending{};
     bool unplayed{};
-    bool flat{};  // every video under the page, not its folders
+    bool flat{};       // every video under the page, not its folders
+    bool favorites{};  // only what the account marked, anywhere under the page
 };
+
+// The Filters a list or a search is asked with; the server takes them as
+// one comma list, every one of them holding.
+inline std::string arrangementFilters(bool unplayed, bool favorites) {
+    if (favorites) return unplayed ? "IsFavorite,IsUnplayed" : "IsFavorite";
+    return unplayed ? "IsUnplayed" : "";
+}
 
 // The one type a library lists recursively whatever its folders are, or
 // nothing for a library that is walked.
@@ -467,15 +481,22 @@ inline ItemsQuery listQuery(const ListPage& page, const ListArrangement& arrange
     query.startIndex = startIndex;
     query.limit = limit;
     query.fields = fields;
-    if (arrangement.unplayed) query.filters = "IsUnplayed";
+    query.filters = arrangementFilters(arrangement.unplayed, arrangement.favorites);
     const std::string type = libraryItemType(page);
+    const bool flat = arrangement.flat && listTakesFlat(page);
+    // Only the marked, under a page walked by folder or listing one type:
+    // from every folder beneath it, since a mark is on a video or folder
+    // anywhere below, which the unmarked folders between would hide. A box
+    // set or a playlist, and their libraries, list what they hold, so the
+    // filter keeps the marked among those.
+    const bool marked = arrangement.favorites && !flat && (!type.empty() || listTakesFlat(page));
     if (page.kind == ListKind::Favorites) {
         // Every library at once, as one list: the series, folders and box
         // sets first, as a folder's page shows them, then the videos.
         query.parentId.clear();
         query.includeTypes = kFavoriteItemTypes;
         query.recursive = true;
-        query.filters = arrangement.unplayed ? "IsFavorite,IsUnplayed" : "IsFavorite";
+        query.filters = arrangementFilters(arrangement.unplayed, true);
         applySort(query, arrangement.sort, arrangement.descending, true);
     } else if (page.kind == ListKind::Person) {
         // Every library at once too; the page puts the films, series and
@@ -493,11 +514,17 @@ inline ItemsQuery listQuery(const ListPage& page, const ListArrangement& arrange
         } else {
             applySort(query, arrangement.sort, arrangement.descending, false);
         }
+    } else if (marked) {
+        // The favorites page's list, of this page alone: the series,
+        // seasons, folders and box sets first, then the videos.
+        query.includeTypes = kFavoriteItemTypes;
+        query.recursive = true;
+        applySort(query, arrangement.sort, arrangement.descending, true);
     } else if (!type.empty()) {
         query.includeTypes = type;
         query.recursive = true;
         applySort(query, arrangement.sort, arrangement.descending, false);
-    } else if (arrangement.flat && listTakesFlat(page)) {
+    } else if (flat) {
         query.includeTypes = "Video,Photo,Movie,Episode";
         query.recursive = true;
         applySort(query, arrangement.sort, arrangement.descending, false);
@@ -506,6 +533,35 @@ inline ItemsQuery listQuery(const ListPage& page, const ListArrangement& arrange
         // shows a home-video or photo library.
         applySort(query, arrangement.sort, arrangement.descending, true);
     }
+    return query;
+}
+
+// What a search finds: the titles a word of which starts with `term`, at
+// any depth under `parentId` -- a library, or the library, folder, show or
+// season the search was opened in. The browser orders them itself.
+inline constexpr const char* kSearchItemTypes = "Series,Movie,Episode,Video,Photo";
+
+// Whether a search can be kept to what is under the page: a library, a
+// folder, a show or a season holds what it lists. A box set and a playlist
+// only point at theirs -- a 4.x server answers a search under a box set
+// with a 500 and under the box-set library with nothing -- and the
+// favorites and a person's titles are in every library.
+inline bool searchableUnder(const ListPage& page) {
+    if (page.id.empty()) return false;
+    if (page.kind == ListKind::Library) return page.collectionType != "boxsets" && page.collectionType != "playlists";
+    return page.kind == ListKind::Folder && page.itemType != "BoxSet" && page.itemType != "Playlist";
+}
+
+inline ItemsQuery searchQuery(const std::string& parentId, const std::string& term, const std::string& filters,
+                              int limit, const std::string& fields) {
+    ItemsQuery query;
+    query.parentId = parentId;
+    query.recursive = true;
+    query.includeTypes = kSearchItemTypes;
+    query.searchTerm = term;
+    query.filters = filters;
+    query.limit = limit;
+    query.fields = fields;
     return query;
 }
 
@@ -601,6 +657,42 @@ inline std::vector<std::vector<std::string>> subtitleBatches(const std::vector<s
         batches.back().push_back(id);
     }
     return batches;
+}
+
+// --- the shape of a video ------------------------------------------------------
+
+// The server takes a video's picture from its frame as stored, so a video
+// whose pixels are not square -- a 9:16 phone clip stored as 1280x720 --
+// has a picture of the wrong shape, and only the video's streams say what
+// it should be. A list's items do not carry them, and MediaStreams for a
+// whole list runs to megabytes (above), so the videos whose pictures are
+// on the screen are asked about by id, a screenful at a time.
+inline std::string videoShapesPath(const std::string& userId, const std::vector<std::string>& ids) {
+    std::string list;
+    for (const auto& id : ids) list += (list.empty() ? "" : ",") + id;
+    return "/Users/" + urlEncode(userId) + "/Items?Ids=" + urlEncode(list) +
+           "&Fields=MediaStreams&EnableImages=false&EnableUserData=false&Limit=" +
+           std::to_string(std::max<std::size_t>(1, ids.size()));
+}
+
+// A stream's AspectRatio as the server words it -- "9:16", "16:9",
+// "2.40:1", or a bare "1.78" -- as width over height; 0 for anything else.
+inline float parseAspectRatio(std::string_view text) {
+    const auto number = [](std::string_view part, double& value) {
+        while (!part.empty() && part.front() == ' ') part.remove_prefix(1);
+        while (!part.empty() && part.back() == ' ') part.remove_suffix(1);
+        if (part.empty()) return false;
+        const auto [end, error] = std::from_chars(part.data(), part.data() + part.size(), value);
+        return error == std::errc() && end == part.data() + part.size() && std::isfinite(value) && value > 0.0;
+    };
+    double width = 0.0, height = 1.0;
+    const auto colon = text.find(':');
+    if (colon == std::string_view::npos ? !number(text, width)
+                                        : !number(text.substr(0, colon), width) || !number(text.substr(colon + 1), height)) {
+        return 0.0F;
+    }
+    const double aspect = width / height;
+    return aspect >= 0.05 && aspect <= 20.0 ? static_cast<float>(aspect) : 0.0F;
 }
 
 inline std::string itemDetailsPath(const std::string& userId, const std::string& itemId) {
@@ -927,6 +1019,25 @@ inline std::optional<double> metadataRating(const json& object, const char* key,
                ? std::optional<double>{rating} : std::nullopt;
 }
 
+// The shape of the first video stream of `streams`, into the item; an item
+// whose streams hold no video (a series, an audio file) keeps 0s.
+inline void videoShapeFromStreams(Item& item, const json& streams) {
+    if (!streams.is_array()) return;
+    item.streamsRead = true;
+    const auto count = std::min(kMaximumMetadataEntries, streams.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& stream = streams[i];
+        if (!stream.is_object() || str(stream, "Type") != "Video") continue;
+        const int width = nonnegativeInt(stream, "Width", 0);
+        const int height = nonnegativeInt(stream, "Height", 0);
+        if (width > 0 && width <= 32768 && height > 0 && height <= 32768) {
+            item.storedAspect = static_cast<float>(width) / static_cast<float>(height);
+        }
+        item.displayAspect = parseAspectRatio(metadataString(stream, "AspectRatio", 32));
+        return;
+    }
+}
+
 inline void metadataTechnicalInfo(Item& item, const json& streams) {
     if (!streams.is_array()) return;
     const auto append = [](std::string& text, const std::string& part) {
@@ -1013,7 +1124,19 @@ inline void itemDetailsFromJson(Item& item, const json& j) {
             item.people.push_back(std::move(person));
         }
     }
-    if (const auto streams = j.find("MediaStreams"); streams != j.end()) metadataTechnicalInfo(item, *streams);
+    if (const auto streams = j.find("MediaStreams"); streams != j.end()) {
+        metadataTechnicalInfo(item, *streams);
+        videoShapeFromStreams(item, *streams);
+    }
+    if (!item.streamsRead) {
+        // A single item's reply names its streams under its first version.
+        if (const auto sources = j.find("MediaSources"); sources != j.end() && sources->is_array() &&
+            !sources->empty() && (*sources)[0].is_object()) {
+            if (const auto streams = (*sources)[0].find("MediaStreams"); streams != (*sources)[0].end()) {
+                videoShapeFromStreams(item, *streams);
+            }
+        }
+    }
     if (item.videoInfo.empty() || item.audioInfo.empty()) {
         if (const auto sources = j.find("MediaSources"); sources != j.end() && sources->is_array()) {
             const auto count = std::min(kMaximumMetadataEntries, sources->size());

@@ -3,8 +3,10 @@
 #include "Diagnostics.hpp"
 #include "ShaderCompat.hpp"
 #include "SoftwareVideoFrame.hpp"
+#include "VideoDevices.hpp"
 
 #include <d3dcompiler.h>
+#include <dwmapi.h>
 #include <dxgi1_3.h>
 
 #include <algorithm>
@@ -238,9 +240,114 @@ float3 linearToPq(float3 nits) {
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float4 layer = overlayTexture.Sample(overlaySampler, uv);
     if (layer.a <= 0.0) return float4(0.0, 0.0, 0.0, 0.0);
+    // A 10-bit sRGB back buffer takes the layer as it is.
+    if (overlayParams.y > 0.5) return layer;
     float3 straight = saturate(layer.rgb / layer.a);
     float3 pq = linearToPq(srgbToLinear(straight) * overlayParams.x);
     return float4(pq * layer.a, layer.a);
+})";
+
+// The output pass: a pane's picture enlarged to its place by the chosen
+// scaler, then PotPlayer's colour controls and the output levels. The
+// kernels read their taps through the point sampler at texel centres; the
+// clamp addressing repeats the edge. Catmull-Rom and Lanczos ring, so the
+// result is held to 0-1. VideoOutput.hpp's videoColorAdjusted() does the
+// colour sums the same way, for the probe.
+constexpr char kOutputShader[] = R"(
+Texture2D videoTexture : register(t0);
+SamplerState linearSampler : register(s0);
+SamplerState pointSampler : register(s1);
+cbuffer OutputParams : register(b0) {
+    float4 sourceSize;     // texels across and down, and their reciprocals
+    float4 outputMode;     // scaler (0 bilinear, 1 bicubic, 2 Lanczos, 3 nearest), colour, limited range
+    float4 colorControls;  // brightness, contrast, saturation, gamma exponent
+    float4 hueRotation;    // cos, sin
+};
+
+float cubicWeight(float x) {
+    x = abs(x);
+    if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
+}
+
+float lanczosWeight(float x) {
+    x = abs(x);
+    if (x < 1e-5) return 1.0;
+    if (x >= 3.0) return 0.0;
+    float a = 3.14159265 * x;
+    return 3.0 * sin(a) * sin(a / 3.0) / (a * a);
+}
+
+float4 tap(float2 texel) {
+    return videoTexture.SampleLevel(pointSampler, (texel + 0.5) * sourceSize.zw, 0);
+}
+
+float4 bicubic(float2 uv) {
+    float2 position = uv * sourceSize.xy - 0.5;
+    float2 base = floor(position);
+    float2 f = position - base;
+    float wx[4];
+    float wy[4];
+    [unroll] for (int i = 0; i < 4; ++i) {
+        wx[i] = cubicWeight(float(i - 1) - f.x);
+        wy[i] = cubicWeight(float(i - 1) - f.y);
+    }
+    float4 sum = 0.0;
+    float total = 0.0;
+    [unroll] for (int y = 0; y < 4; ++y) {
+        [unroll] for (int x = 0; x < 4; ++x) {
+            float w = wx[x] * wy[y];
+            sum += tap(base + float2(x - 1, y - 1)) * w;
+            total += w;
+        }
+    }
+    return sum / total;
+}
+
+float4 lanczos(float2 uv) {
+    float2 position = uv * sourceSize.xy - 0.5;
+    float2 base = floor(position);
+    float2 f = position - base;
+    float wx[6];
+    float wy[6];
+    [unroll] for (int i = 0; i < 6; ++i) {
+        wx[i] = lanczosWeight(float(i - 2) - f.x);
+        wy[i] = lanczosWeight(float(i - 2) - f.y);
+    }
+    float4 sum = 0.0;
+    float total = 0.0;
+    [unroll] for (int y = 0; y < 6; ++y) {
+        [unroll] for (int x = 0; x < 6; ++x) {
+            float w = wx[x] * wy[y];
+            sum += tap(base + float2(x - 2, y - 2)) * w;
+            total += w;
+        }
+    }
+    return sum / total;
+}
+
+float3 adjustColor(float3 rgb) {
+    float luma = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    float cb = (rgb.b - luma) / 1.8556;
+    float cr = (rgb.r - luma) / 1.5748;
+    float y = (luma - 0.5) * colorControls.y + 0.5 + colorControls.x;
+    float blue = (cb * hueRotation.x - cr * hueRotation.y) * colorControls.z;
+    float red = (cb * hueRotation.y + cr * hueRotation.x) * colorControls.z;
+    float3 result = float3(y + 1.5748 * red, y - 0.187324 * blue - 0.468124 * red, y + 1.8556 * blue);
+    return pow(saturate(result), colorControls.w);
+}
+
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float4 color;
+    if (outputMode.x > 2.5) color = videoTexture.SampleLevel(pointSampler, uv, 0);
+    else if (outputMode.x > 1.5) color = lanczos(uv);
+    else if (outputMode.x > 0.5) color = bicubic(uv);
+    else color = videoTexture.SampleLevel(linearSampler, uv, 0);
+    color.rgb = saturate(color.rgb);
+    if (outputMode.y > 0.5) color.rgb = adjustColor(color.rgb);
+    if (outputMode.z > 0.5) color.rgb = color.rgb * (219.0 / 255.0) + 16.0 / 255.0;
+    return float4(color.rgb, 1.0);
 })";
 
 // NVIDIA's RTX Video features are private D3D11 video-processor stream
@@ -272,6 +379,51 @@ std::string narrow(const std::wstring& text) {
     return result;
 }
 
+// A compiled shader's inputs or outputs, as D3D11 links them.
+bool signatureValues(ID3DBlob* blob, bool inputs, std::vector<ShaderSignatureValue>& values) {
+    Microsoft::WRL::ComPtr<ID3D11ShaderReflection> reflection;
+    D3D11_SHADER_DESC description{};
+    if (FAILED(D3DReflect(blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&reflection))) ||
+        FAILED(reflection->GetDesc(&description))) return false;
+    const UINT count = inputs ? description.InputParameters : description.OutputParameters;
+    for (UINT i = 0; i < count; ++i) {
+        D3D11_SIGNATURE_PARAMETER_DESC parameter{};
+        if (FAILED(inputs ? reflection->GetInputParameterDesc(i, &parameter)
+                          : reflection->GetOutputParameterDesc(i, &parameter))) return false;
+        ShaderSignatureValue value;
+        value.semantic = parameter.SemanticName;
+        value.index = parameter.SemanticIndex;
+        value.registerIndex = parameter.Register;
+        value.mask = parameter.Mask;
+        // An output's ReadWriteMask is the components it never writes.
+        value.read = inputs ? parameter.ReadWriteMask : 0;
+        value.position = parameter.SystemValueType == D3D_NAME_POSITION;
+        value.distance = parameter.SystemValueType == D3D_NAME_CLIP_DISTANCE ||
+                         parameter.SystemValueType == D3D_NAME_CULL_DISTANCE;
+        value.system = parameter.SystemValueType != D3D_NAME_UNDEFINED && !value.position && !value.distance;
+        value.floating = parameter.ComponentType == D3D_REGISTER_COMPONENT_FLOAT32;
+        values.push_back(std::move(value));
+    }
+    return true;
+}
+
+// What the quad's vertex shader writes, which every pixel shader is drawn
+// after: SV_POSITION in register 0, then TEXCOORD0-3, each the same video
+// coordinate.
+const std::vector<ShaderSignatureValue>& quadOutputs() {
+    static const std::vector<ShaderSignatureValue> outputs = [] {
+        std::vector<ShaderSignatureValue> values;
+        Microsoft::WRL::ComPtr<ID3DBlob> blob;
+        if (SUCCEEDED(D3DCompile(kVertexShader, sizeof(kVertexShader) - 1, "QuadDeckVS", nullptr, nullptr,
+                                 "main", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, nullptr)) &&
+            !signatureValues(blob.Get(), false, values)) {
+            values.clear();
+        }
+        return values;
+    }();
+    return outputs;
+}
+
 }
 
 namespace {
@@ -286,6 +438,16 @@ constexpr unsigned kBackBufferRetriesPerLog = 60;
 bool lostDeviceResult(HRESULT hr) {
     return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
            hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
+// A line in the log about how the device was made: what happened, its
+// HRESULT, and what is done next.
+void describeDevice(const char* what, HRESULT hr, const char* next = nullptr) {
+    std::ostringstream out;
+    out << "Renderer: " << what << " (0x" << std::hex << std::setw(8) << std::setfill('0')
+        << static_cast<unsigned long>(hr) << ")";
+    if (next) out << "; " << next;
+    appendDiagnostic(out.str());
 }
 }  // namespace
 
@@ -305,11 +467,16 @@ void D3DRenderer::releaseDeviceResources() {
         CloseHandle(frameQueryTimer_);
         frameQueryTimer_ = nullptr;
     }
-    slots_ = {};
-    softwareUploads_ = {};
-    softwarePq_ = {};
-    loggedSoftwareRoute_.fill(-1);
+    if (paceTimer_) {
+        CloseHandle(paceTimer_);
+        paceTimer_ = nullptr;
+    }
+    dropSlots();
     renderTarget_.Reset();
+    outputShader_.Reset();
+    outputParamsBuffer_.Reset();
+    pointSampler_.Reset();
+    effectShaderActive_ = false;
     overlayLayerView_.Reset();
     overlayLayer_.Reset();
     overlayCompositeShader_.Reset();
@@ -351,6 +518,7 @@ void D3DRenderer::releaseDeviceResources() {
     adapterLuid_ = {};
     swapChainFlags_ = 0;
     hdrOutput_ = false;
+    tenBitOutput_ = false;
     enhancementStatus_.hdrOutput = false;
     enhancementStatus_.superResolutionApplied = false;
     enhancementStatus_.rtxHdrApplied = false;
@@ -373,7 +541,10 @@ bool D3DRenderer::recover(HWND window) {
     error_.clear();
     // smartVibranceSettings_ survives the rebuild and seeds the new constant
     // buffer; the caller restores the shader selection, which it owns.
-    const bool recovered = initialize(window);
+    bool recovered = initialize(window);
+    // initialize() goes on past an output-mode switch that failed; a device
+    // that switch found removed is not a recovered one.
+    if (recovered && device_ && lostDeviceResult(device_->GetDeviceRemovedReason())) recovered = false;
     deviceRebuildInProgress_ = false;
     deviceLost_ = !recovered;
     return recovered;
@@ -408,33 +579,126 @@ bool D3DRenderer::initialize(HWND window) {
     return true;
 }
 
-bool D3DRenderer::createDevice(HWND window) {
+HRESULT D3DRenderer::createDeviceOn(IDXGIAdapter* adapter, D3D_DRIVER_TYPE driver) {
     constexpr D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
         D3D_FEATURE_LEVEL_10_1,
     };
-    D3D_FEATURE_LEVEL actual{};
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
 #ifdef _DEBUG
     flags |= D3D11_CREATE_DEVICE_DEBUG;
 #endif
-    HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
-        levels, static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION,
-        &device_, &actual, &context_);
-    if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG)) {
-        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
-        hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+    HRESULT refused = S_OK;
+    for (;;) {
+        device_.Reset();
+        context_.Reset();
+        D3D_FEATURE_LEVEL actual{};
+        const HRESULT hr = D3D11CreateDevice(
+            adapter, driver, nullptr, flags,
             levels, static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION,
             &device_, &actual, &context_);
+        if (SUCCEEDED(hr)) {
+            if (FAILED(refused)) describeDevice("the device refused video support and was made without it", refused);
+            return hr;
+        }
+        if (flags & D3D11_CREATE_DEVICE_DEBUG) {
+            flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+        } else if ((flags & D3D11_CREATE_DEVICE_VIDEO_SUPPORT) && retryWithoutVideoSupport(hr, driver)) {
+            flags &= ~D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+            refused = hr;
+        } else {
+            return hr;
+        }
+    }
+}
+
+bool D3DRenderer::createD3DDevice() {
+    builtChoice_ = videoRendererChoice(videoOutput_);
+    builtRenderer_ = builtChoice_.renderer;
+    adapterFallback_ = false;
+    adapterMissing_ = false;
+    HRESULT hr = E_FAIL;
+    bool created = false;
+    if (builtChoice_.renderer == VideoRenderer::Warp) {
+        hr = createDeviceOn(nullptr, D3D_DRIVER_TYPE_WARP);
+        created = SUCCEEDED(hr);
+        if (!created) {
+            describeDevice("WARP could not be created; rendering on the graphics card", hr);
+            builtRenderer_ = VideoRenderer::Direct3D11;
+        }
+    } else if (!builtChoice_.adapter.empty()) {
+        // Without an adapter D3D11 takes the one driving the main display.
+        const auto chosen = findVideoAdapter(builtChoice_.adapter, builtChoice_.adapterIndex);
+        if (chosen) {
+            hr = createDeviceOn(chosen.Get(), D3D_DRIVER_TYPE_UNKNOWN);
+            created = SUCCEEDED(hr);
+            if (!created) describeDevice("the chosen card could not be used; rendering on the default one", hr);
+        } else {
+            adapterMissing_ = true;
+            appendDiagnostic("Renderer: the chosen card " + narrow(builtChoice_.adapter) +
+                             " is not connected; rendering on the default one");
+        }
+        adapterFallback_ = !created;
+    }
+    if (!created) {
+        hr = createDeviceOn(nullptr, D3D_DRIVER_TYPE_HARDWARE);
+    }
+    // No card makes a device at all. WARP still shows the videos, decoded
+    // in software, where the window would not open; a rebuild after a
+    // device on a card (a lost device, a driver being installed) waits for
+    // the card instead, as below. The log says WARP is tried, and createDevice
+    // then that it renders; should WARP fail as well, its own failure is
+    // logged and reported beside the card's.
+    HRESULT warp = S_OK;
+    if (FAILED(hr) && builtChoice_.renderer != VideoRenderer::Warp &&
+        deviceAdapterAcceptable(true, deviceOnCard_, builtChoice_.renderer)) {
+        describeDevice("no graphics card could make a device", hr, "trying WARP");
+        warp = createDeviceOn(nullptr, D3D_DRIVER_TYPE_WARP);
+        if (SUCCEEDED(warp)) {
+            hr = warp;
+            builtRenderer_ = VideoRenderer::Warp;
+        } else {
+            describeDevice("WARP could not be created either", warp);
+        }
     }
     if (FAILED(hr)) {
         setError("D3D11CreateDevice", hr);
+        if (FAILED(warp)) {
+            std::ostringstream out;
+            out << "; WARP failed: 0x" << std::hex << std::setw(8) << std::setfill('0')
+                << static_cast<unsigned long>(warp);
+            error_ += out.str();
+        }
         return false;
     }
+    // During a driver update D3D11 takes the Basic Render Driver for the
+    // card, and the device is made there without video support. A rebuild
+    // after a device on the card is refused it, and App tries again until
+    // the card is back, instead of the videos staying on the CPU, decoded
+    // in software, for the rest of the session.
+    DXGI_ADAPTER_DESC1 adapter{};
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> made;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> made1;
+    const bool software = SUCCEEDED(device_.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(&made)) &&
+                          SUCCEEDED(made.As(&made1)) && SUCCEEDED(made1->GetDesc1(&adapter)) &&
+                          (adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+    if (!deviceAdapterAcceptable(software, deviceOnCard_, builtChoice_.renderer)) {
+        context_.Reset();
+        device_.Reset();
+        error_ = "The rebuild found only " + narrow(adapter.Description) +
+                 ", a software adapter; waiting for the graphics card";
+        appendDiagnostic("Renderer: " + error_);
+        return false;
+    }
+    deviceOnCard_ = !software;
+    return true;
+}
 
+bool D3DRenderer::createDevice(HWND window) {
+    if (!createD3DDevice()) return false;
+    HRESULT hr = S_OK;
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
     hr = device_.As(&dxgiDevice);
     if (FAILED(hr)) { setError("Query IDXGIDevice", hr); return false; }
@@ -462,33 +726,79 @@ bool D3DRenderer::createDevice(HWND window) {
     hr = adapter->GetParent(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) { setError("Query IDXGIFactory2", hr); return false; }
     displayFactory_ = factory;
+    if (!createSwapChain(window, factory.Get())) return false;
+    appendDiagnostic(std::string("Renderer: ") + narrow(videoRendererLabel(builtRenderer_)) +
+                     (flipModel_ ? ", flip model" : ", bitblt model"));
 
-    // A frame-latency waitable swap chain is what makes vsync affordable here.
-    // Present must stay inside the same critical section as the D3D11VA
-    // decoders, so a Present that blocked for the vertical blank would stall
-    // every decoder for most of a refresh interval. Waiting on the swap
-    // chain's own event instead happens outside that lock, and by the time the
-    // renderer presents, the queue has room and Present returns promptly.
+    // WARP and the Basic Render Driver come without the video processor.
+    // The renderer works on without it; hardware decoding cannot, and the
+    // decoders find that out for themselves and decode in software.
+    if (FAILED(device_.As(&videoDevice_)) || FAILED(context_.As(&videoContext_))) {
+        videoDevice_.Reset();
+        videoContext_.Reset();
+        appendDiagnostic("Renderer: no D3D11 video processor on this device; "
+                         "hardware decoding and deinterlacing are off");
+    } else if (FAILED(context_.As(&videoContext1_))) {
+        videoContext1_.Reset();
+    }
+    probeVideoEnhancements();
+    refreshDisplayStatus();
+    return true;
+}
+
+bool D3DRenderer::createSwapChain(HWND window, IDXGIFactory2* factory) {
     DXGI_SWAP_CHAIN_DESC1 description{};
     description.Width = width_;
     description.Height = height_;
     description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     description.SampleDesc.Count = 1;
     description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    description.BufferCount = 2;
-    description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    description.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    swapChainFlags_ = description.Flags;
-    hr = factory->CreateSwapChainForHwnd(
-        device_.Get(), window, &description, nullptr, nullptr, &swapChain_);
-    if (FAILED(hr)) {
-        // Waitable swap chains need Windows 8.1 or newer. Fall back to a plain
-        // flip chain; presentation then syncs inside the lock as before.
-        description.Flags = 0;
+    HRESULT hr = E_FAIL;
+    flipModel_ = builtRenderer_ != VideoRenderer::Direct3D11Bitblt;
+    if (!flipModel_) {
+        // The bitblt model: one buffer, copied into DWM's picture of the
+        // window as Windows did before the flip model, which capture tools
+        // that read windows the old way can see. DWM's composition is the
+        // vsync, so Present does not wait for the blank inside the lock.
+        description.BufferCount = 1;
+        description.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        description.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
         swapChainFlags_ = 0;
         hr = factory->CreateSwapChainForHwnd(
             device_.Get(), window, &description, nullptr, nullptr, &swapChain_);
+        if (FAILED(hr)) {
+            std::ostringstream out;
+            out << "Renderer: the bitblt swap chain was refused (0x" << std::hex << std::setw(8)
+                << std::setfill('0') << static_cast<unsigned long>(hr) << "); using the flip model";
+            appendDiagnostic(out.str());
+            flipModel_ = true;
+            builtRenderer_ = VideoRenderer::Direct3D11;
+        }
+    }
+    if (flipModel_) {
+        // A frame-latency waitable swap chain is what makes vsync affordable
+        // here. Present must stay inside the same critical section as the
+        // D3D11VA decoders, so a Present that blocked for the vertical blank
+        // would stall every decoder for most of a refresh interval. Waiting
+        // on the swap chain's own event instead happens outside that lock,
+        // and by the time the renderer presents, the queue has room and
+        // Present returns promptly.
+        description.BufferCount = 2;
+        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        description.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        description.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        swapChainFlags_ = description.Flags;
+        hr = factory->CreateSwapChainForHwnd(
+            device_.Get(), window, &description, nullptr, nullptr, &swapChain_);
+        if (FAILED(hr)) {
+            // Waitable swap chains need Windows 8.1 or newer. Fall back to a
+            // plain flip chain; presentation then syncs inside the lock as
+            // before.
+            description.Flags = 0;
+            swapChainFlags_ = 0;
+            hr = factory->CreateSwapChainForHwnd(
+                device_.Get(), window, &description, nullptr, nullptr, &swapChain_);
+        }
     }
     if (FAILED(hr)) {
         setError("CreateSwapChainForHwnd", hr);
@@ -503,21 +813,41 @@ bool D3DRenderer::createDevice(HWND window) {
             frameLatencyWaitable_ = waitableSwapChain->GetFrameLatencyWaitableObject();
         }
     }
-
-    hr = device_.As(&videoDevice_);
-    if (FAILED(hr)) {
-        setError("Query ID3D11VideoDevice", hr);
-        return false;
+    if (!flipModel_) {
+        // Windows 10 1803 and later; before it the timer resolves to the
+        // system tick, which still beats the main loop's own timeout.
+        paceTimer_ = CreateWaitableTimerExW(
+            nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!paceTimer_) paceTimer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        armPaceTimer();
     }
-    hr = context_.As(&videoContext_);
-    if (FAILED(hr)) {
-        setError("Query ID3D11VideoContext", hr);
-        return false;
-    }
-    if (FAILED(context_.As(&videoContext1_))) videoContext1_.Reset();
-    probeVideoEnhancements();
-    refreshDisplayStatus();
     return true;
+}
+
+void D3DRenderer::armPaceTimer() {
+    if (!paceTimer_) return;
+    // The first refresh after now, from DWM's own clock of its blanks; a
+    // sixtieth of a second when DWM does not say.
+    LARGE_INTEGER now{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    LONGLONG due = 166'667;
+    DWM_TIMING_INFO timing{};
+    timing.cbSize = sizeof(timing);
+    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &timing)) && timing.qpcRefreshPeriod > 0 &&
+        frequency.QuadPart > 0) {
+        const auto period = static_cast<LONGLONG>(timing.qpcRefreshPeriod);
+        // A frame the timer has just started is on its blank; the one wanted
+        // is the next, so less than an eighth of a period ahead is too soon.
+        const LONGLONG earliest = now.QuadPart + period / 8;
+        LONGLONG next = static_cast<LONGLONG>(timing.qpcVBlank);
+        if (next < earliest) next += ((earliest - next) / period + 1) * period;
+        due = (next - now.QuadPart) * 10'000'000 / frequency.QuadPart;
+    }
+    LARGE_INTEGER relative{};
+    relative.QuadPart = -std::max<LONGLONG>(due, 1);
+    SetWaitableTimer(paceTimer_, &relative, 0, nullptr, nullptr, FALSE);
 }
 
 void D3DRenderer::probeVideoEnhancements() {
@@ -655,20 +985,34 @@ void D3DRenderer::refreshDisplayStatus() {
 }
 
 bool D3DRenderer::wantHdrOutput() const {
+    // HDR presentation is the flip model's.
     return enhancements_.rtxHdr && enhancementStatus_.nvidiaAdapter &&
            enhancementStatus_.rtxHdrSupported && enhancementStatus_.displayHdr &&
-           videoContext1_ != nullptr;
+           videoContext1_ != nullptr && flipModel_;
+}
+
+bool D3DRenderer::wantTenBitOutput() const {
+    return videoOutput_.tenBit && flipModel_;
 }
 
 bool D3DRenderer::applyOutputMode() {
     const bool wanted = wantHdrOutput();
-    if (wanted == hdrOutput_ || !swapChain_ || deviceLost_) return wanted == hdrOutput_;
+    // PQ is 10-bit already; the 10-bit SDR choice waits behind it.
+    const bool tenBit = !wanted && wantTenBitOutput();
+    const bool current = wanted == hdrOutput_ && tenBit == tenBitOutput_;
+    // recover() holds the latch up while it builds; its new chain switches
+    // here as a first one does.
+    if (current || !swapChain_ || (deviceLost_ && !deviceRebuildInProgress_)) return current;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain3;
     if (FAILED(swapChain_.As(&swapChain3))) {
-        appendDiagnostic("RTX Video HDR: swap chain has no colour-space control; staying 8-bit");
-        return false;
+        // 10-bit sRGB is the chain's colour space without being told; PQ
+        // has to be told.
+        if (wanted) {
+            appendDiagnostic("RTX Video HDR: swap chain has no colour-space control; staying 8-bit");
+            return false;
+        }
     }
-    const DXGI_FORMAT format = wanted ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+    const DXGI_FORMAT format = wanted || tenBit ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
     const DXGI_COLOR_SPACE_TYPE colorSpace = wanted
         ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     UINT support = 0;
@@ -688,21 +1032,30 @@ bool D3DRenderer::applyOutputMode() {
         if (!createBackBuffer()) nextBackBufferRetry_ = std::chrono::steady_clock::now() + kBackBufferRetryInterval;
         return false;
     }
-    hr = swapChain3->SetColorSpace1(colorSpace);
-    if (FAILED(hr)) setError("SetColorSpace1", hr);
+    if (swapChain3) {
+        hr = swapChain3->SetColorSpace1(colorSpace);
+        if (FAILED(hr)) setError("SetColorSpace1", hr);
+    }
     hdrOutput_ = wanted;
+    tenBitOutput_ = tenBit;
     enhancementStatus_.hdrOutput = wanted;
     // Every slot's output texture and processor were built for the old format.
-    slots_ = {};
-    softwareUploads_ = {};
-    softwarePq_ = {};
-    loggedSoftwareRoute_.fill(-1);
+    dropSlots();
     // The chain has switched either way; render() tries again for a target
     // that could not be made on its new buffers.
     const bool targetMade = createBackBuffer();
     if (!targetMade) nextBackBufferRetry_ = std::chrono::steady_clock::now() + kBackBufferRetryInterval;
-    appendDiagnostic(wanted ? "Output: 10-bit PQ (RTX Video HDR)" : "Output: 8-bit sRGB");
+    appendDiagnostic(wanted ? "Output: 10-bit PQ (RTX Video HDR)" : tenBit ? "Output: 10-bit sRGB"
+                                                                           : "Output: 8-bit sRGB");
     return targetMade;
+}
+
+void D3DRenderer::dropSlots() {
+    slots_ = {};
+    softwareUploads_ = {};
+    softwarePq_ = {};
+    postTextures_ = {};
+    loggedSoftwareRoute_.fill(-1);
 }
 
 void D3DRenderer::setVideoEnhancements(const VideoEnhancementSettings& settings) {
@@ -710,10 +1063,7 @@ void D3DRenderer::setVideoEnhancements(const VideoEnhancementSettings& settings)
     if (settings == enhancements_) return;
     enhancements_ = settings;
     // Rebuild every processor with the new extension state on the next frame.
-    slots_ = {};
-    softwareUploads_ = {};
-    softwarePq_ = {};
-    loggedSoftwareRoute_.fill(-1);
+    dropSlots();
     if (!deviceLost_ && swapChain_) {
         refreshDisplayStatus();
         applyOutputMode();
@@ -723,6 +1073,42 @@ void D3DRenderer::setVideoEnhancements(const VideoEnhancementSettings& settings)
 VideoEnhancementStatus D3DRenderer::enhancementStatus() const {
     std::scoped_lock lock(deviceMutex_);
     return enhancementStatus_;
+}
+
+bool D3DRenderer::setVideoOutput(const VideoOutputSettings& settings) {
+    std::scoped_lock lock(deviceMutex_);
+    const VideoOutputSettings wanted = clampVideoOutputSettings(settings);
+    const VideoOutputSettings previous = videoOutput_;
+    videoOutput_ = wanted;
+    // Not built yet: initialize() builds it as they say. Lost with no device
+    // (a rebuild failed), a new renderer or card is worth trying at once.
+    if (!device_) return deviceLost_ && videoRendererChoice(wanted) != builtChoice_;
+    if (videoRendererChoice(wanted) != builtChoice_) return true;
+    // A processor is built to deinterlace or not.
+    if (wanted.deinterlace != previous.deinterlace) dropSlots();
+    if (wanted.tenBit != previous.tenBit && !deviceLost_ && swapChain_) applyOutputMode();
+    return false;
+}
+
+void D3DRenderer::requestRebuild() {
+    std::scoped_lock lock(deviceMutex_);
+    if (!device_) return;
+    deviceLost_ = true;
+}
+
+VideoRendererStatus D3DRenderer::rendererStatus() const {
+    std::scoped_lock lock(deviceMutex_);
+    VideoRendererStatus status;
+    status.built = device_ != nullptr && !deviceLost_;
+    status.renderer = builtRenderer_;
+    status.adapterName = enhancementStatus_.adapterName;
+    status.adapterFallback = adapterFallback_;
+    status.adapterMissing = adapterMissing_;
+    status.videoProcessor = videoDevice_ != nullptr;
+    status.flipModel = flipModel_;
+    status.tenBitOutput = tenBitOutput_;
+    status.hdrOutput = hdrOutput_;
+    return status;
 }
 
 void D3DRenderer::applyStreamExtensions(std::size_t slot, bool hdrSource) {
@@ -899,6 +1285,34 @@ bool D3DRenderer::createPipeline() {
         setError("CreateSamplerState", hr);
         return false;
     }
+    sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    hr = device_->CreateSamplerState(&sampler, &pointSampler_);
+    if (FAILED(hr)) { setError("Create point sampler", hr); return false; }
+    {
+        Microsoft::WRL::ComPtr<ID3DBlob> blob;
+        Microsoft::WRL::ComPtr<ID3DBlob> outputErrors;
+        hr = D3DCompile(kOutputShader, sizeof(kOutputShader) - 1, "OutputPass", nullptr, nullptr,
+                        "main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &outputErrors);
+        if (FAILED(hr)) {
+            if (outputErrors) {
+                error_.assign(static_cast<const char*>(outputErrors->GetBufferPointer()),
+                              outputErrors->GetBufferSize());
+            } else {
+                setError("D3DCompile(output pass)", hr);
+            }
+            return false;
+        }
+        hr = device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &outputShader_);
+        if (FAILED(hr)) { setError("Create output pass shader", hr); return false; }
+        D3D11_BUFFER_DESC paramsDescription{};
+        paramsDescription.ByteWidth = sizeof(float) * 16;
+        paramsDescription.Usage = D3D11_USAGE_DEFAULT;
+        paramsDescription.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        hr = device_->CreateBuffer(&paramsDescription, nullptr, &outputParamsBuffer_);
+        if (FAILED(hr)) { setError("Create output pass parameter buffer", hr); return false; }
+    }
+    // The pipeline starts on the plain copy.
+    effectShaderActive_ = false;
     return true;
 }
 
@@ -923,6 +1337,7 @@ bool D3DRenderer::compilePixelShader(const char* source, std::size_t length, con
     if (FAILED(createResult)) { setError("CreatePixelShader", createResult); return false; }
     pixelShader_ = std::move(shader);
     smartVibranceSelected_ = false;
+    effectShaderActive_ = true;
     error_.clear();
     return true;
 }
@@ -939,7 +1354,11 @@ bool D3DRenderer::setShaderPreset(ShaderPreset preset) {
                                 "SmartVibrancePlus")) return false;
         smartVibranceSelected_ = true;
         return true;
-    default: return compilePixelShader(kPixelShader, sizeof(kPixelShader) - 1, "Normal");
+    default:
+        if (!compilePixelShader(kPixelShader, sizeof(kPixelShader) - 1, "Normal")) return false;
+        // The plain copy: the output pass reads the converted picture itself.
+        effectShaderActive_ = false;
+        return true;
     }
 }
 
@@ -967,14 +1386,63 @@ bool D3DRenderer::compilePixelShaderFile(const std::wstring& path) {
     }
     std::ostringstream bytes;
     bytes << input.rdbuf();
-    const std::string source = adaptPotPlayerShader(bytes.str());
+    const std::string text = bytes.str();
+    // D3D11 links the vertex and pixel shaders by register. A main() that
+    // reads an input the quad's vertex shader does not feed -- a TEXCOORD0
+    // without the position before it packs into the position's register --
+    // drew every pane one colour; it is refused as a file that does not
+    // compile is, saying what main() needs. A legacy main() is given the
+    // position first. One that does not compile so, or that the vertex
+    // shader does not feed so, is compiled again without it, as it was
+    // adapted before, and taken when the vertex shader feeds that: a
+    // position the adapter did not see (a typedef'd or nested struct, a
+    // macro) then stays first. One that neither feeds is compiled once more
+    // with the position before a struct parameter the adapter took to begin
+    // with one, by a definition of the struct that is not the one compiled
+    // (in an #if 0). The refusal is the first one's when that compiled, and
+    // otherwise the second one's: the file's compile error as it was
+    // adapted before, or what its main() reads where, rather than an error
+    // about the position inserted, code the author never wrote, or columns
+    // it moved.
     Microsoft::WRL::ComPtr<ID3DBlob> blob;
-    Microsoft::WRL::ComPtr<ID3DBlob> errors;
-    const HRESULT hr = D3DCompile(source.data(), source.size(), "PotPlayer-compatible pixel shader",
-        nullptr, nullptr, "main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &blob, &errors);
-    if (FAILED(hr)) {
-        if (errors) error_.assign(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
-        else setError("Compile pixel shader file", hr);
+    std::vector<std::string> tried;
+    std::string refusal;
+    bool adaptedCompiled = false;
+    for (const MainPosition position : {MainPosition::Given, MainPosition::AsWritten, MainPosition::BeforeStructs}) {
+        const std::string source = adaptPotPlayerShader(text, position);
+        if (std::find(tried.begin(), tried.end(), source) != tried.end()) continue;
+        tried.push_back(source);
+        Microsoft::WRL::ComPtr<ID3DBlob> compiled;
+        Microsoft::WRL::ComPtr<ID3DBlob> errors;
+        const HRESULT hr = D3DCompile(source.data(), source.size(), "PotPlayer-compatible pixel shader",
+            nullptr, nullptr, "main", "ps_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &compiled, &errors);
+        std::string why;
+        std::vector<ShaderSignatureValue> inputs;
+        if (FAILED(hr)) {
+            if (errors) {
+                why.assign(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
+            } else {
+                setError("Compile pixel shader file", hr);
+                why = error_;
+            }
+        } else if (!signatureValues(compiled.Get(), true, inputs)) {
+            why = "Could not read the pixel shader's inputs";
+        } else {
+            why = unfedShaderInput(quadOutputs(), inputs);
+        }
+        if (why.empty()) {
+            blob = std::move(compiled);
+            break;
+        }
+        if (position == MainPosition::Given) {
+            adaptedCompiled = SUCCEEDED(hr);
+            refusal = std::move(why);
+        } else if (position == MainPosition::AsWritten && !adaptedCompiled) {
+            refusal = std::move(why);
+        }
+    }
+    if (!blob) {
+        error_ = std::move(refusal);
         return false;
     }
     std::scoped_lock lock(deviceMutex_);
@@ -988,6 +1456,7 @@ bool D3DRenderer::compilePixelShaderFile(const std::wstring& path) {
     if (FAILED(createResult)) { setError("Create external pixel shader", createResult); return false; }
     pixelShader_ = std::move(shader);
     smartVibranceSelected_ = false;
+    effectShaderActive_ = true;
     error_.clear();
     return true;
 }
@@ -996,6 +1465,8 @@ void D3DRenderer::bindVibranceColorSpace(std::size_t slot) {
     ID3D11Buffer* buffer = nullptr;
     if (smartVibranceSelected_) {
         const auto& target = slots_[slot];
+        // Under HDR output a 10-bit slot is the PQ one: 10-bit SDR output
+        // is never on with it.
         const bool pq = hdrOutput_ && (target.hdrSource ||
             (target.hardware && target.outputFormat == DXGI_FORMAT_R10G10B10A2_UNORM));
         const float mode = !pq ? 0.0F :
@@ -1058,7 +1529,7 @@ bool D3DRenderer::compositeOverlayLayer() {
     context_->VSSetConstantBuffers(0, 1, uvTransformBuffer_.GetAddressOf());
     const float identity[] = {1.0F, 1.0F, 0.0F, 0.0F};
     context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, identity, 0, 0);
-    const float params[] = {enhancementStatus_.sdrWhiteNits, 0.0F, 0.0F, 0.0F};
+    const float params[] = {enhancementStatus_.sdrWhiteNits, hdrOutput_ ? 0.0F : 1.0F, 0.0F, 0.0F};
     context_->UpdateSubresource(overlayParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
     context_->PSSetShader(overlayCompositeShader_.Get(), nullptr, 0);
     context_->PSSetConstantBuffers(0, 1, overlayParamsBuffer_.GetAddressOf());
@@ -1142,22 +1613,35 @@ void D3DRenderer::retryBackBuffer() {
 bool D3DRenderer::createSlotResources(
     std::size_t slot, const HardwareVideoFrame& frame, const SurfaceSize& requested) {
     auto& target = slots_[slot];
+    if (!videoDevice_ || !videoContext_) {
+        error_ = "No D3D11 video processor on this device";
+        return false;
+    }
     D3D11_TEXTURE2D_DESC inputDescription{};
     frame.texture->GetDesc(&inputDescription);
     const int outputWidth = requested.width;
     const int outputHeight = requested.height;
     const auto color = videoColorDescription(frame.ownerFrame, frame.width, frame.height);
     const bool hdrSource = hdrOutput_ && color.pq;
+    const bool deinterlace = videoOutput_.deinterlace != VideoDeinterlace::Off;
+    const bool interlacedFrame = deinterlace && frame.ownerFrame &&
+                                 (frame.ownerFrame->flags & AV_FRAME_FLAG_INTERLACED);
     if (target.texture && target.inputWidth == frame.width && target.inputHeight == frame.height &&
         target.inputFormat == inputDescription.Format && target.outputWidth == outputWidth &&
         target.outputHeight == outputHeight && target.hdrOutputMode == hdrOutput_ &&
-        target.hdrSource == hdrSource) {
+        target.tenBitOutputMode == tenBitOutput_ && target.hdrSource == hdrSource &&
+        (target.interlaced || !interlacedFrame)) {
         return true;
     }
 
+    // A stream that has shown an interlaced frame keeps a deinterlacing
+    // processor through a new size or output mode as well.
+    const bool interlaced = interlacedFrame || (deinterlace && target.interlaced);
+    const bool newlyInterlaced = interlaced && !target.interlaced;
     target = SlotTexture{};
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
-    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameFormat = interlaced ? D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST
+                                          : D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate = {60, 1};
     content.InputWidth = static_cast<UINT>(frame.width);
     content.InputHeight = static_cast<UINT>(frame.height);
@@ -1173,8 +1657,42 @@ bool D3DRenderer::createSlotResources(
         setError("D3D11 Video Processor input format unsupported", FAILED(hr) ? hr : E_FAIL);
         return false;
     }
-    hr = videoDevice_->CreateVideoProcessor(target.enumerator.Get(), 0, &target.processor);
+    // The processor the driver lists first for deinterlacing that needs no
+    // past or future frames: each frame is processed on its own here. When
+    // none says so, its first, which does what it can with one frame.
+    UINT rateConversion = 0;
+    if (interlaced) {
+        constexpr UINT deinterlacing = D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BLEND |
+            D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_BOB |
+            D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_ADAPTIVE |
+            D3D11_VIDEO_PROCESSOR_PROCESSOR_CAPS_DEINTERLACE_MOTION_COMPENSATION;
+        D3D11_VIDEO_PROCESSOR_CAPS caps{};
+        if (SUCCEEDED(target.enumerator->GetVideoProcessorCaps(&caps))) {
+            for (UINT index = 0; index < caps.RateConversionCapsCount; ++index) {
+                D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS rate{};
+                if (FAILED(target.enumerator->GetVideoProcessorRateConversionCaps(index, &rate))) continue;
+                if ((rate.ProcessorCaps & deinterlacing) && rate.PastFrames == 0 && rate.FutureFrames == 0) {
+                    rateConversion = index;
+                    break;
+                }
+            }
+        }
+    }
+    hr = videoDevice_->CreateVideoProcessor(target.enumerator.Get(), rateConversion, &target.processor);
     if (FAILED(hr)) { setError("CreateVideoProcessor", hr); return false; }
+    if (interlaced) {
+        // One picture out for each frame in, its two fields woven together
+        // as the processor sees fit; the frame's own time shows it.
+        videoContext_->VideoProcessorSetStreamOutputRate(
+            target.processor.Get(), 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_HALF, FALSE, nullptr);
+        if (newlyInterlaced) {
+            std::ostringstream out;
+            out << "Deinterlacing pane " << (slot + 1) << ": " << frame.width << "x" << frame.height
+                << ", processor " << rateConversion;
+            appendDiagnostic(out.str());
+        }
+    }
+    target.interlaced = interlaced;
     target.inputWidth = frame.width;
     target.inputHeight = frame.height;
     target.outputWidth = outputWidth;
@@ -1184,13 +1702,28 @@ bool D3DRenderer::createSlotResources(
     // codes when TrueHDR is disabled/refused. Use a known SDR processor output
     // plus our explicit presentation transform in that case, for both decode
     // paths. Native PQ is still passed through without another SDR transform.
-    const DXGI_FORMAT outputFormat = hdrOutput_ && (hdrSource || target.rtxHdrApplied)
-        ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
-    UINT outputSupport{};
-    hr = target.enumerator->CheckVideoProcessorFormat(outputFormat, &outputSupport);
-    if (FAILED(hr) || !(outputSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
-        setError("D3D11 Video Processor output format unsupported", FAILED(hr) ? hr : E_FAIL);
-        return false;
+    const bool pqOutput = hdrOutput_ && (hdrSource || target.rtxHdrApplied);
+    const auto outputSupported = [&](DXGI_FORMAT format, bool report) {
+        UINT support{};
+        const HRESULT checked = target.enumerator->CheckVideoProcessorFormat(format, &support);
+        if (FAILED(checked) || !(support & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT)) {
+            if (report) {
+                setError("D3D11 Video Processor output format unsupported", FAILED(checked) ? checked : E_FAIL);
+            }
+            return false;
+        }
+        return true;
+    };
+    // The 10-bit SDR output keeps a 10-bit stream's depth to the back buffer
+    // where the processor can write it; 8-bit where it cannot, which is no
+    // error: the picture is whole either way.
+    const bool canFallBack = !pqOutput && tenBitOutput_;
+    DXGI_FORMAT outputFormat = pqOutput || tenBitOutput_ ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                                         : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (!outputSupported(outputFormat, !canFallBack)) {
+        if (!canFallBack) return false;
+        outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (!outputSupported(outputFormat, true)) return false;
     }
 
     D3D11_TEXTURE2D_DESC outputDescription{};
@@ -1214,8 +1747,10 @@ bool D3DRenderer::createSlotResources(
     if (FAILED(hr)) { setError("CreateVideoProcessorOutputView", hr); return false; }
     target.inputFormat = inputDescription.Format;
     target.outputFormat = outputFormat;
+    target.pqOutput = pqOutput;
     target.hdrSource = hdrSource;
     target.hdrOutputMode = hdrOutput_;
+    target.tenBitOutputMode = tenBitOutput_;
     return true;
 }
 
@@ -1225,7 +1760,7 @@ bool D3DRenderer::convertSurface(
     if (!createSlotResources(slot, frame, requested)) return false;
     // Metadata belongs to each decoded frame, not the cached texture geometry.
     const auto color = videoColorDescription(frame.ownerFrame, frame.width, frame.height);
-    if (target.outputFormat == DXGI_FORMAT_R10G10B10A2_UNORM) {
+    if (target.pqOutput) {
         // The PQ output mode names the spaces by DXGI type: an HDR10 stream is
         // handed over as PQ BT.2020 and passed through, anything else as the
         // SDR space it is and left to RTX Video HDR to expand. A BT.2020 SDR
@@ -1273,8 +1808,15 @@ bool D3DRenderer::convertSurface(
     if (FAILED(hr)) { setError("CreateVideoProcessorInputView", hr); return false; }
     RECT source{0, 0, frame.width, frame.height};
     RECT destination{0, 0, target.outputWidth, target.outputHeight};
-    videoContext_->VideoProcessorSetStreamFrameFormat(
-        target.processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    // Each frame says for itself whether it is interlaced and which field
+    // comes first; a progressive one among them passes through untouched.
+    D3D11_VIDEO_FRAME_FORMAT frameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    if (target.interlaced && frame.ownerFrame && (frame.ownerFrame->flags & AV_FRAME_FLAG_INTERLACED)) {
+        frameFormat = (frame.ownerFrame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST)
+            ? D3D11_VIDEO_FRAME_FORMAT_INTERLACED_TOP_FIELD_FIRST
+            : D3D11_VIDEO_FRAME_FORMAT_INTERLACED_BOTTOM_FIELD_FIRST;
+    }
+    videoContext_->VideoProcessorSetStreamFrameFormat(target.processor.Get(), 0, frameFormat);
     videoContext_->VideoProcessorSetStreamSourceRect(target.processor.Get(), 0, TRUE, &source);
     videoContext_->VideoProcessorSetStreamDestRect(target.processor.Get(), 0, TRUE, &destination);
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
@@ -1295,9 +1837,11 @@ bool D3DRenderer::convertSoftwareSurface(
     auto& upload = softwareUploads_[slot];
     const auto& source = *frame.ownerFrame;
     if (upload.width != source.width || upload.height != source.height) {
+        const bool interlaced = upload.interlaced;
         upload = {};
         upload.width = source.width;
         upload.height = source.height;
+        upload.interlaced = interlaced;
     }
     // Retry after a size/output/settings/device change, not on every video
     // frame when a driver rejects a particular processing configuration.
@@ -1459,6 +2003,84 @@ bool D3DRenderer::prepareSoftwarePqTexture(std::size_t slot) {
     return true;
 }
 
+bool D3DRenderer::runEffectsPass(std::size_t slot) {
+    const auto& source = slots_[slot];
+    auto& post = postTextures_[slot];
+    if (!source.view) return false;
+    if (post.width != source.outputWidth || post.height != source.outputHeight) post = {};
+    if (!post.texture) {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(source.outputWidth);
+        desc.Height = static_cast<UINT>(source.outputHeight);
+        desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+        // Deep enough for a 10-bit or a PQ picture.
+        desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &post.texture);
+        if (SUCCEEDED(hr)) hr = device_->CreateShaderResourceView(post.texture.Get(), nullptr, &post.view);
+        if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(post.texture.Get(), nullptr, &post.target);
+        if (FAILED(hr)) {
+            setError("Create output pass texture", hr);
+            post = {};
+            return false;
+        }
+        post.width = source.outputWidth;
+        post.height = source.outputHeight;
+    }
+    context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
+    context_->VSSetConstantBuffers(0, 1, uvTransformBuffer_.GetAddressOf());
+    const float identity[] = {1, 1, 0, 0};
+    context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, identity, 0, 0);
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(post.width);
+    viewport.Height = static_cast<float>(post.height);
+    viewport.MaxDepth = 1;
+    context_->RSSetViewports(1, &viewport);
+    context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+    // The same parameters the shader has when it draws straight to the
+    // window: the converted picture's size, the frame and the clock.
+    const float clock = static_cast<float>(std::fmod(std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
+    const float params[] = {viewport.Width, viewport.Height,
+        static_cast<float>(source.serial), clock, 1 / viewport.Width, 1 / viewport.Height,
+        0, 0, 0, 0, 0, 0};
+    context_->UpdateSubresource(pixelParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
+    context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
+    context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
+    bindVibranceColorSpace(slot);
+    context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
+    context_->OMSetRenderTargets(1, post.target.GetAddressOf(), nullptr);
+    context_->PSSetShaderResources(0, 1, source.view.GetAddressOf());
+    context_->Draw(4, 0);
+    ID3D11ShaderResourceView* empty = nullptr;
+    context_->PSSetShaderResources(0, 1, &empty);
+    context_->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
+void D3DRenderer::drawOutputPass(ID3D11ShaderResourceView* view, int width, int height,
+                                 VideoScaling scaling, bool color) {
+    const auto params = videoColorParams(videoOutput_);
+    const float across = static_cast<float>(std::max(1, width));
+    const float down = static_cast<float>(std::max(1, height));
+    const bool controls = color && videoOutput_.color != VideoColorControls{};
+    const float values[] = {
+        across, down, 1.0F / across, 1.0F / down,
+        static_cast<float>(scaling), controls ? 1.0F : 0.0F, color && params.limitedRange ? 1.0F : 0.0F, 0.0F,
+        params.brightness, params.contrast, params.saturation, params.exponent,
+        params.hueCos, params.hueSin, 0.0F, 0.0F};
+    context_->UpdateSubresource(outputParamsBuffer_.Get(), 0, nullptr, values, 0, 0);
+    context_->PSSetShader(outputShader_.Get(), nullptr, 0);
+    context_->PSSetConstantBuffers(0, 1, outputParamsBuffer_.GetAddressOf());
+    ID3D11SamplerState* samplers[] = {sampler_.Get(), pointSampler_.Get()};
+    context_->PSSetSamplers(0, 2, samplers);
+    context_->PSSetShaderResources(0, 1, &view);
+    context_->Draw(4, 0);
+}
+
 void D3DRenderer::render(
     const PaneArray<std::shared_ptr<const HardwareVideoFrame>>& frames,
     const PaneArray<PaneView>& views,
@@ -1466,6 +2088,9 @@ void D3DRenderer::render(
     int expandedPane, int soloPane, unsigned contentHeight,
     const PaneArray<float>& aspectRatios,
     AutoLayoutFocus autoFocus, int autoFocusPane) {
+    // The bitblt chain's next frame is at the next refresh, whatever this
+    // one does; without a timer set, the main loop goes on its timeout.
+    armPaceTimer();
     // A missing render target is not a reason to stop here: a failure that
     // left it so is tried again below.
     if (!swapChain_ || width_ == 0 || height_ == 0 || deviceLost_) {
@@ -1539,8 +2164,15 @@ void D3DRenderer::render(
             continue;
         }
         const float paneZoom = std::clamp(views[index].zoom, 1.0F, 4.0F);
+        // Only the video processor deinterlaces, so an interlaced software
+        // frame goes to it as NV12, and the rest of its stream after it.
+        if (!frame->hardware && frame->ownerFrame && (frame->ownerFrame->flags & AV_FRAME_FLAG_INTERLACED)) {
+            softwareUploads_[index].interlaced = true;
+        }
+        const bool deinterlaceSoftware = videoOutput_.deinterlace != VideoDeinterlace::Off &&
+                                         videoDevice_ && softwareUploads_[index].interlaced;
         const bool softwareVideoProcessor = !frame->hardware && frame->ownerFrame &&
-            (hdrOutput_ || enhancements_.superResolution) &&
+            (hdrOutput_ || enhancements_.superResolution || deinterlaceSoftware) &&
             softwareNv12Eligible(*frame->ownerFrame);
         const int sourceWidth = softwareVideoProcessor ? frame->ownerFrame->width : frame->width;
         const int sourceHeight = softwareVideoProcessor ? frame->ownerFrame->height : frame->height;
@@ -1584,42 +2216,18 @@ void D3DRenderer::render(
         const bool softwarePq = hdrOutput_ &&
             slots_[index].outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM && !slots_[index].hdrSource;
         if (softwarePq && !prepareSoftwarePqTexture(index)) continue;
-        // The fallback uses two offscreen passes; rebind the presentation
-        // target and selected shader for this pane and every following pane.
-        context_->OMSetRenderTargets(1, renderTarget_.GetAddressOf(), nullptr);
-        context_->PSSetShader(softwarePq ? copyShader_.Get() : pixelShader_.Get(), nullptr, 0);
-        context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
-        context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
-        const auto mode = views[index].mode;
-        const RectF fitted = mode == ViewMode::Fit
-            ? fitInside(cells[index], slots_[index].outputWidth, slots_[index].outputHeight)
-            : cells[index];
-        float scaleX = 1.0F;
-        float scaleY = 1.0F;
-        if (mode == ViewMode::Fill) {
-            const float sourceAspect = static_cast<float>(slots_[index].outputWidth) /
-                                       std::max(1, slots_[index].outputHeight);
-            const float cellAspect = cells[index].width / std::max(1.0F, cells[index].height);
-            if (sourceAspect > cellAspect) scaleX = cellAspect / sourceAspect;
-            else scaleY = sourceAspect / cellAspect;
-        }
-        const float zoom = std::clamp(views[index].zoom, 1.0F, 4.0F);
-        scaleX /= zoom;
-        scaleY /= zoom;
-        const float transform[] = {scaleX, scaleY, (1.0F - scaleX) * 0.5F,
-                                   (1.0F - scaleY) * 0.5F};
-        context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, transform, 0, 0);
+        // The texture keeps the stored proportions; the picture is shaped by
+        // its pixels' width as well, so a 720x576 DVD at 64:45 fills a 16:9
+        // pane and the viewport and the crop stretch it there.
+        const PanePictureGeometry geometry = panePictureGeometry(
+            cells[index], slots_[index].outputWidth, slots_[index].outputHeight,
+            static_cast<float>(frame->pixelAspect), views[index].mode, views[index].zoom);
+        const RectF& fitted = geometry.viewport;
+        const float scaleX = geometry.scaleX;
+        const float scaleY = geometry.scaleY;
+        const float transform[] = {scaleX, scaleY, geometry.offsetX, geometry.offsetY};
         const float width = static_cast<float>(std::max(1, slots_[index].outputWidth));
         const float height = static_cast<float>(std::max(1, slots_[index].outputHeight));
-        const float clock = static_cast<float>(std::fmod(std::chrono::duration<double>(
-            std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
-        const float params[] = {
-            width, height, static_cast<float>(frame->serial), clock,
-            1.0F / width, 1.0F / height, 0.0F, 0.0F,
-            // Safe c2/pPrev initial state. True temporal feedback would require
-            // a separate history texture or a player-specific analysis pass.
-            0.0F, 0.0F, 0.0F, 0.0F};
-        context_->UpdateSubresource(pixelParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
         D3D11_VIEWPORT viewport{};
         viewport.TopLeftX = fitted.x + 1.0F;
         viewport.TopLeftY = fitted.y + 1.0F;
@@ -1627,19 +2235,58 @@ void D3DRenderer::render(
         viewport.Height = std::max(1.0F, fitted.height - 2.0F);
         viewport.MinDepth = 0.0F;
         viewport.MaxDepth = 1.0F;
-        context_->RSSetViewports(1, &viewport);
+        // The colour controls and the levels are for SDR; PQ is left as it
+        // is. A scaler of the chosen kind enlarges, and shrinking (a
+        // software frame shown smaller than it came) stays bilinear, which
+        // the other kernels, never widened, would only make shimmer.
+        const bool colorPass = !hdrOutput_ && !videoColorNeutral(videoOutput_);
+        VideoScaling scaling = videoOutput_.scaling;
+        if (width * scaleX > viewport.Width * 1.01F || height * scaleY > viewport.Height * 1.01F) {
+            scaling = VideoScaling::Bilinear;
+        }
+        bool outputPass = colorPass || scaling != VideoScaling::Bilinear;
         ID3D11ShaderResourceView* view = softwarePq ? softwarePq_[index].pqView.Get()
                                                   : slots_[index].view.Get();
-        context_->PSSetShaderResources(0, 1, &view);
-        bindVibranceColorSpace(index);
-        context_->Draw(4, 0);
+        if (outputPass && !softwarePq && effectShaderActive_) {
+            // The user's shader first, at the picture's own size.
+            if (runEffectsPass(index)) view = postTextures_[index].view.Get();
+            else outputPass = false;
+        }
+        // The fallback and the effects use offscreen passes; rebind the
+        // presentation target and the pane's state for this pane and every
+        // following pane.
+        context_->OMSetRenderTargets(1, renderTarget_.GetAddressOf(), nullptr);
+        context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, transform, 0, 0);
+        context_->RSSetViewports(1, &viewport);
+        if (outputPass) {
+            drawOutputPass(view, slots_[index].outputWidth, slots_[index].outputHeight, scaling, colorPass);
+        } else {
+            context_->PSSetShader(softwarePq ? copyShader_.Get() : pixelShader_.Get(), nullptr, 0);
+            context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+            context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
+            context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
+            const float clock = static_cast<float>(std::fmod(std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
+            const float params[] = {
+                width, height, static_cast<float>(frame->serial), clock,
+                1.0F / width, 1.0F / height, 0.0F, 0.0F,
+                // Safe c2/pPrev initial state. True temporal feedback would require
+                // a separate history texture or a player-specific analysis pass.
+                0.0F, 0.0F, 0.0F, 0.0F};
+            context_->UpdateSubresource(pixelParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
+            context_->PSSetShaderResources(0, 1, &view);
+            bindVibranceColorSpace(index);
+            context_->Draw(4, 0);
+        }
         ID3D11ShaderResourceView* empty = nullptr;
         context_->PSSetShaderResources(0, 1, &empty);
     }
-    if (overlay_ && hdrOutput_) {
+    if (overlay_ && (hdrOutput_ || tenBitOutput_)) {
         // Direct2D cannot draw sRGB colours straight into a PQ back buffer:
         // white would come out at 10,000 nits. It paints a layer instead and
-        // a shader pass brings that in at the display's SDR white.
+        // a shader pass brings that in at the display's SDR white. Nor does
+        // it draw into a 10-bit buffer at all; the layer is blended in as
+        // it is.
         compositeOverlayLayer();
     } else if (overlay_) {
         // Direct2D draws through the same immediate context, so the painter
@@ -1712,7 +2359,9 @@ void D3DRenderer::render(
         deviceLock.lock();
     }
     const auto presentStarted = PerfClock::now();
-    const HRESULT hr = swapChain_->Present(1, 0);
+    // The bitblt chain copies into DWM's picture of the window, which DWM
+    // shows at its next blank; waiting for one here would hold the lock.
+    const HRESULT hr = swapChain_->Present(flipModel_ ? 1 : 0, 0);
     const auto presentFinished = PerfClock::now();
     if (FAILED(hr)) {
         noteFailure("Present", hr);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AssSubtitles.hpp"
+#include "AudioDevices.hpp"
 #include "AudioOutput.hpp"
 #include "Core.hpp"
 #include "D3DRenderer.hpp"
@@ -21,6 +22,7 @@
 #include "SourceReaper.hpp"
 #include "SyncState.hpp"
 #include "VideoSource.hpp"
+#include "WindowSurface.hpp"
 
 #include <array>
 #include <atomic>
@@ -75,10 +77,23 @@ private:
     static LRESULT CALLBACK videoWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     // A short on-screen notice for actions that otherwise only change the
     // title bar: audio selection, speed, mute, volume, seeks from the keyboard.
-    void showNotice(const std::wstring& text);
+    // It is up for 1.5 seconds unless said otherwise.
+    void showNotice(const std::wstring& text, ULONGLONG milliseconds = 1500);
+    // Each tick: takes the notice down once its time is up, and then shows
+    // the start's WARP fallback when it is due and nothing else is up.
     void expireNotice(ULONGLONG now);
     void toggleMute();
     void toggleSolo(int pane);
+    // Among several videos: the one at a place on the screen (0 for V1)
+    // alone, from the grid or straight from another alone -- its key and
+    // its button on the bar -- or, alone already, every video again, as its
+    // Solo chip does; and every video again. A place with no video there,
+    // or a single video, changes nothing.
+    void soloVideoAt(std::size_t position);
+    void showAllVideos();
+    // How many places the bar's buttons for the videos cover: the videos
+    // loaded among several, none for one or none.
+    std::size_t soloButtonCount() const;
     // Setting A arms the master loop to the end of the timeline until B
     // narrows it; both report what they did as a notice.
     void setMasterLoopA(double seconds);
@@ -149,11 +164,16 @@ private:
     LRESULT frameHitTest(POINT screen) const;
     // A video dragged where no pane can take it moves the window instead.
     bool paneDragMovesWindow() const;
-    // The settings sheet (AppPanel.cpp).
+    // F5 and Settings in the menu: the settings window (AppSettingsWindow.cpp)
+    // shown, or put away when it is up. The sheet beside it is left as it is.
     void toggleSettingsPanel();
+    // The sheet (AppPanel.cpp): the Emby browser or a folder's list, over the
+    // right of the picture. openSheet shows it for the face its caller then
+    // sets; closeSettingsPanel puts it away.
+    void openSheet();
     void closeSettingsPanel();
-    // The sheet is settings, the Emby browser or a folder's list in turn;
-    // each keeps its own place, left where it was when it comes back.
+    // The sheet is the Emby browser or a folder's list in turn; each keeps
+    // its own place, left where it was when it comes back.
     float& sheetScrollSlot();
     void rememberSheetScroll();
     void restoreSheetScroll();
@@ -181,7 +201,9 @@ private:
     void localSetFlat(bool flat);
     void applyLocalList(std::uint64_t serial, std::wstring directory, std::vector<LocalEntry> entries,
                         std::wstring error = {}, std::vector<std::wstring> folders = {}, bool capped = false);
-    void showLocalToolbarMenu(int part);
+    // A button of the F6 list's toolbar: Thumbnails and All videos switch
+    // at once, Sort opens its drop-down.
+    void localToolbarAction(int part);
     void retryLocalList();
     void embyToolbarAction(int part);
     void applyLocalProbes(std::uint64_t serial, std::wstring directory,
@@ -260,8 +282,10 @@ private:
     // takes as many tiles per line as fit. Given `runs`, a browser list's
     // rows are left out and described there (PanelListRun) for
     // refreshPanelGeometry to keep and fill near the screen; without, every
-    // row comes whole.
+    // row comes whole. With neither face set they are the settings tab's.
     std::vector<PanelRow> buildSettingsRows(float clientWidth, std::vector<PanelListRun>* runs = nullptr) const;
+    // The chosen settings tab's rows, which the settings window shows.
+    std::vector<PanelRow> buildSettingsTabRows() const;
     ListRowMarks listRowMarks() const;
     void fillListRow(PanelRow& row, const ListRowMarks& marks) const;
     std::vector<PanelRow> withListRuns(std::vector<PanelRow> rows, std::vector<PanelListRun> listRuns,
@@ -277,8 +301,122 @@ private:
     bool sheetTakesPointer() const;
     PanelHit panelHitAt(POINT local) const;
     void scrollSettingsPanel(int wheelDelta);
+    // A slider of the sheet's row `rowIndex`, or of a row of either, at
+    // `fraction` of its rail.
     void applyPanelSlider(int rowIndex, float fraction);
+    // `part` is the band of an Equalizer row.
+    void applyPanelSlider(const PanelRow& row, float fraction, int part = -1);
+    // A hit on the sheet: its close, a switch, or one of its rows, which
+    // activatePanelRow (below) acts on.
     void activatePanelHit(const PanelHit& hit);
+    // The control a hit on these rows is, when its clicks add up (see
+    // repeatControlAt): a slider, a stepper, the scrollbar.
+    static std::optional<RepeatControl> panelRepeatControl(const PanelHit& hit, const std::vector<PanelRow>& rows);
+
+    // The keyboard (AppKeys.cpp). A key press is a chord -- the key with
+    // Ctrl, Shift and Alt as they are held -- looked up in keyBindings_;
+    // the Keys tab edits that table and settings.qconfig keeps it.
+    struct KeyCapture {
+        KeyAction action{};
+        std::size_t slot{};
+    };
+    KeyChord keyChordOf(WPARAM key, bool alt) const;
+    // Does what the key's chord is bound to; false when it is bound to
+    // nothing. A held key repeats only a step (KeyActionInfo::repeats).
+    bool runShortcut(WPARAM key, LPARAM lParam, bool alt);
+    void runKeyAction(KeyAction action);
+    // A key box of the Keys tab waits for a key: the next press is its new
+    // key, Esc gives up (Default keys is the way back to an Esc cleared).
+    // Only while the tab is shown with no drop-down.
+    // captureKey is false for a chord that cannot be a shortcut, which the
+    // caller hands on to Windows (Alt+F4 still closes the window).
+    bool keysTabShown() const;
+    bool capturingKey() const;
+    bool captureKey(WPARAM key, LPARAM lParam, bool alt);
+    void appendKeyRows(std::vector<PanelRow>& rows) const;
+    void keyBoxClicked(const PanelRow& row, int part, std::optional<KeyCapture> ended);
+    void keyCommand(int part, std::optional<KeyCapture> ended);
+    // An action's first key as a menu line shows it, empty while it has
+    // none; a tooltip's name with that key after it in brackets.
+    std::wstring shortcut(KeyAction action) const;
+    std::wstring withShortcut(std::wstring text, KeyAction action) const;
+    std::wstring sortShortcut(emby::SortKey key) const;
+    // The empty window's line of keys.
+    std::wstring emptyHintKeys() const;
+    // What a row of the sheet or of the settings window does when it is
+    // hit: the same state change the menu and the keys make. `ended` is a
+    // key box's wait the click ended, which the Keys tab's buttons act on.
+    void activatePanelRow(const PanelRow& row, const PanelHit& hit, std::optional<KeyCapture> ended = std::nullopt);
+
+    // The settings window (AppSettingsWindow.cpp): the seven tabs in a window
+    // of their own, owned by the player's, so it stays over it and goes
+    // with it; the user moves and sizes it, and it opens again where it was
+    // left. The sheet's rows, layout and hit test, painted by an Overlay of
+    // its own on the renderer's device. With no renderer it is state alone:
+    // open, rows, layout and hits, but no window.
+    static LRESULT CALLBACK settingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    void openSettingsWindow();
+    void closeSettingsWindow();
+    bool createSettingsWindow();
+    // This frame's rows and layout for a client this large, then what is
+    // under the pointer and its tooltip.
+    void refreshSettingsWindowGeometry(const RECT& client);
+    void buildSettingsWindowScene(const RECT& client);
+    void renderSettingsWindow();
+    PanelHit settingsWindowHitAt(POINT local) const;
+    void settingsWindowHover();
+    void settingsWindowPress(POINT local);
+    void settingsWindowMove(POINT local, bool leftDown);
+    void settingsWindowRelease(POINT local);
+    void settingsWindowCancelPress();
+    // A spin box's arrow held: the timer's step, and its end.
+    void settingsSpinStep();
+    void stopSettingsSpin();
+    // A spin box's number typed (SettingsWindow::spinEdit): begun by a press
+    // on it -- all of it chosen, or once typing the caret put at `x` -- its
+    // keys and characters, and its end, setting what was typed or not.
+    void beginSpinEdit(int row, float x);
+    void spinEditKey(WPARAM key, bool ctrl, bool shift);
+    void spinEditCharacter(wchar_t character);
+    void endSpinEdit(bool apply);
+    // A spin box's number as it stands, and set; nothing for a row that is
+    // not one.
+    std::optional<int> spinBoxValue(SettingId id) const;
+    void setSpinBoxValue(SettingId id, int value);
+    void scrollSettingsWindow(int wheelDelta);
+    void activateSettingsHit(const PanelHit& hit);
+    // A drop-down Choice row's list, hanging from its box's bottom-left in
+    // a window of its own as a Windows combo box's does, free to reach past
+    // the settings window: its options, the chosen one ticked; a click on
+    // one chooses it as a click on its segment would, a click anywhere else
+    // only closes it, and the arrows, Enter and Esc act on it while it is
+    // open, the settings window keeping the keys.
+    void openSettingsDropDown(int row);
+    void closeSettingsDropDown();
+    // Hung again from its row, found by what it is, once the rows are built
+    // anew -- following the window when it moves -- and closed when the row
+    // is gone or out of sight.
+    void layoutSettingsDropDown();
+    void chooseSettingsDropDown(int index);
+    void settingsDropDownKey(WPARAM key);
+    // The list's window: a popup that never takes the keys, made the first
+    // time a list opens and hidden between lists. With no settings window
+    // there is none, and handleSettingsListMessage is called with the list's
+    // own coordinates.
+    static LRESULT CALLBACK settingsListWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handleSettingsListMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    bool createSettingsListWindow();
+    void buildSettingsListScene();
+    // Drawn after the settings window, and shown once it has been.
+    void renderSettingsList(ID3D11Device* device);
+
+    // A key pressed in the window: the player's shortcut, but Esc (Back)
+    // puts the window away. False for a key bound to nothing.
+    bool settingsWindowShortcut(WPARAM key, LPARAM lParam, bool alt);
+    // The window is up and the pointer is on it, whatever lies beneath.
+    bool pointerOverSettingsWindow(POINT screen) const;
+    LRESULT settingsWindowFrameHit(POINT screen) const;
     // The sheet's drop-down (PanelMenu.hpp), drawn in the sheet: opened
     // under the `part`-th box of the row with this id (and param, when it
     // is not -1), or at a point of the sheet. It is not modal: `choose`
@@ -347,10 +485,26 @@ private:
     int panelMenuCardAt(POINT local) const;
     // A menu over the picture keeps its button lit: the bar's, a pill.
     OverlayHit panelMenuAnchorHit() const;
+    // The sync panel (syncPanelLayout) over the Sync key of the bar or the
+    // capsule: the seek bars' mode, each video's offset and repeat, all
+    // offsets to zero, without the settings window. A press on it acts and
+    // leaves it open; one anywhere else, Escape, Alt or the player going to
+    // the background closes it, as they do a menu. The wheel on a video's
+    // row steps its offset a tenth of a second a notch.
+    void toggleSyncPanel();
+    void closeSyncPanel();
+    // Each frame and on opening: over its key, a row for each video by its
+    // place on the screen; it closes when its key has gone.
+    void layoutSyncPanel();
+    void syncPanelPress(POINT local);
+    void syncPanelRelease(POINT local);
+    // True when the wheel was the panel's: over it.
+    bool syncPanelWheel(POINT local, int wheelDelta);
+    void activateSyncPanel(const SyncPanelHit& hit);
     void selectSettingsTab(SettingsTab tab);
-    // The header's switches in their order, each the face it leads to; a
-    // press on the `part`-th shows that face. Emby is shown as Ctrl+E shows
-    // it (the sign-in dialog when signed out).
+    // The sheet header's switches in their order, each what it leads to; a
+    // press on the `part`-th shows that. Emby is shown as Ctrl+E shows it
+    // (the sign-in page when signed out).
     std::vector<SheetFace> sheetSwitches() const;
     void switchSheet(int part);
     void showSheetFace(SheetFace face);
@@ -372,6 +526,12 @@ private:
         // `term` once the typing pauses; kept with the page, so Back to it
         // finds the box as it was left.
         TextFieldState field;
+        // A Search page opened from a library, folder, show or season: that
+        // page's id and title. What is under it alone is searched, unless
+        // `everyLibrary` was chosen on the page.
+        std::string scopeId, scopeTitle;
+        bool everyLibrary{};
+        bool searchesScope() const { return !scopeId.empty() && !everyLibrary; }
         // A Person page's person: first what the credit said (name,
         // picture), then their own item (birth, biography) once it comes;
         // `expanded` is its biography's More / Less.
@@ -499,6 +659,11 @@ private:
     // Re-orders the list being played; the entry playing stays the one playing.
     void embyReorderPlaylist(const std::function<void(std::vector<emby::Item>&)>& order);
     void embyToggleUnplayed();
+    // The whole page, or only the account's favorites under it.
+    void embyToggleFavoritesFilter();
+    // The page lists only favorites: the Favorites page, or a page the
+    // filter is on for.
+    bool embyListsFavoritesOnly() const;
     // Folders, or every video under the page with its folders left out.
     void embySetFlat(bool flat);
     void embyToggleFlat();
@@ -515,7 +680,11 @@ private:
     static emby::ListPage embyListPage(const EmbyPage& page);
     // The request a list or TV hierarchy page makes, without the server.
     std::string embyListPath(const EmbyPage& page, int startIndex, int limit) const;
-    std::string embySearchPath(const std::string& libraryId, const std::string& term) const;
+    // What a Search page asks under: every library, one request each, or
+    // the folder it was opened in alone.
+    std::vector<std::string> embySearchParents(const EmbyPage& page) const;
+    // A search under one library or folder, at any depth.
+    std::string embySearchPath(const std::string& parentId, const std::string& term) const;
     // A list reply for the page shown, `startIndex` on from its start, read
     // here for the home page's immediate reply.
     void embyListArrived(std::uint64_t serial, int startIndex, const EmbyClient::Response& response);
@@ -540,8 +709,10 @@ private:
     void embyReceiveList(std::uint64_t serial, int startIndex, EmbyClient::Response& response);
     void embyListParsed(std::uint64_t serial, int startIndex, const EmbyClient::Response& response,
                         EmbyListParse parsed);
-    // A search asks every library at once; what the answers so far came to.
+    // A search asks every library at once, or the one folder it was opened
+    // in (`folder`); what the answers so far came to.
     struct EmbySearch {
+        std::string folder;
         std::size_t libraries{};
         std::size_t remaining{};
         std::size_t failed{};
@@ -601,6 +772,11 @@ private:
     void embyKeepPressOn(const std::string& item);
     // Asks for the pictures of the tiles on screen that are not cached yet.
     void embyRequestVisibleImages();
+    // Asks, once each, for the shape of the videos whose tiles lie between
+    // `top` and `bottom` (emby::videoShapesPath), into thumbnails_.
+    void embyAskVisibleShapes(float top, float bottom);
+    void embyShapesArrived(std::uint64_t account, const std::vector<std::string>& asked,
+                           const EmbyClient::Response& response);
     void embyAccountAction(int part);
     void embyNavigate(int part);
     // PotPlayer's habit: while an Emby item plays, the pointer at the
@@ -689,6 +865,10 @@ private:
     bool embySearchTyping() const;
     void embyClearSearch();
     PanelRow embySearchRow() const;
+    // Under the box of a Search page opened in a folder: that folder or
+    // every library, part 0 or 1, searched again at once.
+    PanelRow embySearchScopeRow() const;
+    void embyChooseSearchScope(int part);
     void embySearchEdited();
     // What the box holds becomes the page's term and is searched for,
     // unless it already is; empty, the results go.
@@ -723,7 +903,8 @@ private:
     std::optional<OverlayRect> fieldCaretBox();
     // Tells the input method where the caret is, for its candidate list.
     void fieldPlaceIme();
-    // The input method off while the password has the typing, on after.
+    // The input method on while the search box or the sign-in's server or
+    // user box has the typing, off with none or the password.
     void fieldSyncIme();
     void fieldImeStart();
     void fieldImeComposition(LPARAM flags);
@@ -767,6 +948,10 @@ private:
     void embyFinishPane(std::size_t pane);
     void finishLocalPanes();
     void localFinishPane(std::size_t pane);
+    // Linked, the F6 and Emby videos repeat together: each that repeats waits
+    // at its end, and once none plays they start over, each at its offset.
+    void finishLinkedBrowserSet();
+    bool repeatsWithLinkedVideos(std::size_t pane) const;
     void embyTick();
     void embyClearPane(std::size_t pane);
     // A reply finds its pane by the serial it was queued with: a swap may
@@ -776,8 +961,12 @@ private:
     void embyDetachPlayback();
     // A source not yet ready, or an Emby item still being resolved.
     bool paneOpening(std::size_t pane) const;
-    // Everything a pane holds about its media besides the decoder.
-    void resetPaneMediaState(std::size_t pane);
+    // Everything a pane holds about its media besides the decoder. The same
+    // video opened again (sameMedia) keeps what the viewer chose for it: the
+    // subtitle, the files loaded by hand, both timings and the audio track;
+    // and its serial, so it is still the video a menu or a dialog was
+    // opened on.
+    void resetPaneMediaState(std::size_t pane, bool sameMedia = false);
     void releasePanelPress(POINT local);
     // Subtitles (AppSubtitles.cpp). A pane's subtitles come from one of
     // three places: a text stream the Emby server hands over, a file -- one
@@ -817,7 +1006,10 @@ private:
     };
     static SidecarScan scanSidecars(const std::wstring& path, const std::vector<std::string>& wanted);
     void applySidecarScan(std::size_t pane, std::uint64_t serial, SidecarScan scan);
-    void loadSidecarSubtitles(std::size_t pane, const std::wstring& path);
+    // The files beside a local video, read off this thread. New media is
+    // given a new serial for the scan to come back by; the same video
+    // opened again (sameMedia) keeps its own.
+    void loadSidecarSubtitles(std::size_t pane, const std::wstring& path, bool sameMedia = false);
     // A scan or a read that comes back finds its pane by the serial it left
     // with: a swap may have moved the pane, new media retired the serial.
     std::optional<std::size_t> subtitlePaneWithSerial(std::uint64_t serial) const;
@@ -932,7 +1124,6 @@ private:
     void showLayoutMenu();
     void chooseLayout(LayoutMode mode);
     void chooseSeekMode(SeekMode mode);
-    bool handleAltKey(WPARAM key);
     void selectAudioTrack(std::size_t pane, int streamIndex);
     void retireSource(std::size_t pane);
     void startSourceStream(std::size_t pane, const std::wstring& url, const SourceOptions& options,
@@ -951,6 +1142,11 @@ private:
     // where `path` is among them (-1 when it is not). False when that folder
     // has not been read yet: it is never read here, on the window thread.
     bool siblingFiles(const std::wstring& path, std::vector<std::wstring>& files, int& position) const;
+    // The list a pane's video plays from, as the steps walk it, and where
+    // the video is in it (-1 when it is not): its Emby page, its F6 queue,
+    // the F6 list where that covers it, else its folder once read. False
+    // where it has none, or its folder is not read yet.
+    bool playlistPlace(std::size_t pane, int& position, std::size_t& count) const;
     // Reads the folder of a video opened by hand off this thread, unless the
     // F6 list is that folder's or a read of it is already on its way.
     void requestSiblingFolder(const std::wstring& path);
@@ -1004,7 +1200,7 @@ private:
     void seekRelative(double delta);
     void seekAbsolute(double position, SeekStyle style = SeekStyle::Synchronized,
                       bool keepEmbyPhotos = false);
-    void alignBrowserPanesToTime(double target);
+    void alignBrowserPanesToTime(double target, bool announce = true);
     void toggleAudioPane(std::size_t pane);
     void setAudioMask(unsigned mask);
     void refreshAudioControls();
@@ -1015,6 +1211,118 @@ private:
     // The master volume by 5 percent a step, up for positive steps.
     void stepVolume(int steps);
     void selectNextUnfinishedAudio(double timelinePosition);
+    // The sound's own settings (AppAudio.cpp): the output it plays on and
+    // what happens as outputs come and go, how loud it may go, its timing,
+    // speed, language and effects; the menus, keys and Audio tab rows that
+    // change them.
+    void startAudioOutput();
+    // Each tick: outputs that came, went or became the default, and an
+    // engine that stopped, are answered by opening the output again.
+    void serviceAudioOutput();
+    void refreshAudioOutputs();
+    bool audioOutputListed(const std::wstring& id) const;
+    std::wstring audioOutputName(const std::wstring& id) const;
+    // The chosen output while it is connected, otherwise Windows' default.
+    std::wstring wantedAudioOutput() const;
+    void logAudioOutput(const char* what);
+    bool reopenAudioOutput(const char* reason);
+    // The pane's sound sought again where its picture is, as after a change
+    // of track, output or delay; every pane's, or the barrier rebuilt.
+    void reaimPaneAudio(std::size_t pane);
+    void reaimAllAudio();
+    // Empty for Windows' default.
+    void chooseAudioOutput(const std::wstring& id);
+    void cycleAudioOutput();
+    void setAudioDeviceChannels(bool deviceChannels);
+    // The master volume, up to what the Audio tab lets it reach.
+    float maxMasterVolume() const;
+    void setMasterVolume(float volume);
+    void setMaxMasterVolume(int percent);
+    // The seconds a pane's sound is late, every video's delay and its own.
+    double paneAudioDelay(std::size_t pane) const;
+    // A source about to open takes the voices' layout, its delay and tempo.
+    void prepareSourceAudio(VideoSource& source, std::size_t pane) const;
+    // The decoder stretches a pane's sound to its speed while pitch is kept.
+    void syncPaneAudioTempo(std::size_t pane);
+    void applyPaneAudioDelay(std::size_t pane);
+    void nudgePaneAudioDelay(std::size_t pane, double seconds);
+    void resetPaneAudioDelay(std::size_t pane);
+    // 0 puts every video's delay back to none.
+    void nudgeAllAudioDelay(int milliseconds);
+    void setPitchCorrection(bool on);
+    // The pane the audio keys act on, -1 for none.
+    int audioKeyPane() const;
+    int paneAudioTrack(std::size_t pane) const;
+    void cycleAudioTrack(std::size_t pane);
+    void setAudioLanguage(AudioLanguage language);
+    void applyAudioEffects();
+    void changeAudioEffects(const AudioEffectSettings& effects, const std::wstring& notice);
+    void toggleEqualizer();
+    void chooseEqualizerPreset(std::size_t preset);
+    // A band by its index, or the preamp at -1, in dB.
+    void setEqualizerGain(int band, float db);
+    void toggleNormalizer();
+    void setNightMode(int strength);
+    void setStereoMode(AudioStereoMode mode);
+    void toggleStereoMode(AudioStereoMode mode);
+    void toggleVoiceEmphasis();
+    void toggleCrossfeed();
+    void setStereoWidening(int strength);
+    void appendAudioMenu(PanelMenu& menu) const;
+    void appendPaneAudioSyncMenu(PanelMenu& menu, std::size_t pane) const;
+    // False for a command or a key that is not the sound's.
+    bool handleAudioCommand(unsigned command, int pane);
+    bool handleAudioKey(KeyAction action);
+    // The Audio tab's Output, Sound and Equalizer sections.
+    void appendAudioSettingsRows(std::vector<PanelRow>& rows) const;
+    // The picture's way to the screen (AppVideo.cpp): PotPlayer's video
+    // output settings -- the renderer and the graphics card it runs on, the
+    // display fullscreen goes to, the output's depth, deinterlacing, the
+    // scaler, the colour controls and the levels -- and the Video tab and
+    // keys that change them.
+    // Before the window exists: the renderer is then built as the settings
+    // say, not built and at once built again.
+    void primeVideoOutput();
+    // Hands the settings to the renderer, and builds it again as for a lost
+    // device when they want another renderer or card.
+    void applyVideoOutput();
+    void refreshVideoDevices();
+    // After a display change: a chosen card that was not connected when the
+    // device was built is used once it is back.
+    void reclaimVideoAdapter();
+    // After a build: a notice when it ended on WARP though WARP was not
+    // chosen, as no card made a device.
+    void noticeWarpFallback();
+    // After WM_CREATE's build or a rebuild: that notice once the start has
+    // opened what it was given and no other notice is up (expireNotice), so
+    // that the launch's or the rebuild's notices and it do not hide one
+    // another.
+    void noticeWarpFallbackWhenClear();
+    void chooseVideoRenderer(VideoRenderer renderer);
+    // -1 for the card D3D11 picks, else a place in videoAdapters_.
+    void chooseVideoAdapter(int index);
+    // -1 for the window's own display, else a place in videoDisplays_.
+    void chooseFullscreenDisplay(int index);
+    void setVideoTenBit(bool tenBit);
+    void setVideoDeinterlace(VideoDeinterlace mode);
+    void setVideoScaling(VideoScaling scaling);
+    void setVideoLimitedRange(bool limited);
+    // A control set to a value, held to its range; a notice only when asked.
+    void setVideoColor(VideoColorControl control, int value, bool notice = false);
+    void stepVideoColor(VideoColorControl control, int steps);
+    void resetVideoColor();
+    bool handleVideoKey(KeyAction action);
+    // The picture menu's Video line, and its commands.
+    void appendVideoMenu(PanelMenu& menu) const;
+    bool handleVideoCommand(unsigned command);
+    void videoPanelAction(const PanelRow& row, int part);
+    // The monitor fullscreen covers: the chosen display while it is
+    // connected, otherwise the one the window is on.
+    HMONITOR fullscreenMonitor() const;
+    // A fullscreen window put over that monitor again: another was chosen,
+    // or its DPI or the desktop changed.
+    void placeFullscreen();
+    void appendVideoSettingsRows(std::vector<PanelRow>& rows) const;
     void createControls();
     void layoutControls(unsigned width, unsigned height);
     void updateDockAnimation();
@@ -1025,6 +1333,8 @@ private:
     void changeDecodeMode(DecodeMode mode);
     void setPaneOffset(std::size_t pane, double seconds);
     void applyPaneOffset(std::size_t pane, double seconds);
+    void moveBrowserPaneOffset(std::size_t pane, double seconds);
+    void placeBrowserPane(std::size_t pane, double alignedTime);
     double paneOffsetSeconds(std::size_t pane) const;
     bool anyPaneOffset() const;
     void resetPaneOffset(std::size_t pane);
@@ -1120,6 +1430,27 @@ private:
     HINSTANCE instance_{};
     D3DRenderer renderer_;
     AudioOutput audio_;
+    // The sound's settings as settings.qconfig keeps them; Windows' outputs
+    // as last listed, and the one it plays media on. A change of outputs is
+    // answered once they have settled; an output is opened again when the
+    // engine stops, and when the wanted one changes.
+    AudioSettings audioSettings_;
+    AudioDevices audioDevices_;
+    std::vector<AudioDeviceInfo> audioOutputs_;
+    std::wstring defaultAudioOutput_;
+    bool audioStarted_{};
+    bool audioDevicesChanged_{};
+    std::chrono::steady_clock::time_point audioDevicesChangedAt_{};
+    bool audioReopenPending_{};
+    std::chrono::steady_clock::time_point audioReopenAt_{};
+    // The last reopen failed: said once, not again until one opens.
+    bool audioReopenFailed_{};
+    // Each pane's own delay, on top of every video's, for the media it
+    // plays now: seconds its sound is late, negative early.
+    PaneArray<double> audioDelays_{};
+    // The audio track the viewer picked for the media it plays now, -1 for
+    // none: a source opened again for the same video starts on it.
+    PaneArray<int> audioTrackChoices_{-1, -1, -1, -1, -1};
     PlaybackClock clock_;
     PaneArray<std::unique_ptr<VideoSource>> sources_{};
     PaneArray<std::wstring> paths_{};
@@ -1146,6 +1477,11 @@ private:
     DecodeMode decodeMode_{DecodeMode::Automatic};
     bool nasCacheEnabled_{true};
     VideoEnhancementSettings rtxVideo_;
+    // The Video tab's settings as settings.qconfig keeps them, and the
+    // graphics cards and displays as last listed.
+    VideoOutputSettings videoOutput_;
+    std::vector<VideoAdapterInfo> videoAdapters_;
+    std::vector<VideoDisplayInfo> videoDisplays_;
     // Emby: the client, the browser's page stack and its current list, and
     // per-pane playback state. Subtitles and audio-track choices belong to
     // any pane, Emby or local.
@@ -1264,7 +1600,7 @@ private:
         ~ScanToken() { value->store(~std::uint64_t{0}); }
     };
     ScanToken localScanToken_;
-    // The normal sheet's tab, and each tab's own scroll.
+    // The settings window's tab, and each tab's own scroll.
     SettingsTab settingsTab_{SettingsTab::Playback};
     std::array<float, kSettingsTabCount> settingsTabScroll_{};
     float embyListScroll_{};
@@ -1307,6 +1643,9 @@ private:
     // report never waits on the one queue behind a long list's worth.
     std::deque<std::vector<std::string>> embySubtitleQuestions_;
     std::size_t embySubtitleQuestionsOut_{};
+    // Whether a question for the shape of the videos in view is out: one
+    // at a time, the next screenful asked once it is answered.
+    bool embyShapeQuestionOut_{};
     // The items whose favorite change is on its way to the server.
     std::unordered_set<std::string> embyFavoriteAsking_;
     // The favorite entry a pane's menu offered, kept for the command it
@@ -1324,7 +1663,8 @@ private:
     // and its caret, when the caret last moved -- it shows solid then, and
     // blinks after -- the hidden system caret kept under the drawn one for
     // input methods that follow that instead, and whether the input method
-    // is off for the password. The main window having the keyboard at all.
+    // is off: with no box typing, or the password. The main window having
+    // the keyboard at all.
     // When the search box was last edited and not yet searched for (0 for
     // not).
     TextFieldId typingField_{TextFieldId::None};
@@ -1392,9 +1732,13 @@ private:
     PaneMenuSnapshot takePaneMenuSnapshot();
     void clearPaneMenuSnapshot();
     void runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command, int pane);
-    // An Alt+letter subtitle key was taken: its character message, which
-    // would only make the default handler beep, is dropped.
+    // An Alt key was taken as a shortcut or a key box's new key: its
+    // character message, which would only make the default handler beep,
+    // is dropped.
     bool altCharTaken_{};
+    // Every action's keys, and the key box waiting for a key press.
+    KeyBindings keyBindings_{defaultKeyBindings()};
+    std::optional<KeyCapture> keyCapture_;
     // The last left press was a drop-down's: the second of two quick clicks,
     // which the window class makes a double-click, is a press too, not the
     // picture's double-click (Solo) once the first has closed the menu.
@@ -1407,7 +1751,10 @@ private:
     // would open the system menu, is dropped.
     bool ncRightUpTaken_{};
     // Retired whenever the pane's media changes, so a scan or a read that
-    // finishes late finds the pane has moved on.
+    // finishes late finds the pane has moved on. The same video opened again
+    // for a decoder, renderer or card change, or a device recovery, keeps
+    // it: a menu left open, the Load dialog, a step key waiting for its
+    // folder and the pane picked for a replacement still find their video.
     PaneArray<std::uint64_t> subtitleSerial_{};
     std::uint64_t subtitleSerialCounter_{};
     // The viewer chose this pane's subtitles, or turned them off: nothing
@@ -1444,11 +1791,22 @@ private:
     // or could not be kept aside after a failed read: this session runs on
     // defaults and saves nothing, so the file another build wrote survives.
     bool settingsReadOnly_{};
+    // Set once loadAppSettings has looked for settings.qconfig, found or
+    // not. Before then the App holds only defaults, and nothing is saved:
+    // a window whose WM_CREATE failed is destroyed before run() reads it.
+    bool settingsRead_{};
     ShaderPreset shaderPreset_{ShaderPreset::Normal};
     SeekMode seekMode_{SeekMode::Linked};
     SeekMode browserSeekMode_{SeekMode::Independent};
     bool browserSeekAligned_{};
+    // On a deck of browser videos, each one's offset: the seconds it stands
+    // ahead of the time the Linked rail aligns the videos to. The master
+    // clock predates each video there, so the adjustments cannot carry it.
+    PaneArray<double> browserOffsets_{};
     bool fullscreen_{};
+    // Set while toggleFullscreen or placeFullscreen moves the window itself:
+    // a WM_DPICHANGED from inside that move keeps the rectangle asked for.
+    bool placingWindow_{};
     bool controlsVisible_{true};
     bool controlsPinned_{};
     float dockProgress_{1.0F};
@@ -1537,7 +1895,8 @@ private:
     int dragPane_{-1};
     float dragFraction_{};
     int dropTargetPane_{-1};
-    // The settings sheet.
+    // The sheet: the browser or the F6 list. The names
+    // are the settings' from when they were its first face.
     bool settingsOpen_{};
     float settingsAlpha_{};
     float settingsScroll_{};
@@ -1643,11 +2002,113 @@ private:
         int& highlightedAt(std::size_t depth) { return depth == 0 ? highlighted : submenus[depth - 1].highlighted; }
     };
     std::optional<OpenPanelMenu> panelMenu_;
+    // The sync panel that is open: where it stands, the pane of each of its
+    // rows, and what is under the pointer and pressed.
+    struct OpenSyncPanel {
+        SyncPanelLayout layout{};
+        std::array<std::size_t, kMaxPanes> panes{};
+        SyncPanelHit hot{};
+        SyncPanelHit pressed{};
+        bool pressing{};
+        ULONGLONG openedAt{};
+    };
+    std::optional<OpenSyncPanel> syncPanel_;
     // Where the last click let go, for the double-click that follows it.
     std::optional<RepeatControl> releasedControl_;
+    // The settings window. Its scroll is the shown tab's own
+    // (settingsTabScroll_), and it has no text boxes.
+    struct SettingsWindow {
+        HWND window{};
+        bool open{};
+        // Its own DPI over 96: it may stand on another monitor than the player.
+        float scale{1.0F};
+        std::vector<PanelRow> rows;
+        PanelLayout layout{};
+        PanelHitKind hotKind{PanelHitKind::None};
+        int hotRow{-1};
+        int hotPart{-1};
+        PanelHitKind pressedKind{PanelHitKind::None};
+        int pressedRow{-1};
+        int pressedPart{-1};
+        // What the pressed row was, so a release on a row rebuilt beneath the
+        // pointer does not act on another.
+        SettingId pressedId{SettingId::None};
+        int pressedParam{-1};
+        // A press that may become a drag of the content: where it started
+        // and the scroll then. The thumb drag keeps where it was grabbed.
+        bool pressArmed{};
+        POINT pressPoint{};
+        float pressScroll{};
+        float thumbGrab{};
+        // A spin box's arrow pressed and held: it stepped at the press, and
+        // steps at each tick of the window's timer while the pointer is on it.
+        bool spinning{};
+        // A spin box whose number is being typed: its row, by id and param,
+        // the digits with their caret and selection, and when the caret last
+        // moved, for its blink. Enter, Tab, a press elsewhere and the keyboard
+        // leaving the window set what was typed; Esc leaves the number as it
+        // was.
+        struct SpinEdit {
+            SettingId id{SettingId::None};
+            int param{-1};
+            TextFieldState field;
+            ULONGLONG caretTick{};
+        };
+        std::optional<SpinEdit> spinEdit;
+        enum class Drag { None, Slider, Scroll, Scrollbar };
+        Drag drag{Drag::None};
+        int dragRow{-1};
+        // The band of an Equalizer row being dragged.
+        int dragPart{-1};
+        float dragFraction{};
+        // The drop-down open: the row it hangs from, by its place, id and
+        // param; its lines and their card, in the list window's own
+        // coordinates, the card that window's whole client; the line lit and
+        // the one pressed; and where the list window stands, in screen
+        // pixels (in this window's client with no window).
+        struct DropDown {
+            int row{-1};
+            SettingId id{SettingId::None};
+            int param{-1};
+            std::vector<PanelMenuItem> items;
+            PanelMenuLayout layout{};
+            int highlighted{-1};
+            int pressed{-1};
+            OverlayRect frame{};
+        };
+        std::optional<DropDown> dropDown;
+        // The list's window, owned by this one; painted with this window's
+        // Overlay into a chain of its own. `listFramed`: Windows rounds its
+        // corners and draws its frame, as Windows 11 does; else the painter
+        // draws a hairline round it.
+        HWND listWindow{};
+        bool listFramed{};
+        OverlayScene listScene;
+        WindowSurface listSurface;
+        // Where the last click let go, for the double-click that follows it.
+        std::optional<RepeatControl> released;
+        // The pointer in its client while it is over it; hotSince is when
+        // what it lights last changed, for the tooltip's delay.
+        POINT pointer{-1, -1};
+        bool pointerInside{};
+        bool trackingLeave{};
+        ULONGLONG hotSince{};
+        std::wstring tooltip;
+        OverlayRect tooltipAnchor{};
+        // A frame being painted: WM_SIZE and WM_PAINT do not paint another
+        // inside it.
+        bool painting{};
+        Overlay overlay;
+        OverlayScene scene;
+        WindowSurface surface;
+    };
+    SettingsWindow settingsWindow_;
     int panelDragRow_{-1};
     std::wstring noticeText_;
     ULONGLONG noticeUntil_{};
+    // A build is yet to be said, should it be on WARP not chosen
+    // (noticeWarpFallbackWhenClear).
+    bool warpFallbackNoticeDue_{};
     float uiScale_{1.0F};
     SmartVibranceSettings smartVibrance_;
     std::wstring customShaderPath_;

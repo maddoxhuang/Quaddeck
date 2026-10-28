@@ -86,13 +86,16 @@ void App::togglePlayback() {
 
 void App::stopPlayback() {
     const bool independentDeck = perPaneTimelines();
+    // Linked, each video starts its offset away from the others' zero.
+    const bool linkedBrowser = linkedBrowserSeekBars();
     if (independentDeck) {
         const double timeline = clock_.position();
         for (std::size_t pane = 0; pane < paths_.size(); ++pane) {
             if (paths_[pane].empty()) continue;
             if (!sources_[pane]) {
-                syncAdjustments_[pane] = -(timeline - startDelays_[pane]) * playbackRates_[pane];
-                sourcePausedTimes_[pane] = 0.0;
+                const double start = linkedBrowser ? browserOffsets_[pane] : 0.0;
+                syncAdjustments_[pane] = start - (timeline - startDelays_[pane]) * playbackRates_[pane];
+                sourcePausedTimes_[pane] = std::max(0.0, start);
             }
             // A pane held at its end plays from zero with the others on
             // Play; one the viewer paused stays paused.
@@ -125,7 +128,9 @@ void App::stopPlayback() {
         // Every source returns to its own zero under a parked master clock.
         // Moving master time to zero alone would restore each resume offset.
         for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
-            if (sources_[pane]) seekPaneTo(pane, 0.0);
+            if (!sources_[pane]) continue;
+            if (linkedBrowser) placeBrowserPane(pane, 0.0);
+            else seekPaneTo(pane, 0.0);
         }
     } else {
         seekAbsolute(0.0);
@@ -273,11 +278,12 @@ void App::seekAbsolute(double position, SeekStyle style, bool keepEmbyPhotos) {
     updateControls();
 }
 
-// Explicit browser-linked seeks align source-local seconds. Browser queues,
-// repeat and EOF still use their independent timeline policy. Rebase all
+// Explicit browser-linked seeks align source-local seconds. Browser queues
+// and EOF still use their own policy; repeat is the set's, together
+// (finishLinkedBrowserSet). Rebase all
 // offsets against the same new master-clock sample before issuing one fast
 // seek, so a slow network pane does not hold the other pictures.
-void App::alignBrowserPanesToTime(double requested) {
+void App::alignBrowserPanesToTime(double requested, bool announce) {
     if (!linkedBrowserSeekBars() || !std::isfinite(requested)) return;
     const auto origins = paneOrigins();
     if (deviceRecoveryPending_) {
@@ -294,7 +300,7 @@ void App::alignBrowserPanesToTime(double requested) {
                 showNotice(L"Wait for video lengths after device recovery");
                 return;
             }
-            longest = std::max(longest, knownDuration);
+            longest = std::max(longest, knownDuration - browserOffsets_[pane]);
         }
         if (longest <= 0.0) {
             pendingSeekDirection_ = 0;
@@ -306,13 +312,13 @@ void App::alignBrowserPanesToTime(double requested) {
             if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
             const double knownDuration = sources_[pane] ? sources_[pane]->duration()
                                                          : deviceRecoverySourceDurations_[pane];
-            const double paneTarget = std::min(target, knownDuration);
+            const double paneTarget = std::min(target + browserOffsets_[pane], knownDuration);
             syncAdjustments_[pane] = paneTarget -
                 (target - startDelays_[pane]) * playbackRates_[pane];
             const bool heldAtEnd = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
                                    (localPanes_[pane] && localPanes_[pane]->endHandled);
             if (heldAtEnd) sourcePaused_[pane] = false;
-            if (sourcePaused_[pane]) sourcePausedTimes_[pane] = paneTarget;
+            if (sourcePaused_[pane]) sourcePausedTimes_[pane] = std::max(0.0, paneTarget);
             if (embyPanes_[pane]) embyPanes_[pane]->endHandled = false;
             if (localPanes_[pane]) localPanes_[pane]->endHandled = false;
             duration_ = std::max(duration_, timelineDuration(knownDuration,
@@ -320,7 +326,7 @@ void App::alignBrowserPanesToTime(double requested) {
         }
         browserSeekAligned_ = true;
         seekAbsolute(target, SeekStyle::Fast, true);
-        showNotice(L"Aligned video time to " + formatTime(target));
+        if (announce) showNotice(L"Aligned video time to " + formatTime(target));
         return;
     }
     double longest = 0.0;
@@ -341,7 +347,9 @@ void App::alignBrowserPanesToTime(double requested) {
             showNotice(L"Cannot align a video with unknown duration");
             return;
         }
-        longest = std::max(longest, sources_[pane]->duration());
+        // The rail runs to where the last video ends among the others, each
+        // counted from its offset.
+        longest = std::max(longest, sources_[pane]->duration() - browserOffsets_[pane]);
     }
     if (longest <= 0.0) {
         pendingSeekDirection_ = 0;
@@ -351,15 +359,17 @@ void App::alignBrowserPanesToTime(double requested) {
     duration_ = target;
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
         if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
-        // A shorter video can only reach its own end. Its repeat/loop rule
-        // remains in force and may remap that end during this seek.
-        const double paneTarget = std::min(target, sources_[pane]->duration());
+        // Each video goes to the target plus its own offset; one whose
+        // offset puts it before its start waits there. A shorter video can
+        // only reach its own end, where one that repeats waits for the
+        // others; an A-B loop remains in force and may remap that end.
+        const double paneTarget = std::min(target + browserOffsets_[pane], sources_[pane]->duration());
         syncAdjustments_[pane] = paneTarget -
             (target - startDelays_[pane]) * playbackRates_[pane];
         const bool heldAtEnd = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
                                (localPanes_[pane] && localPanes_[pane]->endHandled);
         if (heldAtEnd) sourcePaused_[pane] = false;
-        if (sourcePaused_[pane]) sourcePausedTimes_[pane] = paneTarget;
+        if (sourcePaused_[pane]) sourcePausedTimes_[pane] = std::max(0.0, paneTarget);
         if (embyPanes_[pane]) embyPanes_[pane]->endHandled = false;
         if (localPanes_[pane]) localPanes_[pane]->endHandled = false;
         duration_ = std::max(duration_, timelineDuration(
@@ -367,7 +377,7 @@ void App::alignBrowserPanesToTime(double requested) {
     }
     browserSeekAligned_ = true;
     seekAbsolute(target, SeekStyle::Fast, true);
-    showNotice(L"Aligned video time to " + formatTime(target));
+    if (announce) showNotice(L"Aligned video time to " + formatTime(target));
 }
 
 void App::beginSynchronizedSeek(double position, bool showKeyframePreview, bool resume) {
@@ -433,6 +443,7 @@ PaneArray<SeekBarrier::PaneStatus> App::paneStatuses() const {
         if (!sources_[pane]) continue;
         status[pane].loaded = true;
         status[pane].errored = !sources_[pane]->error().empty();
+        status[pane].seekEndedWithoutFrame = sources_[pane]->seekEndedWithoutFrame();
         const auto audioStatus = sources_[pane]->audioDecodeStatus();
         status[pane].audioGeneration = audioStatus.generation;
         status[pane].audioState = barrierAudioState(audioStatus.state);
@@ -500,7 +511,7 @@ bool App::playbackIntended() const {
            (seekBarrier_.active() && seekBarrier_.resume());
 }
 
-// The settings sheet reads the audio mask and per-pane trims when it is
+// The settings window reads the audio mask and per-pane trims when it is
 // built, so there is nothing to push any more; kept for its call sites.
 void App::refreshAudioControls() {}
 
@@ -607,9 +618,8 @@ void App::adjustVolumeFromWheel(short wheelDelta) {
 }
 
 void App::stepVolume(int steps) {
-    const float volume = std::clamp(audio_.volume() + steps * 0.05F, 0.0F, 1.0F);
-    audio_.setVolume(volume);
-    if (volume > 0.0F && audio_.muted()) audio_.setMuted(false);
+    const float volume = std::clamp(audio_.volume() + steps * 0.05F, 0.0F, maxMasterVolume());
+    setMasterVolume(volume);
     const int slider = static_cast<int>(std::lround(volume * 100.0F));
     showNotice(L"Volume " + std::to_wstring(slider) + L"%");
     updateControls();

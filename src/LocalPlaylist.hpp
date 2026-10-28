@@ -169,6 +169,24 @@ inline std::wstring localRelativeFolder(const std::wstring& path, const std::wst
     return start < folder.size() ? folder.substr(start) : std::wstring();
 }
 
+// Where a video stands in the list it plays from -- the F6 list, its folder
+// or the Emby page it was chosen on -- as the title shows it after its
+// name: "3/48", "?/48" when the list does not hold it, and nothing for a
+// list of one or none.
+inline std::wstring listPlaceText(int position, std::size_t count) {
+    if (count < 2) return {};
+    return (position >= 0 && static_cast<std::size_t>(position) < count ? std::to_wstring(position + 1)
+                                                                        : std::wstring(L"?")) +
+           L"/" + std::to_wstring(count);
+}
+
+// How many videos a list holds, as its header says it beside the crumb:
+// "48 videos", "1 video", nothing for none.
+inline std::wstring videoCountText(std::size_t count) {
+    if (count == 0) return {};
+    return std::to_wstring(count) + (count == 1 ? L" video" : L" videos");
+}
+
 // Where the list is, as the browser's header says it: the folder's last two
 // names under an ellipsis -- "… › Show › Season 1" -- or all of them when
 // there are no more than three: "D: › Show".

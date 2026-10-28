@@ -15,6 +15,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <initializer_list>
 
 namespace quaddeck {
 
@@ -41,8 +42,11 @@ inline OverlayRect overlayRect(const RectF& rect) {
 // In the order they sit on the bar. Previous and Next are there only with
 // one video loaded: they step through its folder or its Emby list, and
 // Subtitles is that video's switch; among several each has its own on its
-// strip. Layout is there only with several: it opens the arrangement menu.
-// There is no
+// strip. Sync and Layout are there only with several: Sync opens the sync
+// panel (the seek bars' mode, each video's offset and repeat), Layout the
+// arrangement menu. So are the videos' buttons: All videos shows every
+// video, SoloV1 to SoloV5 one alone, a button for each video loaded, so
+// one alone gives way to another without the grid between. There is no
 // menu button: a right-click opens the menu anywhere on the picture. Nor
 // is there a settings button: F5 and the menu open the sheet.
 enum class BarItem {
@@ -55,10 +59,28 @@ enum class BarItem {
     Audio,
     Volume,
     Subtitles,
+    AllVideos,
+    SoloV1,
+    SoloV2,
+    SoloV3,
+    SoloV4,
+    SoloV5,
+    Sync,
     Layout,
     Fullscreen,
 };
-inline constexpr std::size_t kBarItemCount = 11;
+inline constexpr std::size_t kBarItemCount = 18;
+
+// The button that shows the video at a place on the screen alone (0 for
+// V1), and back: the place a button shows alone, or -1 for any other.
+inline BarItem soloBarItem(std::size_t position) {
+    return static_cast<BarItem>(static_cast<std::size_t>(BarItem::SoloV1) + std::min(position, kMaxPanes - 1));
+}
+
+inline int barItemSoloPosition(BarItem item) {
+    const int index = static_cast<int>(item) - static_cast<int>(BarItem::SoloV1);
+    return index >= 0 && index < static_cast<int>(kMaxPanes) ? index : -1;
+}
 
 struct TransportBarLayout {
     // The gradient scrim the row sits on. Not a control.
@@ -66,13 +88,16 @@ struct TransportBarLayout {
     // The strip the controls occupy; the pointer inside it keeps the bar open.
     // As a capsule, the capsule itself: there is no band then.
     OverlayRect row;
-    // Non-interactive master-control scope label, drawn for multiple panes.
+    // The capsule's "All", a label, not a control. The full bar has none:
+    // until 2026-10-21 it had an "All, linked" label over its left end.
     OverlayRect scopeLabel;
     std::array<OverlayRect, kBarItemCount> items{};
     // The bar is the "All" capsule (capsuleBarLayout), and the line in it
-    // between the keys of playback and those of the window.
+    // between the keys of playback and those of the window -- or, with the
+    // videos' buttons between them, the lines before and after those.
     bool capsule{};
     OverlayRect divider;
+    OverlayRect videosDivider;
     const OverlayRect& operator[](BarItem item) const {
         return items[static_cast<std::size_t>(item)];
     }
@@ -133,16 +158,20 @@ inline bool capsuleRevealWanted(const TransportBarLayout& bar, float px, float p
 // Among several videos with no shared timeline the bar would be a row of
 // keys on either side of nothing, and each pane's strip would have to stand
 // on it. Instead the keys that act on every video -- play, stop, sound, the
-// arrangement and fullscreen -- are one capsule labelled "All", centred on
-// the bottom above the strips, which keep to their own bottom edges. A line
-// parts playback's keys from the window's. Too narrow, the capsule lets go
-// of its label, the arrangement, stop, sound and fullscreen in that order;
-// play stays. It is centred on `centreX` (the middle of `width` when
+// sync panel, the arrangement and fullscreen -- are one capsule labelled
+// "All", centred on the bottom above the strips, which keep to their own
+// bottom edges. A line parts playback's keys from the rest. With `videos`
+// of two or more, the videos' buttons stand between two lines after
+// playback's: All videos, then one for each of V1 up to that many. Too
+// narrow, the capsule lets go of its label, the arrangement, sync, the
+// videos' buttons (all of them at once), stop, sound and fullscreen in that
+// order; play stays. It is centred on `centreX` (the middle of `width` when
 // negative): the window's middle, so a browser docked over the right of
 // the picture does not move it. Only where the browser would cover it is it
 // pushed left, just clear of it.
 inline TransportBarLayout capsuleBarLayout(float width, float height, float scale, bool volumeOpen,
-                                           const BarMetrics& metrics = {}, float centreX = -1.0F) {
+                                           const BarMetrics& metrics = {}, float centreX = -1.0F,
+                                           std::size_t videos = 0) {
     TransportBarLayout result;
     result.capsule = true;
     const float s = std::max(0.0F, scale);
@@ -161,9 +190,18 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
     const float side = std::min(metrics.side * s, width / 8.0F);
     const auto index = [](BarItem item) { return static_cast<std::size_t>(item); };
     std::array<bool, kBarItemCount> present{};
-    for (const auto item : {BarItem::Play, BarItem::Stop, BarItem::Audio, BarItem::Layout, BarItem::Fullscreen}) {
+    for (const auto item : {BarItem::Play, BarItem::Stop, BarItem::Audio, BarItem::Sync, BarItem::Layout,
+                            BarItem::Fullscreen}) {
         present[index(item)] = true;
     }
+    const std::size_t soloButtons = videos >= 2 ? std::min(videos, kMaxPanes) : 0;
+    const auto showVideos = [&](bool shown) {
+        present[index(BarItem::AllVideos)] = shown && soloButtons > 0;
+        for (std::size_t position = 0; position < kMaxPanes; ++position) {
+            present[index(soloBarItem(position))] = shown && position < soloButtons;
+        }
+    };
+    showVideos(true);
     bool withLabel = true;
     // Lays the capsule out from `left`, or only measures it, and returns its width.
     const auto place = [&](float left, bool commit) {
@@ -180,24 +218,38 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
             x += button;
             afterButton = true;
         };
+        // A line after the buttons so far, where buttons follow it.
+        const auto line = [&](OverlayRect& target, std::initializer_list<BarItem> following) {
+            bool any = false;
+            for (const auto item : following) any = any || present[index(item)];
+            if (!afterButton || !any) return;
+            const float thickness = std::max(1.0F, s);
+            if (commit) {
+                target = {x + (divider - thickness) * 0.5F, top + (rowHeight - 14.0F * s) * 0.5F, thickness,
+                          14.0F * s};
+            }
+            x += divider;
+            afterButton = false;
+        };
         put(BarItem::Play);
         put(BarItem::Stop);
         put(BarItem::Audio);
-        if (afterButton && (present[index(BarItem::Layout)] || present[index(BarItem::Fullscreen)])) {
-            const float line = std::max(1.0F, s);
-            if (commit) result.divider = {x + (divider - line) * 0.5F, top + (rowHeight - 14.0F * s) * 0.5F, line, 14.0F * s};
-            x += divider;
-            afterButton = false;
-        }
+        line(result.divider, {BarItem::AllVideos, BarItem::Sync, BarItem::Layout, BarItem::Fullscreen});
+        put(BarItem::AllVideos);
+        for (std::size_t position = 0; position < kMaxPanes; ++position) put(soloBarItem(position));
+        line(result.videosDivider, {BarItem::Sync, BarItem::Layout, BarItem::Fullscreen});
+        put(BarItem::Sync);
         put(BarItem::Layout);
         put(BarItem::Fullscreen);
         return x + padding - left;
     };
     const float room = width - side * 2.0F;
     if (place(0.0F, false) > room) withLabel = false;
-    for (const auto item : {BarItem::Layout, BarItem::Stop, BarItem::Audio, BarItem::Fullscreen}) {
+    for (const auto item : {BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Stop, BarItem::Audio,
+                            BarItem::Fullscreen}) {
         if (place(0.0F, false) <= room) break;
-        present[index(item)] = false;
+        if (item == BarItem::AllVideos) showVideos(false);
+        else present[index(item)] = false;
     }
     const float capsuleWidth = place(0.0F, false);
     if (capsuleWidth > width) return result;
@@ -213,20 +265,23 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
 // Lay the bar out for a client of `width` x `height`. The seek rail takes
 // whatever is left; when even the preferred rail does not fit, controls are
 // removed as complete units in a fixed order, because each remains reachable
-// from the keyboard, the menu or the settings sheet. Play and the rail are
+// from the keyboard, the menu or the settings window. Play and the rail are
 // the final pair; below their minimum the rail alone spans the row. A
 // control that is out never comes back at a narrower width. Without a shared
 // timeline, the middle stays blank and the controls on either side retain
 // their positions and hit targets -- among several videos the bar is then
 // the "All" capsule instead (capsuleBarLayout), centred on `capsuleCentreX`.
 // `singleVideo` puts the step buttons and the subtitle switch on the bar,
-// `severalVideos` the arrangement button.
+// `severalVideos` the sync and arrangement buttons, and with them `videos`
+// of two or more the videos' buttons, All videos and one for each of V1 up
+// to that many, between the sound and sync; they leave together, after sync.
 inline TransportBarLayout transportBarLayout(
     float width, float height, float scale, bool volumeOpen, bool singleVideo = false,
     const BarMetrics& metrics = {}, bool showTimeline = true, bool severalVideos = false,
-    float capsuleCentreX = -1.0F) {
+    float capsuleCentreX = -1.0F, std::size_t videos = 0) {
+    if (!severalVideos) videos = 0;
     if (severalVideos && !showTimeline) {
-        return capsuleBarLayout(width, height, scale, volumeOpen, metrics, capsuleCentreX);
+        return capsuleBarLayout(width, height, scale, volumeOpen, metrics, capsuleCentreX, videos);
     }
     TransportBarLayout result;
     const float s = std::max(0.0F, scale);
@@ -241,28 +296,33 @@ inline TransportBarLayout transportBarLayout(
                    width, std::min(metrics.bandHeight * s, height)};
     result.row = {0.0F, height - bottomMargin - rowHeight, width, rowHeight};
 
-    std::array<float, kBarItemCount> widths{
-        metrics.button, metrics.button, metrics.button, metrics.button, metrics.timeWidth, 0.0F,
-        metrics.button, 0.0F, metrics.button, metrics.button,
-        metrics.button};
+    std::array<float, kBarItemCount> widths{};
+    widths.fill(metrics.button);
+    const auto index = [](BarItem item) { return static_cast<std::size_t>(item); };
+    widths[index(BarItem::Time)] = metrics.timeWidth;
+    widths[index(BarItem::Seek)] = 0.0F;
+    widths[index(BarItem::Volume)] = 0.0F;
     for (auto& value : widths) value *= s;
     std::array<bool, kBarItemCount> present{};
     present.fill(true);
-    const auto index = [](BarItem item) { return static_cast<std::size_t>(item); };
     present[index(BarItem::Volume)] = false;
     present[index(BarItem::Previous)] = singleVideo;
     present[index(BarItem::Next)] = singleVideo;
     present[index(BarItem::Subtitles)] = singleVideo;
+    present[index(BarItem::Sync)] = severalVideos;
     present[index(BarItem::Layout)] = severalVideos;
     present[index(BarItem::Time)] = showTimeline;
     present[index(BarItem::Seek)] = showTimeline;
+    const std::size_t soloButtons = videos >= 2 ? std::min(videos, kMaxPanes) : 0;
+    const auto showVideos = [&](bool shown) {
+        present[index(BarItem::AllVideos)] = shown && soloButtons > 0;
+        for (std::size_t position = 0; position < kMaxPanes; ++position) {
+            present[index(soloBarItem(position))] = shown && position < soloButtons;
+        }
+    };
+    showVideos(true);
     const float side = std::min(metrics.side * s, width / 8.0F);
     const float gap = metrics.gap * s;
-    const float scopeHeight = 18.0F * s;
-    const float scopeTop = result.row.y - 24.0F * s;
-    if (scopeTop >= 0.0F && width - 2.0F * side >= 40.0F * s) {
-        result.scopeLabel = {side, scopeTop, std::min(112.0F * s, std::max(0.0F, width - 2.0F * side)), scopeHeight};
-    }
 
     const auto required = [&](float seekWidth) {
         float total = showTimeline ? seekWidth : 0.0F;
@@ -274,12 +334,14 @@ inline TransportBarLayout transportBarLayout(
         }
         return side * 2.0F + total + gap * static_cast<float>(std::max(0, count - 1));
     };
-    constexpr std::array<BarItem, 8> hideOrder{
-        BarItem::Layout, BarItem::Subtitles, BarItem::Stop,
+    // All videos stands for all the videos' buttons, which leave together.
+    constexpr std::array<BarItem, 10> hideOrder{
+        BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Subtitles, BarItem::Stop,
         BarItem::Time, BarItem::Audio, BarItem::Fullscreen, BarItem::Previous, BarItem::Next};
     for (const auto item : hideOrder) {
         if (required(showTimeline ? metrics.seekPreferred * s : 0.0F) <= width) break;
-        present[index(item)] = false;
+        if (item == BarItem::AllVideos) showVideos(false);
+        else present[index(item)] = false;
     }
     if (showTimeline && present[index(BarItem::Play)] &&
         required(metrics.seekMinimumWithPlay * s) > width) {
@@ -482,7 +544,9 @@ inline constexpr std::array<bool, kPaneChipCount> kEveryPaneChip{true, true, tru
 // rail, and under it one row -- on the left its "V2" tag, which opens its
 // menu, its pause and its time; on the right its volume, sound, subtitles,
 // repeat, Solo and close. The tag shows on every pane while the pointer
-// moves, the rest of the strip on the pane under the pointer.
+// moves, the rest of the strip on the pane under the pointer. While the
+// videos share one timeline the bar's rail is theirs: the strip is the row
+// alone, and the bar marks where each video ends.
 struct PaneChromeLayout {
     // The "V2" tag at the left end of the row. The only video has none.
     OverlayRect pill;
@@ -498,7 +562,8 @@ struct PaneChromeLayout {
     // The seek rail's hit band, above the row.
     OverlayRect timeline;
     // The rail and the row: a press there on none of the controls is the
-    // strip's, not the picture's. Only with a rail.
+    // strip's, not the picture's. Only with a rail, or the row of a tagged
+    // video whose rail is the bar's.
     OverlayRect strip;
     // The scrim the strip is drawn on. Not a control.
     OverlayRect band;
@@ -568,6 +633,10 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
         result.strip = {cell.x, result.timeline.y, cell.width, bottom - result.timeline.y};
         const float bandTop = std::max(top, result.timeline.y - metrics.bandRise * s);
         result.band = {cell.x, bandTop, cell.width, bottom - bandTop};
+    } else if (!options.withTimeline && options.withPill) {
+        // One of several on the bar's rail: the row is the strip, on no
+        // scrim -- its ends are capsules of their own, as the bar's "All".
+        result.strip = {cell.x, rowTop, cell.width, bottom - rowTop};
     }
 
     // What the row would hold, left then right, and what each is worth.
@@ -778,6 +847,172 @@ inline OverlayHit overlayHitTest(
         return {OverlayHitKind::Video, index, -1};
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// The sync panel
+
+// What the Sync key opens, standing over it: the seek bars' mode as two
+// segments, Linked and Independent, with a line saying what that means;
+// a row for each video -- its tag, its offset, steps of a second and of a
+// tenth either way, and its repeat; and at its foot a button that sets
+// every offset back to zero, beside a line of help. A card of its own, not
+// a menu: a press on it acts and leaves it open, so a video can be nudged
+// a few times running.
+inline constexpr std::size_t kSyncSteps = 4;
+
+struct SyncPanelRowLayout {
+    // The whole row: the wheel anywhere on it steps the offset.
+    OverlayRect row;
+    OverlayRect tag;
+    OverlayRect value;
+    // -1 s, -0.1 s, +0.1 s, +1 s.
+    std::array<OverlayRect, kSyncSteps> steps{};
+    OverlayRect repeat;
+};
+
+struct SyncPanelLayout {
+    OverlayRect card;
+    OverlayRect title;
+    // The segments' track, and in it Linked and Independent, by SeekMode.
+    OverlayRect track;
+    std::array<OverlayRect, 2> modes{};
+    OverlayRect hint;
+    OverlayRect rule;
+    std::array<SyncPanelRowLayout, kMaxPanes> rows{};
+    std::size_t rowCount{};
+    OverlayRect footRule;
+    OverlayRect reset;
+    OverlayRect footHint;
+};
+
+// 96-DPI metrics of the panel.
+struct SyncPanelMetrics {
+    float width{414.0F};
+    float padding{12.0F};
+    float headerHeight{36.0F};
+    float trackWidth{222.0F};
+    float trackHeight{32.0F};
+    float segmentInset{3.0F};
+    float segmentGap{2.0F};
+    float hintGap{2.0F};
+    float hintHeight{18.0F};
+    float ruleGap{12.0F};
+    float rowsGap{6.0F};
+    float rowHeight{36.0F};
+    float tagWidth{40.0F};
+    float tagHeight{24.0F};
+    float valueWidth{76.0F};
+    float stepWidth{52.0F};
+    float stepHeight{28.0F};
+    float stepGap{4.0F};
+    float repeat{30.0F};
+    float footHeight{30.0F};
+    float resetWidth{168.0F};
+    // Between the card and its key, and the window's edges.
+    float keyGap{6.0F};
+    float edge{8.0F};
+};
+
+// The panel for `rowCount` videos over `key`, kept inside `bounds` -- the
+// window under the caption's strip. Where the room above the key is too
+// short it reaches down over the key rather than leave the top.
+inline SyncPanelLayout syncPanelLayout(const OverlayRect& key, const OverlayRect& bounds, std::size_t rowCount,
+                                       float scale, const SyncPanelMetrics& metrics = {}) {
+    SyncPanelLayout result;
+    const float s = std::max(0.0F, scale);
+    if (!key.visible() || !bounds.visible() || s <= 0.0F) return result;
+    rowCount = std::min(rowCount, kMaxPanes);
+    const float padding = metrics.padding * s;
+    const float width = metrics.width * s;
+    const float headerBottom = padding + metrics.headerHeight * s;
+    const float hintTop = headerBottom + metrics.hintGap * s;
+    const float ruleTop = hintTop + metrics.hintHeight * s + metrics.ruleGap * s;
+    const float hairline = std::max(1.0F, s);
+    const float rowsTop = ruleTop + hairline + metrics.rowsGap * s;
+    const float rowsBottom = rowsTop + metrics.rowHeight * s * static_cast<float>(rowCount);
+    const float footRuleTop = rowsBottom + metrics.rowsGap * s;
+    const float footTop = footRuleTop + hairline + metrics.rowsGap * s;
+    const float height = footTop + metrics.footHeight * s + padding;
+
+    const float edge = metrics.edge * s;
+    const float lowest = bounds.x + edge;
+    const float highest = std::max(lowest, bounds.right() - edge - width);
+    const float x = std::clamp(key.x + key.width * 0.5F - width * 0.5F, lowest, highest);
+    const float y = std::max(bounds.y, key.y - metrics.keyGap * s - height);
+    result.card = {x, y, width, height};
+
+    const float trackWidth = metrics.trackWidth * s;
+    result.track = {x + width - padding - trackWidth, y + padding + (metrics.headerHeight - metrics.trackHeight) * s * 0.5F,
+                    trackWidth, metrics.trackHeight * s};
+    const float inset = metrics.segmentInset * s;
+    const float segment = (trackWidth - inset * 2.0F - metrics.segmentGap * s) * 0.5F;
+    for (std::size_t mode = 0; mode < result.modes.size(); ++mode) {
+        result.modes[mode] = {result.track.x + inset + static_cast<float>(mode) * (segment + metrics.segmentGap * s),
+                              result.track.y + inset, segment, result.track.height - inset * 2.0F};
+    }
+    result.title = {x + padding, y + padding, std::max(0.0F, result.track.x - padding - (x + padding)),
+                    metrics.headerHeight * s};
+    result.hint = {x + padding, y + hintTop, width - padding * 2.0F, metrics.hintHeight * s};
+    // The rules stand a little in from the card's edges.
+    const float ruleInset = padding + 6.0F * s;
+    result.rule = {x + ruleInset, y + ruleTop, width - ruleInset * 2.0F, hairline};
+
+    result.rowCount = rowCount;
+    for (std::size_t index = 0; index < rowCount; ++index) {
+        auto& row = result.rows[index];
+        const float top = y + rowsTop + metrics.rowHeight * s * static_cast<float>(index);
+        const float rowHeight = metrics.rowHeight * s;
+        row.row = {x, top, width, rowHeight};
+        row.tag = {x + padding, top + (rowHeight - metrics.tagHeight * s) * 0.5F, metrics.tagWidth * s,
+                   metrics.tagHeight * s};
+        row.value = {row.tag.right() + 10.0F * s, top, metrics.valueWidth * s, rowHeight};
+        float stepX = row.value.right() + metrics.stepGap * s;
+        for (auto& step : row.steps) {
+            step = {stepX, top + (rowHeight - metrics.stepHeight * s) * 0.5F, metrics.stepWidth * s,
+                    metrics.stepHeight * s};
+            stepX = step.right() + metrics.stepGap * s;
+        }
+        row.repeat = {x + width - padding - metrics.repeat * s, top + (rowHeight - metrics.repeat * s) * 0.5F,
+                      metrics.repeat * s, metrics.repeat * s};
+    }
+    result.footRule = {x + ruleInset, y + footRuleTop, width - ruleInset * 2.0F, hairline};
+    result.reset = {x + padding, y + footTop, metrics.resetWidth * s, metrics.footHeight * s};
+    const float hintLeft = result.reset.right() + padding;
+    result.footHint = {hintLeft, y + footTop, std::max(0.0F, x + width - padding - hintLeft), metrics.footHeight * s};
+    return result;
+}
+
+enum class SyncPanelHitKind { None, Card, Mode, Step, Repeat, Reset };
+
+// What a point of the panel is: off it None; a segment (`part` its
+// SeekMode); a step (`part` 0..3) or the repeat of row `row`; the reset; or
+// the card -- `row` the row it is in, if any, for the wheel.
+struct SyncPanelHit {
+    SyncPanelHitKind kind{SyncPanelHitKind::None};
+    int row{-1};
+    int part{-1};
+    bool operator==(const SyncPanelHit&) const = default;
+};
+
+inline SyncPanelHit syncPanelHitTest(const SyncPanelLayout& layout, float px, float py) {
+    if (!layout.card.contains(px, py)) return {};
+    for (std::size_t mode = 0; mode < layout.modes.size(); ++mode) {
+        if (layout.modes[mode].contains(px, py)) return {SyncPanelHitKind::Mode, -1, static_cast<int>(mode)};
+    }
+    for (std::size_t index = 0; index < layout.rowCount; ++index) {
+        const auto& row = layout.rows[index];
+        if (!row.row.contains(px, py)) continue;
+        for (std::size_t step = 0; step < kSyncSteps; ++step) {
+            if (row.steps[step].contains(px, py)) {
+                return {SyncPanelHitKind::Step, static_cast<int>(index), static_cast<int>(step)};
+            }
+        }
+        if (row.repeat.contains(px, py)) return {SyncPanelHitKind::Repeat, static_cast<int>(index), -1};
+        return {SyncPanelHitKind::Card, static_cast<int>(index), -1};
+    }
+    if (layout.reset.contains(px, py)) return {SyncPanelHitKind::Reset, -1, -1};
+    return {SyncPanelHitKind::Card, -1, -1};
 }
 
 }  // namespace quaddeck

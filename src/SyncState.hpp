@@ -327,6 +327,9 @@ public:
     struct PaneStatus {
         bool loaded{};
         bool errored{};
+        // The last seek generation the source ended with no frame to show
+        // for it, 0 for none (VideoSource::seekEndedWithoutFrame).
+        std::uint64_t seekEndedWithoutFrame{};
         std::uint64_t audioGeneration{};
         AudioState audioState{AudioState::Unknown};
     };
@@ -430,7 +433,13 @@ public:
             // A pane that has failed cannot contribute a frame; waiting for one
             // would hold the other panes hostage.
             if (status[pane].errored) continue;
-            if (!panes_[pane].frameReady) return false;
+            // Nor can one whose seek ended with no frame: nothing from its
+            // target to the end of the stream decodes, and no picture was up
+            // to stand in. Only for the generation recorded here; its sound,
+            // when waited for, still is.
+            const bool frameless = panes_[pane].generation != 0 &&
+                                   status[pane].seekEndedWithoutFrame == panes_[pane].generation;
+            if (!panes_[pane].frameReady && !frameless) return false;
             if (panes_[pane].audioWait) {
                 // Audio state is meaningful only for the seek that established
                 // this barrier. A terminal or primed result from an older seek

@@ -1,14 +1,15 @@
 #pragma once
 
-// The settings sheet: a column of rows that slides in over the right edge
-// of the video. This header is the row model, the geometry and the hit test,
+// The sheet: a column of rows that slides in over the right edge of the
+// video, and the settings window, which is the same column in a window of
+// its own. This header is the row model, the geometry and the hit test,
 // all independent of the native window. App fills the rows from its state each frame
-// (AppPanel.cpp) and Overlay paints them. The normal settings are split
-// over tabs (SettingsTab): a strip under the header that stays put while
-// the rows of the chosen tab scroll beneath it. A page's leading rows can
-// stay put the same way (PanelRow::pinned): the browsers' title, way
-// around and view. The header switches between the settings and the
-// Emby browser (SheetFace), which share the sheet.
+// (AppPanel.cpp, AppSettingsWindow.cpp) and Overlay paints them. The
+// settings are split over tabs (SettingsTab): a column down the window's
+// left, one tab a line under its title, beside the chosen tab's rows. A
+// page's leading rows can stay put while the rest scroll (PanelRow::pinned):
+// the browsers' title, way around and view. The sheet itself has one face
+// (SheetFace), the Emby browser.
 
 #include "OverlayLayout.hpp"
 #include "TextField.hpp"
@@ -26,13 +27,19 @@ namespace quaddeck {
 // Tiles is one line of the browser's grid: pictures with titles under them.
 // TextField is a one-line box typed into where it is drawn: the browser's
 // search, the Emby sign-in's server, user and password.
-enum class PanelRowKind { Header, Note, Toggle, Choice, Slider, Buttons, Item, Tiles, MediaDetail, TextField, CompactItem };
+// Shortcut is one action of the Keys tab: its name, and at the right a box
+// for each of its keys (`options`, empty for a free one); `selected` is the
+// box waiting for a key press, and `on` says its keys are not the defaults.
+// Equalizer is a graphic equalizer: an upright slider per band side by
+// side, each with its value over it and its caption under it.
+enum class PanelRowKind { Header, Note, Toggle, Choice, Slider, Buttons, Item, Tiles, MediaDetail, TextField, CompactItem,
+                          Shortcut, Equalizer };
 
-// The pages of the normal settings sheet, in the order of its tab strip.
-// Emby is not one: the browser is the other face of the sheet, reached by
-// the header's switch, and its account lives there.
-enum class SettingsTab { Playback, Audio, Subtitles, Picture, General };
-inline constexpr int kSettingsTabCount = 5;
+// The pages of the settings window, in the order of its tabs. Emby
+// is not one: the browser is a face of the sheet, reached by the header's
+// switch, and its account lives there.
+enum class SettingsTab { Playback, Audio, Subtitles, Picture, Video, General, Keys };
+inline constexpr int kSettingsTabCount = 7;
 
 inline const wchar_t* settingsTabName(SettingsTab tab) {
     switch (tab) {
@@ -40,20 +47,37 @@ inline const wchar_t* settingsTabName(SettingsTab tab) {
     case SettingsTab::Audio: return L"Audio";
     case SettingsTab::Subtitles: return L"Subtitles";
     case SettingsTab::Picture: return L"Picture";
+    case SettingsTab::Video: return L"Video";
     case SettingsTab::General: return L"General";
+    case SettingsTab::Keys: return L"Keys";
     }
     return L"";
 }
 
-// The faces of the sheet, which the header's switches lead between: the
-// settings with their tabs, the Emby browser (or the F6 folder list in its
-// place). A switch is captioned with the face
-// it leads to; the last switch stands beside the close glyph.
-enum class SheetFace { Settings, Emby };
+// The icon beside a tab's name: a Segoe Fluent Icons / MDL2 Assets code
+// point, the same in both faces.
+inline wchar_t settingsTabGlyph(SettingsTab tab) {
+    switch (tab) {
+    case SettingsTab::Playback: return L'\xE768';  // Play
+    case SettingsTab::Audio: return L'\xE767';     // Volume
+    case SettingsTab::Subtitles: return L'\xED1E'; // Subtitles
+    case SettingsTab::Picture: return L'\xE8B9';   // Picture
+    case SettingsTab::Video: return L'\xE7F4';     // TVMonitor
+    case SettingsTab::General: return L'\xE713';   // Setting
+    case SettingsTab::Keys: return L'\xE765';      // KeyboardClassic
+    }
+    return L'\0';
+}
+
+// The sheet's face: the Emby browser, or the F6 folder list in its place.
+// The settings are not one: they were the sheet's other face before 1.4.0,
+// and now they are a window of their own, which F5 and the menu bring up.
+// A header switch would be captioned with the face it leads to and stand
+// beside the close glyph.
+enum class SheetFace { Emby };
 
 inline const wchar_t* sheetFaceCaption(SheetFace face) {
     switch (face) {
-    case SheetFace::Settings: return L"\x2039 Settings";
     case SheetFace::Emby: return L"Emby \x203A";
     }
     return L"";
@@ -114,6 +138,9 @@ enum class SettingId {
     EmbyReplaceCancel,
     // The browser's search box; its clear button is the row's Trailing hit.
     EmbySearch,
+    // Under it, on a search opened in a folder: part 0 searches that
+    // folder, part 1 every library.
+    EmbySearchScope,
     // The sign-in page's boxes: `param` 0 the server, 1 the user, 2 the
     // password. Its Sign in button is an EmbyAccount row.
     EmbySignInField,
@@ -124,6 +151,45 @@ enum class SettingId {
     // A person's page: the information row at its top (More / Less).
     EmbyPersonAction,
     EmbyToolbar, EmbyRetry, LocalToolbar, LocalRetry,
+    // The Keys tab: an action's key boxes (`param` is the KeyAction, a hit's
+    // part the box), and the buttons over the list -- Reset all keys, or,
+    // while a box waits for a key, Clear this key, Default keys and Cancel.
+    ShortcutKey,
+    ShortcutCommand,
+    // The Audio tab's own rows (AppAudio.cpp): the output and its speakers,
+    // how loud it may go, every video's delay; the effects; the equalizer,
+    // whose bands are EqualizerBand rows (`param` the band, -1 the preamp);
+    // and a video's track and timing (`param` its place on the screen).
+    AudioDevice,
+    AudioSpeakers,
+    AudioMaxVolume,
+    AudioDelayAll,
+    AudioNormalize,
+    AudioNightMode,
+    AudioChannels,
+    AudioVoice,
+    AudioCrossfeed,
+    AudioWidening,
+    AudioPitch,
+    AudioLanguage,
+    Equalizer,
+    EqualizerPreset,
+    EqualizerBand,
+    PaneAudioTrack,
+    PaneAudioDelay,
+    // The Video tab's rows (AppVideo.cpp): the renderer, the graphics card,
+    // the display fullscreen goes to, the output's depth, deinterlacing, the
+    // scaler, the levels, and the colour controls (`param` the control) with
+    // the button that sets them back.
+    VideoRenderer,
+    VideoAdapter,
+    VideoDisplay,
+    VideoDepth,
+    VideoDeinterlace,
+    VideoScaling,
+    VideoLevels,
+    VideoColor,
+    VideoColorReset,
 };
 
 // One movie/series information surface. Text stays separate from cached
@@ -194,11 +260,38 @@ struct PanelRow {
     // Tiles: options are the titles; one entry per tile in each of these.
     std::vector<std::string> tileKeys;      // picture cache key, empty for none
     std::vector<std::wstring> tileBadges;   // "✓", "▶ 40%", "23:40"
-    std::vector<int> tileParams;            // the item each tile stands for
+    std::vector<int> tileParams;            // the item each tile (or band) stands for
     float tileWidth{220.0F};                // 96-DPI width of one tile
     float tileAspect{16.0F / 9.0F};         // picture width over height
     // Choice: segments on one line, 0 for the sheet's default of three.
     int segmentsPerLine{};
+    // Choice: a drop-down rather than segments, for a long list or long
+    // captions -- the chosen option in a box at the row's right, the list
+    // in a card that opens under it. `value` is what the box says while no
+    // option is chosen.
+    bool dropDown{};
+    // Buttons: a spin box rather than buttons -- `value` in a box at the
+    // row's right, the arrow up over the arrow down at its right end (parts
+    // 0 and 1, named by `options`). `slider01` is where the value stands
+    // between its least and its most: an arrow is dimmed at its end. Its
+    // number is a `Field` hit; while it is typed, `field` holds the digits
+    // and is `focused`, and the box shows them in place of `value`.
+    bool spinBox{};
+    // Equalizer: one band per caption in `options`, `levels` where each
+    // stands from 0 at the bottom to 1 at the top, `levelTexts` its value
+    // over it and `tileParams` what each stands for; the first `apartBands`
+    // stand apart from the rest (a preamp). `on` lights the levels in the
+    // accent, as an equalizer switched on.
+    std::vector<float> levels;
+    std::vector<std::wstring> levelTexts;
+    int apartBands{};
+    // A Choice or Buttons row laid out compact (PanelMetrics::compactControls):
+    // the width of each caption in `options`, of the label and of the value,
+    // in 96-DPI units, as the painter measures them (Overlay::measureCaptions).
+    // A width missing or negative is estimated from its text.
+    std::vector<float> captionWidths;
+    float labelWidth{-1.0F};
+    float valueWidth{-1.0F};
     // Item: this row is the item being played. Tiles: `selected` is the
     // first tile being played (-1 for none); one entry per tile in these too.
     bool current{};
@@ -236,6 +329,11 @@ struct PanelRow {
     float buttonMinWidth{};
     // Buttons: drawn in the accent, the action a form's Enter takes.
     bool primary{};
+    // Buttons, the sheet's: one per caption, a button that switches
+    // something on and off -- a browser toolbar's filter -- lit as a chosen
+    // segment while it is on. The settings window's compact buttons do not
+    // light.
+    std::vector<bool> buttonsOn;
     // Note: in the warning colour -- something went wrong.
     bool alert{};
     // Note only: reserve its complete wrapped text height before laying out
@@ -355,9 +453,10 @@ inline OverlayRect panelWrappedNoteTextBox(const OverlayRect& row, float scale) 
         std::max(0.0F, row.height - (kPanelWrappedNoteTopPad + kPanelWrappedNoteBottomPad) * scale)};
 }
 
-// What a hit on a row means: a Tiles row has one item per tile.
+// What a hit on a row means: a Tiles row has one item per tile, an
+// Equalizer row one per band.
 inline int panelRowParam(const PanelRow& row, int part) {
-    if (row.kind != PanelRowKind::Tiles) return row.param;
+    if (row.kind != PanelRowKind::Tiles && row.kind != PanelRowKind::Equalizer) return row.param;
     if (part < 0 || static_cast<std::size_t>(part) >= row.tileParams.size()) return -1;
     return row.tileParams[static_cast<std::size_t>(part)];
 }
@@ -484,6 +583,19 @@ struct PanelRowGeometry {
     std::vector<OverlayRect> addParts;
     OverlayRect trailing;
     PanelMediaDetailGeometry mediaDetail;
+    // A Choice or Buttons row laid out compact: its label's box and a
+    // Buttons row's value's, beside the controls or on the line above them.
+    bool compact{};
+    OverlayRect label;
+    OverlayRect value;
+};
+
+// A card the settings window's rows stand on (PanelMetrics::cards): its box
+// and the rows on it, `first` up to `end`.
+struct PanelCard {
+    OverlayRect box;
+    std::size_t first{};
+    std::size_t end{};
 };
 
 struct PanelLayout {
@@ -494,12 +606,19 @@ struct PanelLayout {
     // button in their order, the last beside it; empty when the sheet was
     // laid out without any.
     std::vector<OverlayRect> sheetSwitches;
-    // The tab strip under the header, when the sheet has tabs: the strip
-    // and one rectangle per tab. The content starts below it and scrolls
-    // beneath it; both are empty for a sheet without tabs.
-    OverlayRect tabStrip;
+    // The column of tabs down the sheet's left, top to bottom, when it has
+    // tabs: the column, the sheet's title at its top (beside the header,
+    // which with the content and rows takes the rest of the width) and one
+    // rectangle per tab below. All empty for a sheet without tabs.
+    OverlayRect tabColumn;
+    OverlayRect tabTitle;
     std::vector<OverlayRect> tabs;
-    // The band of pinned rows under the header and tab strip, and how
+    // A window's own caption strip across its top (PanelMetrics::
+    // windowCaption), as the player's: the title in `tabTitle` at its left
+    // and `close` square at its right end. Empty for a sheet over the
+    // picture, whose close is in its header.
+    OverlayRect caption;
+    // The band of pinned rows under the header, and how
     // many of the leading rows lie in it; empty and zero when none do, or
     // when they would take more than half of the room below the header.
     OverlayRect pinned;
@@ -509,6 +628,9 @@ struct PanelLayout {
     // when everything fits.
     OverlayRect scrollbar;
     std::vector<PanelRowGeometry> rows;
+    // The cards down the content, scrolled with their rows; empty for a
+    // sheet laid out without them.
+    std::vector<PanelCard> cards;
     float contentHeight{};
     float maxScroll{};
     // The scroll the rows were laid out with, clamped.
@@ -604,21 +726,90 @@ struct PanelMetrics {
     float labelLine{24.0F};
     float segment{34.0F};
     float segmentGap{6.0F};
-    float switchWidth{44.0F};
-    float switchHeight{24.0F};
+    // A switch as wide and tall as a menu's (PanelMenuMetrics).
+    float switchWidth{40.0F};
+    float switchHeight{20.0F};
     float trailingSize{32.0F};
     float bottomPad{24.0F};
     int segmentsPerLine{3};
     float tileGap{12.0F};
     float tileLabel{40.0F};   // two lines of small text under a picture
-    float tabHeight{30.0F};
+    float tabColumnWidth{200.0F};
+    float tabInset{10.0F};    // between the tabs and the column's sides
+    float tabHeight{40.0F};
     float tabGap{4.0F};
-    float tabMinWidth{56.0F}; // narrower than this and the tabs take another line
-    float tabStripPad{8.0F};
+    // The settings window: a caption strip of its own across its top, as
+    // tall as the player's with the same square close at its right end
+    // (CaptionMetrics), its title small at its left; under it the header,
+    // shorter, its first tab level with it.
+    bool windowCaption{};
+    float windowHeaderHeight{48.0F};
+    // The settings window's rows on cards, as Windows' own settings: the
+    // rows between two headers on one card, inset from its sides, and each
+    // header a title over its card. The pinned rows stand on none.
+    bool cards{};
+    float cardPad{16.0F};        // between a card's sides and its rows
+    float cardEdge{4.0F};        // above its first row and under its last
+    float cardGap{12.0F};        // under a card, and above one the content starts with
+    float cardHeaderRow{36.0F};  // a header over a card
+    float cardRadius{8.0F};
     float sheetSwitchWidth{88.0F};
     float textFieldRow{60.0F};
     float textFieldHeight{40.0F};
+    float shortcutRow{40.0F};
+    float shortcutKeyWidth{104.0F};
+    float shortcutKeyHeight{28.0F};
+    // The settings window's Choice and Buttons rows: each segment or button
+    // as wide as its caption, not a share of the row. They stand at the
+    // row's right with the label at its left, as a toggle's switch does,
+    // when all of them fit there; else on lines of their own under the
+    // label, from the left. A Choice row's segments are joined in a track.
+    bool compactControls{};
+    float compactRow{44.0F};
+    float compactTrack{32.0F};
+    float compactInset{3.0F};
+    float compactSegmentGap{2.0F};
+    // As tall as the track, a drop-down's box and a spin box beside them.
+    float compactButton{32.0F};
+    float compactCaptionPad{14.0F};
+    float compactSegmentMinimum{56.0F};
+    float compactButtonMinimum{64.0F};
+    float compactLabelGap{24.0F};
+    float compactValueGap{12.0F};
+    float compactLineGap{6.0F};
+    // A drop-down's box at the row's right: as wide as its widest option
+    // with the padding and the chevron, but no narrower than the minimum
+    // and no wider than its share of the row. The two pads and the chevron
+    // are as wide as a list's tick column, inset and card padding
+    // (PanelMenuMetrics), so the list hung from the box is the box's width.
+    float dropDownHeight{32.0F};
+    float dropDownMinimum{150.0F};
+    float dropDownShare{0.55F};
+    float dropDownPad{12.0F};
+    float dropDownChevron{34.0F};
+    // A spin box's at the row's right, as high as a drop-down's box, its
+    // arrows in a column at its right end.
+    float spinBoxWidth{96.0F};
+    float spinBoxArrows{26.0F};
+    // A graphic equalizer: the line of values over its sliders, the line of
+    // captions under them, and the gap that sets the leading bands apart.
+    float equalizerRow{236.0F};
+    float equalizerValueLine{26.0F};
+    float equalizerCaptionLine{30.0F};
+    float equalizerApartGap{24.0F};
 };
+
+// The width of the column of tabs down a sheet `sheetWidth` wide: what the
+// metrics ask, but never more than half of the sheet.
+inline float panelTabColumnWidth(float sheetWidth, float scale, const PanelMetrics& m = {}) {
+    return std::clamp(m.tabColumnWidth * std::max(0.0F, scale), 0.0F, std::max(0.0F, sheetWidth) * 0.5F);
+}
+
+// How far a row on a card stands in from either side of the content: the
+// card's padding, nothing for a sheet without cards.
+inline float panelCardInset(float scale, const PanelMetrics& m = {}) {
+    return m.cards ? m.cardPad * std::max(0.0F, scale) : 0.0F;
+}
 
 // How many tiles of about `tileWidth` go on one line of a sheet
 // `innerWidth` wide: the count that fits, one more when more than half of
@@ -669,9 +860,181 @@ inline int panelButtonsPerLine(const PanelRow& row, float rowWidth, float scale,
     return std::clamp(static_cast<int>((std::max(0.0F, width) + m.segmentGap * scale) / unit), 1, std::max(1, count));
 }
 
+// A line of text's width before DirectWrite has measured it, in 96-DPI
+// units at `em`: a little over half of it for a Latin letter, the whole of
+// it for a CJK character, so the estimate errs wide.
+inline float panelTextWidthEstimate(const std::wstring& text, float em = 14.0F) {
+    float width = 0.0F;
+    for (const wchar_t c : text) width += (c >= 0x2E80 ? 1.0F : 0.56F) * em;
+    return width;
+}
+
+// A compact Choice or Buttons row (PanelMetrics::compactControls) in a row
+// `innerWidth` wide at `x`, `y`: its height and, given a geometry, its parts,
+// label and value. Every part is its caption's width and the padding either
+// side, no less than the minimum; a Buttons row's value stands just left of
+// its buttons. Beside the label they end at the row's right, one line at the
+// row's own height. Under it, with the value at the label line's right end,
+// they run from its left on one line when they fit there; else they are a
+// grid of cells all as wide as the widest, as many columns as fit and then
+// as few as that many lines allow, so every line but the last is full. A
+// Choice row's segments, on one line or in a grid, share one track.
+inline float panelCompactRow(const PanelRow& row, float x, float y, float innerWidth, float s,
+                             const PanelMetrics& m, PanelRowGeometry* geometry = nullptr) {
+    const bool choice = row.kind == PanelRowKind::Choice;
+    const std::size_t count = row.options.size();
+    // As the sheet's Buttons rows, an empty caption hides its slot only
+    // where the row asks to wrap.
+    const auto shown = [&](std::size_t i) { return choice || row.buttonMinWidth <= 0.0F || !row.options[i].empty(); };
+    const float minimum = (choice ? m.compactSegmentMinimum : m.compactButtonMinimum) * s;
+    const auto partWidth = [&](std::size_t i) {
+        const float caption = i < row.captionWidths.size() && row.captionWidths[i] >= 0.0F
+            ? row.captionWidths[i] : panelTextWidthEstimate(row.options[i]);
+        return std::max(minimum, (caption + 2.0F * m.compactCaptionPad) * s);
+    };
+    const auto textWidth = [](float measured, const std::wstring& text, float em) {
+        if (text.empty()) return 0.0F;
+        return measured >= 0.0F ? measured : panelTextWidthEstimate(text, em);
+    };
+    const float gap = (choice ? m.compactSegmentGap : m.segmentGap) * s;
+    const float inset = choice ? m.compactInset * s : 0.0F;
+    const float partHeight = (choice ? m.compactTrack - 2.0F * m.compactInset : m.compactButton) * s;
+    // Between a grid's lines: a Choice's segments inside their track, a
+    // Buttons row's buttons as far apart as lines of them always were.
+    const float lineGap = choice ? gap : m.compactLineGap * s;
+    int shownCount = 0;
+    float parts = 0.0F;
+    float widest = 0.0F;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!shown(i)) continue;
+        const float width = partWidth(i);
+        parts += (shownCount > 0 ? gap : 0.0F) + width;
+        widest = std::max(widest, width);
+        ++shownCount;
+    }
+    const float controls = shownCount > 0 ? parts + 2.0F * inset : 0.0F;
+    const float label = textWidth(row.labelWidth, row.label, 14.0F) * s;
+    const float value = choice ? 0.0F : textWidth(row.valueWidth, row.value, 12.0F) * s;
+    const float labelSpace = label > 0.0F ? label + m.compactLabelGap * s : 0.0F;
+    const float valueSpace = value > 0.0F ? value + m.compactValueGap * s : 0.0F;
+    const bool beside = labelSpace + valueSpace + controls <= innerWidth;
+    const float room = std::max(0.0F, innerWidth - 2.0F * inset);
+    const bool oneLine = beside || parts <= room;
+    int columns = shownCount;
+    int lines = shownCount > 0 ? 1 : 0;
+    if (!oneLine) {
+        const int fit = std::max(1, static_cast<int>((room + gap) / (widest + gap)));
+        lines = (shownCount + fit - 1) / fit;
+        columns = (shownCount + lines - 1) / lines;
+    }
+    const float block = lines > 0
+        ? 2.0F * inset + static_cast<float>(lines) * partHeight + static_cast<float>(lines - 1) * lineGap : 0.0F;
+
+    float height = 0.0F;
+    float top = 0.0F;
+    float left = x;
+    if (beside) {
+        height = m.compactRow * s;
+        top = (height - block) * 0.5F;
+        left = x + innerWidth - controls;
+    } else {
+        top = label > 0.0F || value > 0.0F ? m.labelLine * s : 6.0F * s;
+        height = top + block + 8.0F * s;
+    }
+    if (!geometry) return height;
+
+    geometry->compact = true;
+    if (beside) {
+        const float valueX = left - valueSpace;
+        geometry->label = {x, y, std::max(0.0F, valueX - (label > 0.0F ? m.compactLabelGap * s : 0.0F) - x), height};
+        if (value > 0.0F) geometry->value = {valueX, y, value, height};
+    } else {
+        geometry->label = {x, y, innerWidth, m.labelLine * s};
+        if (value > 0.0F) geometry->value = geometry->label;
+    }
+    geometry->parts.assign(count, OverlayRect{});
+    int placed = 0;
+    float cursor = 0.0F;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!shown(i)) continue;
+        if (oneLine) {
+            const float width = partWidth(i);
+            geometry->parts[i] = {left + inset + cursor, y + top + inset, width, partHeight};
+            cursor += width + gap;
+        } else {
+            const auto column = static_cast<float>(placed % columns);
+            const auto line = static_cast<float>(placed / columns);
+            geometry->parts[i] = {left + inset + column * (widest + gap), y + top + inset + line * (partHeight + lineGap),
+                                  widest, partHeight};
+        }
+        ++placed;
+    }
+    return height;
+}
+
+// A drop-down Choice row in its box: the label at the left, as a toggle's,
+// and the box at the right, upright in the middle of the row.
+inline void panelDropDownRow(const PanelRow& row, PanelRowGeometry& geometry, float s, const PanelMetrics& m) {
+    float widest = 0.0F;
+    for (std::size_t i = 0; i < row.options.size(); ++i) {
+        widest = std::max(widest, i < row.captionWidths.size() && row.captionWidths[i] >= 0.0F
+            ? row.captionWidths[i] : panelTextWidthEstimate(row.options[i]));
+    }
+    if (row.selected < 0 && !row.value.empty()) {
+        widest = std::max(widest, row.valueWidth >= 0.0F ? row.valueWidth : panelTextWidthEstimate(row.value));
+    }
+    const OverlayRect& box = geometry.row;
+    const float minimum = std::min(box.width, m.dropDownMinimum * s);
+    const float width = std::clamp((widest + 2.0F * m.dropDownPad + m.dropDownChevron) * s, minimum,
+                                   std::max(minimum, box.width * m.dropDownShare));
+    const float height = std::min(m.dropDownHeight * s, box.height);
+    geometry.compact = true;
+    geometry.control = {box.right() - width, box.y + (box.height - height) * 0.5F, width, height};
+    geometry.label = {box.x, box.y, std::max(0.0F, geometry.control.x - m.compactLabelGap * s - box.x), box.height};
+}
+
+// A spin box: the label at the left, as a toggle's, and the box at the
+// right, upright in the middle of the row; its arrows split the column at
+// its right end, the one up over the one down.
+inline void panelSpinBoxRow(PanelRowGeometry& geometry, float s, const PanelMetrics& m) {
+    const OverlayRect& box = geometry.row;
+    const float width = std::min(m.spinBoxWidth * s, box.width);
+    const float height = std::min(m.dropDownHeight * s, box.height);
+    const float arrows = std::min(m.spinBoxArrows * s, width);
+    geometry.compact = true;
+    geometry.control = {box.right() - width, box.y + (box.height - height) * 0.5F, width, height};
+    const float half = std::round(height * 0.5F);
+    geometry.parts = {{geometry.control.right() - arrows, geometry.control.y, arrows, half},
+                      {geometry.control.right() - arrows, geometry.control.y + half, arrows, height - half}};
+    geometry.value = {geometry.control.x, geometry.control.y, width - arrows, height};
+    geometry.label = {box.x, box.y, std::max(0.0F, geometry.control.x - m.compactLabelGap * s - box.x), box.height};
+}
+
+// A graphic equalizer's bands: as many columns as captions across the row,
+// those set apart a gap from the rest, each column's band of travel between
+// the line of values and the line of captions. `control` is that band
+// across the row.
+inline void panelEqualizerRow(const PanelRow& row, PanelRowGeometry& geometry, float s, const PanelMetrics& m) {
+    const OverlayRect& box = geometry.row;
+    const std::size_t count = row.options.size();
+    if (count == 0) return;
+    const bool apart = row.apartBands > 0 && static_cast<std::size_t>(row.apartBands) < count;
+    const float gap = apart ? m.equalizerApartGap * s : 0.0F;
+    const float column = std::max(0.0F, (box.width - gap) / static_cast<float>(count));
+    const float top = box.y + m.equalizerValueLine * s;
+    const float bottom = std::max(top, box.bottom() - m.equalizerCaptionLine * s);
+    geometry.control = {box.x, top, box.width, bottom - top};
+    geometry.parts.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const float x = box.x + static_cast<float>(i) * column +
+                        (apart && i >= static_cast<std::size_t>(row.apartBands) ? gap : 0.0F);
+        geometry.parts.push_back({x, top, column, bottom - top});
+    }
+}
+
 inline float panelRowHeight(const PanelRow& row, float scale, const PanelMetrics& m = {}, float rowWidth = -1.0F) {
     switch (row.kind) {
-    case PanelRowKind::Header: return m.headerRow * scale;
+    case PanelRowKind::Header: return (m.cards ? m.cardHeaderRow : m.headerRow) * scale;
     case PanelRowKind::Note: {
         if (!row.wrapNote) return m.noteRow * scale;
         const float width = rowWidth >= 0.0F ? rowWidth : std::max(0.0F, m.width - 2.0F * m.pad) * scale;
@@ -690,12 +1053,23 @@ inline float panelRowHeight(const PanelRow& row, float scale, const PanelMetrics
     case PanelRowKind::Tiles:
         return (row.tileWidth / std::max(0.1F, row.tileAspect) + m.tileLabel + m.tileGap) * scale;
     case PanelRowKind::Slider: return m.sliderRow * scale;
+    case PanelRowKind::Equalizer: return m.equalizerRow * scale;
     case PanelRowKind::Choice: {
+        if (row.dropDown) return m.compactRow * scale;
+        if (m.compactControls) {
+            return panelCompactRow(row, 0.0F, 0.0F,
+                                   rowWidth >= 0.0F ? rowWidth : std::max(0.0F, m.width - 2.0F * m.pad) * scale, scale, m);
+        }
         const int lines = panelChoiceLines(static_cast<int>(row.options.size()),
                                            row.segmentsPerLine > 0 ? row.segmentsPerLine : m.segmentsPerLine);
         return (m.labelLine + lines * m.segment + std::max(0, lines - 1) * m.segmentGap + 8.0F) * scale;
     }
     case PanelRowKind::Buttons: {
+        if (row.spinBox) return m.compactRow * scale;
+        if (m.compactControls) {
+            return panelCompactRow(row, 0.0F, 0.0F,
+                                   rowWidth >= 0.0F ? rowWidth : std::max(0.0F, m.width - 2.0F * m.pad) * scale, scale, m);
+        }
         const int lines = panelChoiceLines(panelButtonCount(row), panelButtonsPerLine(row, rowWidth, scale, m));
         return ((row.label.empty() ? m.buttonsRow : m.buttonsRow + m.labelLine) +
             std::max(0, lines - 1) * (m.segment + m.segmentGap)) * scale;
@@ -706,6 +1080,7 @@ inline float panelRowHeight(const PanelRow& row, float scale, const PanelMetrics
     case PanelRowKind::TextField:
         // A label stands above a sign-in box; the search box has none.
         return (row.label.empty() ? m.textFieldRow : m.labelLine + m.textFieldHeight + 12.0F) * scale;
+    case PanelRowKind::Shortcut: return m.shortcutRow * scale;
     }
     return 0.0F;
 }
@@ -720,6 +1095,9 @@ inline void panelRowParts(PanelRowGeometry& geometry, const PanelRow& row, float
     geometry.parts.clear();
     geometry.addParts.clear();
     geometry.mediaDetail = {};
+    geometry.compact = false;
+    geometry.label = {};
+    geometry.value = {};
     const float innerX = geometry.row.x;
     const float innerWidth = geometry.row.width;
     const float y = geometry.row.y;
@@ -771,7 +1149,18 @@ inline void panelRowParts(PanelRowGeometry& geometry, const PanelRow& row, float
         }
         break;
     }
+    case PanelRowKind::Equalizer:
+        panelEqualizerRow(row, geometry, s, m);
+        break;
     case PanelRowKind::Choice: {
+        if (row.dropDown) {
+            panelDropDownRow(row, geometry, s, m);
+            break;
+        }
+        if (m.compactControls) {
+            panelCompactRow(row, innerX, y, innerWidth, s, m, &geometry);
+            break;
+        }
         const int count = static_cast<int>(row.options.size());
         const int perLine = std::max(1, row.segmentsPerLine > 0 ? row.segmentsPerLine : m.segmentsPerLine);
         const float gap = m.segmentGap * s;
@@ -807,6 +1196,14 @@ inline void panelRowParts(PanelRowGeometry& geometry, const PanelRow& row, float
         break;
     }
     case PanelRowKind::Buttons: {
+        if (row.spinBox) {
+            panelSpinBoxRow(geometry, s, m);
+            break;
+        }
+        if (m.compactControls) {
+            panelCompactRow(row, innerX, y, innerWidth, s, m, &geometry);
+            break;
+        }
         const int count = panelButtonCount(row);
         if (count > 0) {
             const float gap = m.segmentGap * s;
@@ -822,6 +1219,23 @@ inline void panelRowParts(PanelRowGeometry& geometry, const PanelRow& row, float
                     top + (placed / perLine) * (m.segment + m.segmentGap) * s, buttonWidth, m.segment * s};
                 ++placed;
             }
+        }
+        break;
+    }
+    case PanelRowKind::Shortcut: {
+        // The key boxes side by side at the right end, together no more
+        // than three fifths of the row; the action's name has the rest.
+        const int count = static_cast<int>(row.options.size());
+        if (count <= 0) break;
+        const float gap = m.segmentGap * s;
+        const float keyWidth = std::min(m.shortcutKeyWidth * s,
+            std::max(0.0F, (innerWidth * 0.6F - gap * static_cast<float>(count - 1)) / static_cast<float>(count)));
+        const float keyHeight = std::min(m.shortcutKeyHeight * s, rowHeight);
+        const float top = y + (rowHeight - keyHeight) * 0.5F;
+        for (int i = 0; i < count; ++i) {
+            geometry.parts.push_back({innerX + innerWidth - static_cast<float>(count - i) * keyWidth -
+                                          static_cast<float>(count - 1 - i) * gap,
+                                      top, keyWidth, keyHeight});
         }
         break;
     }
@@ -866,8 +1280,9 @@ inline float panelTextFieldCaretWidth(float scale) { return std::max(1.0F, std::
 // docked, as PotPlayer's playlist -- beside a video.
 // `captionTop` is the window caption's strip: the sheet's column still reaches the
 // top edge, under the window buttons, but its header and rows start below.
-// `tabCount` puts that many tabs in a strip under the header; their
-// captions are App's (settingsTabName) and the rows are the chosen tab's.
+// `tabCount` puts that many tabs in a column down the sheet's left, under
+// its title, and the header and rows beside it; their captions are App's
+// (settingsTabName) and the rows are the chosen tab's.
 // `sheetSwitches` puts that many switches to the sheet's other faces in the
 // header, the last beside the close glyph, each as wide as one switch has
 // always been while the room beside the title allows, else sharing it.
@@ -889,56 +1304,71 @@ inline void settingsPanelLayoutInto(
         layout.rows.clear();
         return;
     }
-    const float headerTop = std::clamp(captionTop, 0.0F, height);
+    // A window's own caption strip, the player's height, over everything.
+    const CaptionMetrics caption{};
+    const float captionHeight = m.windowCaption ? std::min(caption.rowHeight * s, height) : 0.0F;
+    const float headerTop = std::clamp(std::max(captionTop, captionHeight), 0.0F, height);
     const float sheetWidth = sheetWidthOverride > 0.0F
         ? std::min(width, sheetWidthOverride)
         : std::min(m.width * s, std::max(0.0F, width - m.sideGutter * s));
     const float travel = 48.0F * s * (1.0F - std::clamp(slide, 0.0F, 1.0F));
     layout.sheet = {width - sheetWidth + travel, 0.0F, sheetWidth, height};
-    const float headerHeight = std::min(m.headerHeight * s, height - headerTop);
-    layout.header = {layout.sheet.x, headerTop, sheetWidth, headerHeight};
+    // With tabs, their column takes the sheet's left and the header, the
+    // content and the rows the rest.
+    const float tabColumnWidth = tabCount > 0 ? panelTabColumnWidth(sheetWidth, s, m) : 0.0F;
+    const float headerHeight =
+        std::min((m.windowCaption ? m.windowHeaderHeight : m.headerHeight) * s, height - headerTop);
+    layout.header = {layout.sheet.x + tabColumnWidth, headerTop, sheetWidth - tabColumnWidth, headerHeight};
     const float closeSize = std::min(m.closeSize * s, headerHeight);
-    layout.close = {layout.sheet.right() - m.pad * s - closeSize,
-                    headerTop + (headerHeight - closeSize) * 0.5F, closeSize, closeSize};
+    if (m.windowCaption) {
+        // Close square at the strip's right end and the title small at its
+        // left, inset as the player's (captionLayout).
+        layout.caption = {layout.sheet.x, 0.0F, sheetWidth, captionHeight};
+        const float button = std::min(caption.button * s, sheetWidth);
+        layout.close = {layout.sheet.right() - button, 0.0F, button, captionHeight};
+        const float inset = caption.titleInset * s;
+        layout.tabTitle = {layout.sheet.x + inset, 0.0F,
+                           std::max(0.0F, layout.close.x - layout.sheet.x - 2.0F * inset), captionHeight};
+    } else {
+        layout.close = {layout.sheet.right() - m.pad * s - closeSize,
+                        headerTop + (headerHeight - closeSize) * 0.5F, closeSize, closeSize};
+    }
     if (sheetSwitches > 0) {
         const float gap = 8.0F * s;
-        const float room = std::max(0.0F, layout.close.x - gap - layout.sheet.x - m.pad * s);
+        // Beside the close glyph, or at the header's end where the close is
+        // in a window's caption.
+        const float end = m.windowCaption ? layout.header.right() - m.pad * s + gap : layout.close.x;
+        const float room = std::max(0.0F, end - gap - layout.header.x - m.pad * s);
         const float count = static_cast<float>(sheetSwitches);
         const float switchWidth = std::min(m.sheetSwitchWidth * s,
                                            std::max(0.0F, (room - gap * (count - 1.0F)) / count));
         layout.sheetSwitches.reserve(static_cast<std::size_t>(sheetSwitches));
         for (int i = 0; i < sheetSwitches; ++i) {
-            const float right = layout.close.x - gap -
-                                static_cast<float>(sheetSwitches - 1 - i) * (switchWidth + gap);
-            layout.sheetSwitches.push_back({right - switchWidth, layout.close.y, switchWidth, closeSize});
+            const float right = end - gap - static_cast<float>(sheetSwitches - 1 - i) * (switchWidth + gap);
+            layout.sheetSwitches.push_back(
+                {right - switchWidth, headerTop + (headerHeight - closeSize) * 0.5F, switchWidth, closeSize});
         }
     }
     const float pad = m.pad * s;
-    const float innerX = layout.sheet.x + pad;
-    const float innerWidth = std::max(0.0F, sheetWidth - pad * 2.0F);
+    const float innerX = layout.header.x + pad;
+    const float innerWidth = std::max(0.0F, layout.header.width - pad * 2.0F);
     float contentTop = headerTop + headerHeight;
     if (tabCount > 0) {
-        // As many tabs on one line as keep each at least tabMinWidth wide,
-        // sharing the inner width equally; the rest wrap onto further lines.
-        const float gap = m.tabGap * s;
-        const int perLine = std::clamp(
-            static_cast<int>((innerWidth + gap) / std::max(1.0F, m.tabMinWidth * s + gap)), 1, tabCount);
-        const int lines = (tabCount + perLine - 1) / perLine;
+        // The column reaches the sheet's top and bottom; the sheet's title
+        // stands at its top level with the header, and the tabs follow
+        // one a line, as a window's navigation. Under a window's caption,
+        // which has the title, the first tab stands level with the header.
+        layout.tabColumn = {layout.sheet.x, layout.sheet.y, tabColumnWidth, height};
+        if (!m.windowCaption) layout.tabTitle = {layout.sheet.x, headerTop, tabColumnWidth, headerHeight};
+        const float inset = m.tabInset * s;
         const float tabHeight = m.tabHeight * s;
-        const float stripHeight = 2.0F * m.tabStripPad * s + static_cast<float>(lines) * tabHeight +
-                                  static_cast<float>(lines - 1) * gap;
-        layout.tabStrip = {layout.sheet.x, contentTop, sheetWidth,
-                           std::min(stripHeight, std::max(0.0F, height - contentTop))};
-        const float tabWidth = std::max(
-            0.0F, (innerWidth - gap * static_cast<float>(perLine - 1)) / static_cast<float>(perLine));
+        const float gap = m.tabGap * s;
+        const float firstTab = m.windowCaption ? headerTop + (headerHeight - tabHeight) * 0.5F : contentTop + gap;
         layout.tabs.reserve(static_cast<std::size_t>(tabCount));
         for (int i = 0; i < tabCount; ++i) {
-            layout.tabs.push_back({innerX + static_cast<float>(i % perLine) * (tabWidth + gap),
-                                   contentTop + m.tabStripPad * s +
-                                       static_cast<float>(i / perLine) * (tabHeight + gap),
-                                   tabWidth, tabHeight});
+            layout.tabs.push_back({layout.sheet.x + inset, firstTab + static_cast<float>(i) * (tabHeight + gap),
+                                   std::max(0.0F, tabColumnWidth - 2.0F * inset), tabHeight});
         }
-        contentTop += layout.tabStrip.height;
     }
     // The leading pinned rows, unless they would leave the rest less than
     // half of the room: a short window scrolls everything as before.
@@ -950,19 +1380,37 @@ inline void settingsPanelLayoutInto(
     if (pinnedHeight > std::max(0.0F, height - contentTop) * 0.5F) {
         layout.pinnedRows = 0;
     } else if (layout.pinnedRows > 0) {
-        layout.pinned = {layout.sheet.x, contentTop, sheetWidth, pinnedHeight};
+        layout.pinned = {layout.header.x, contentTop, layout.header.width, pinnedHeight};
         contentTop += pinnedHeight;
     }
-    layout.content = {layout.sheet.x, contentTop, sheetWidth, std::max(0.0F, height - contentTop)};
+    layout.content = {layout.header.x, contentTop, layout.header.width, std::max(0.0F, height - contentTop)};
+
+    // With cards, a row of the content but a header stands on one, inset
+    // from its sides; a card opens at the first such row after a header,
+    // or at the content's top, and closes at the next header or the end.
+    const float cardInset = panelCardInset(s, m);
+    const float cardEdge = m.cardEdge * s;
+    const float cardGap = m.cardGap * s;
+    const auto onCard = [&](std::size_t index) {
+        return m.cards && index >= layout.pinnedRows && rows[index].kind != PanelRowKind::Header;
+    };
 
     // Each row's box but its place first, the content's height with them.
     layout.rows.resize(rows.size());
     float total = 0.0F;
+    bool cardOpen = false;
     for (std::size_t index = 0; index < rows.size(); ++index) {
-        const float rowHeight = panelRowHeight(rows[index], s, m, innerWidth);
-        layout.rows[index].row = {innerX, 0.0F, innerWidth, rowHeight};
-        if (index >= layout.pinnedRows) total += rowHeight;
+        const bool card = onCard(index);
+        const float rowWidth = card ? std::max(0.0F, innerWidth - 2.0F * cardInset) : innerWidth;
+        const float rowHeight = panelRowHeight(rows[index], s, m, rowWidth);
+        layout.rows[index].row = {innerX + (card ? cardInset : 0.0F), 0.0F, rowWidth, rowHeight};
+        if (index < layout.pinnedRows) continue;
+        if (card && !cardOpen) total += (index == layout.pinnedRows ? cardGap : 0.0F) + cardEdge;
+        if (!card && cardOpen) total += cardEdge + cardGap;
+        cardOpen = card;
+        total += rowHeight;
     }
+    if (cardOpen) total += cardEdge;
     layout.contentHeight = total + m.bottomPad * s;
     layout.maxScroll = std::max(0.0F, layout.contentHeight - layout.content.height);
     const float clampedScroll = std::clamp(scroll, 0.0F, layout.maxScroll);
@@ -972,13 +1420,33 @@ inline void settingsPanelLayoutInto(
         layout.scrollbar = {layout.sheet.right() - strip, layout.content.y, strip, layout.content.height};
     }
 
-    // Pinned rows go down their band unscrolled, the others down the content.
+    // Pinned rows go down their band unscrolled, the others down the content
+    // and their cards with them.
     float pinnedY = layout.pinned.y;
     float scrolledY = layout.content.y - clampedScroll;
+    cardOpen = false;
+    const auto closeCard = [&](std::size_t end) {
+        PanelCard& open = layout.cards.back();
+        open.end = end;
+        open.box.height = scrolledY + cardEdge - open.box.y;
+    };
     for (std::size_t index = 0; index < rows.size(); ++index) {
         const auto& row = rows[index];
         auto& geometry = layout.rows[index];
         float& cursor = index < layout.pinnedRows ? pinnedY : scrolledY;
+        if (index >= layout.pinnedRows) {
+            const bool card = onCard(index);
+            if (card && !cardOpen) {
+                if (index == layout.pinnedRows) cursor += cardGap;
+                layout.cards.push_back({{innerX, cursor, innerWidth, 0.0F}, index, index});
+                cursor += cardEdge;
+            }
+            if (!card && cardOpen) {
+                closeCard(index);
+                cursor += cardEdge + cardGap;
+            }
+            cardOpen = card;
+        }
         geometry.row.y = cursor;
         cursor += geometry.row.height;
         if (row.kind == PanelRowKind::MediaDetail && layout.mediaDetailRow < 0) {
@@ -991,11 +1459,15 @@ inline void settingsPanelLayoutInto(
         // A bare row: its box alone, whatever the slot held before.
         geometry.control = {};
         geometry.trailing = {};
+        geometry.compact = false;
+        geometry.label = {};
+        geometry.value = {};
         if (!geometry.parts.empty()) geometry.parts.clear();
         if (!geometry.addParts.empty()) geometry.addParts.clear();
         // Only a laid-out information page has a height (or NaN).
         if (!(geometry.mediaDetail.height == 0.0F)) geometry.mediaDetail = {};
     }
+    if (cardOpen) closeCard(rows.size());
 }
 
 inline PanelLayout settingsPanelLayout(
@@ -1020,7 +1492,11 @@ inline std::size_t panelFirstRowReaching(const PanelLayout& layout, float y) {
 
 // Field is a TextField's box, which takes the caret on the press itself;
 // a search box's clear button is Trailing, a click like any other.
-enum class PanelHitKind { None, Outside, Sheet, Close, Toggle, Segment, Button, Slider, Trailing, Item, Tile, Scrollbar, Add, Tab, Switch, Field };
+// DropDown is a drop-down Choice's box, which opens its list. A band of an
+// Equalizer row is a Slider with the band in `part` and its level, from the
+// bottom up, in `fraction`.
+enum class PanelHitKind { None, Outside, Sheet, Close, Toggle, Segment, Button, Slider, Trailing, Item, Tile, Scrollbar, Add, Tab, Switch, Field,
+                          DropDown };
 
 struct PanelHit {
     PanelHitKind kind{PanelHitKind::None};
@@ -1040,12 +1516,12 @@ inline PanelHit settingsPanelHitTest(
     for (std::size_t i = 0; i < layout.sheetSwitches.size(); ++i) {
         if (layout.sheetSwitches[i].contains(px, py)) return {PanelHitKind::Switch, -1, static_cast<int>(i)};
     }
-    // A tab is hit by its index in `part`; the strip around the tabs is
-    // the sheet, so a press there can still drag the content.
+    // A tab is hit by its index in `part`; the column around the tabs is
+    // the sheet.
     for (std::size_t i = 0; i < layout.tabs.size(); ++i) {
         if (layout.tabs[i].contains(px, py)) return {PanelHitKind::Tab, -1, static_cast<int>(i)};
     }
-    if (layout.tabStrip.contains(px, py)) return {PanelHitKind::Sheet};
+    if (layout.tabColumn.contains(px, py)) return {PanelHitKind::Sheet};
     if (layout.scrollbar.visible() && layout.scrollbar.contains(px, py)) return {PanelHitKind::Scrollbar};
     // The pinned band holds the leading rows, the content the others.
     const bool pinned = layout.pinned.contains(px, py);
@@ -1086,7 +1562,19 @@ inline PanelHit settingsPanelHitTest(
                 return {PanelHitKind::Slider, index, -1, railFraction(px, geometry.control, railInset)};
             }
             return {PanelHitKind::Sheet};
+        case PanelRowKind::Equalizer:
+            for (std::size_t part = 0; part < geometry.parts.size(); ++part) {
+                if (geometry.parts[part].contains(px, py)) {
+                    return {PanelHitKind::Slider, index, static_cast<int>(part),
+                            verticalRailFraction(py, geometry.parts[part], railInset)};
+                }
+            }
+            return {PanelHitKind::Sheet};
         case PanelRowKind::Choice:
+            if (rows[i].dropDown) {
+                return geometry.control.contains(px, py) ? PanelHit{PanelHitKind::DropDown, index}
+                                                         : PanelHit{PanelHitKind::Sheet};
+            }
             for (std::size_t part = 0; part < geometry.parts.size(); ++part) {
                 if (geometry.parts[part].contains(px, py)) {
                     return {PanelHitKind::Segment, index, static_cast<int>(part)};
@@ -1095,6 +1583,9 @@ inline PanelHit settingsPanelHitTest(
             return {PanelHitKind::Sheet};
         case PanelRowKind::MediaDetail:
         case PanelRowKind::Buttons:
+        case PanelRowKind::Shortcut:
+            // A spin box's number is typed into, as a text box is.
+            if (rows[i].spinBox && geometry.value.contains(px, py)) return {PanelHitKind::Field, index};
             for (std::size_t part = 0; part < geometry.parts.size(); ++part) {
                 if (geometry.parts[part].contains(px, py)) {
                     return {PanelHitKind::Button, index, static_cast<int>(part)};
@@ -1110,6 +1601,47 @@ inline PanelHit settingsPanelHitTest(
         }
     }
     return {PanelHitKind::Sheet};
+}
+
+// ---------------------------------------------------------------------------
+// The settings window
+
+// What the window manager is told a point of the settings window is. Its
+// sheet fills the window and has no Windows title bar over it: the sides
+// and the bottom keep Windows' own resize frame, a band of `resizeBand`
+// along the top edge sizes it (`corner` how far along that edge a corner
+// reaches), and its caption strip and the header outside its close
+// button move it, as a caption would.
+inline WindowFrameHit settingsWindowFrameHitTest(float px, float py, float width, float resizeBand, float corner,
+                                                 const PanelLayout& layout) {
+    if (px < 0.0F || py < 0.0F || px >= width) return WindowFrameHit::Client;
+    if (py < resizeBand) {
+        if (px < corner) return WindowFrameHit::TopLeft;
+        if (px >= width - corner) return WindowFrameHit::TopRight;
+        return WindowFrameHit::Top;
+    }
+    if (layout.close.contains(px, py)) return WindowFrameHit::Client;
+    if (!layout.caption.contains(px, py) && !layout.header.contains(px, py) && !layout.tabTitle.contains(px, py)) {
+        return WindowFrameHit::Client;
+    }
+    return WindowFrameHit::Caption;
+}
+
+// Where the settings window first stands, in screen pixels: `width` by
+// `height`, centred over the player's window (`player`), as a dialog of
+// its owner's, but not above the bottom of `insideTop` (the player's
+// caption strip, whose buttons it leaves uncovered where the player is tall
+// enough). Kept to the work area, and no larger than it. Later it opens
+// where it was left.
+inline OverlayRect settingsWindowPlacement(const OverlayRect& player, const OverlayRect& workArea, float width,
+                                           float height, float insideTop) {
+    const float w = std::max(0.0F, std::min(width, workArea.width));
+    const float h = std::max(0.0F, std::min(height, workArea.height));
+    float x = player.x + (player.width - w) * 0.5F;
+    float y = std::max(player.y + (player.height - h) * 0.5F, player.y + insideTop);
+    x = std::clamp(x, workArea.x, std::max(workArea.x, workArea.right() - w));
+    y = std::clamp(y, workArea.y, std::max(workArea.y, workArea.bottom() - h));
+    return {x, y, w, h};
 }
 
 }  // namespace quaddeck

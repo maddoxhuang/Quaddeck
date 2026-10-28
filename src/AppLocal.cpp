@@ -100,17 +100,21 @@ std::vector<LocalEntry> App::scanLocalFolder(const std::wstring& directory, std:
     std::error_code code;
     for (std::filesystem::directory_iterator entry(std::filesystem::path(localListingPath(directory)), code), end;
          !code && entry != end; entry.increment(code)) {
+        // An entry that cannot be looked at -- a link whose target is gone
+        // or out of reach, one access to is refused -- is left out, not the
+        // listing, and is looked at once: a link to a share that has gone
+        // away waits out its timeout each time. Only an error of the listing
+        // itself fails it.
+        std::error_code kind;
         if (folders) {
-            // A folder that cannot be looked at is left out, not the listing.
-            std::error_code kind;
             if (entry->is_directory(kind) && !kind) {
                 if (listedFolder(entry->path().wstring(), walking)) folders->push_back(entry->path().wstring());
                 continue;
             }
+            if (kind) continue;
         }
-        const bool regular = entry->is_regular_file(code);
-        if (code) break;
-        if (!regular) continue;
+        const bool regular = entry->is_regular_file(kind);
+        if (kind || !regular) continue;
         const std::wstring extension = entry->path().extension().wstring();
         if (isSubtitleExtension(extension)) {
             subtitles.push_back(entry->path().wstring());
@@ -456,7 +460,7 @@ void App::openLocalList() {
     embyCancelReplacement();
     if (settingsOpen_) rememberSheetScroll();
     localFollowVideo(paths_[embyPlaybackTarget()]);
-    if (!settingsOpen_) toggleSettingsPanel();
+    openSheet();
     embyBrowserOpen_ = true;
     browserSource_ = BrowserSource::Local;
     // Where the list was left, not its top.
@@ -491,8 +495,8 @@ void App::retryLocalList() {
     listLocalFolder(localDirectory_, true);
 }
 
-// Shared with the Emby browser's Folders and All videos, as the view and the
-// sort are: the folder is read again for the other one, from its top.
+// Shared with the Emby browser's All videos, as the view and the sort are:
+// the folder is read again for the other arrangement, from its top.
 void App::localSetFlat(bool flat) {
     if (flat == embyBrowser_.flat) return;
     embyBrowser_.flat = flat;
@@ -501,40 +505,38 @@ void App::localSetFlat(bool flat) {
     listLocalFolder(localDirectory_);
 }
 
-void App::showLocalToolbarMenu(int part) {
+void App::localToolbarAction(int part) {
     if (part < 0 || part > 2) return;
-    PanelMenu menu;
+    // Thumbnails and All videos are buttons of their own and switch at once;
+    // the row saves them (activatePanelRow).
     if (part == 0) {
-        menu.option(1, L"List", embyBrowser_.view == 0).option(2, L"Thumbnails", embyBrowser_.view != 0);
-    } else if (part == 2) {
-        menu.option(1, L"Folders", !embyBrowser_.flat).option(2, L"All videos", embyBrowser_.flat);
-    } else {
-        const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
-        const int selected = std::max(0, localSortChoice(key));
-        for (int choice = 0; choice < kLocalSortCount; ++choice) {
-            menu.option(static_cast<unsigned>(choice + 1), localSortName(choice), choice == selected);
-        }
+        localSetView(embyBrowser_.view == 0 ? 1 : 0);
+        return;
     }
-    openPanelMenu(std::move(menu), SettingId::LocalToolbar, part, -1, [this, part](unsigned command) {
-        if (part == 0 || part == 2) {
-            if (command >= 1 && command <= 2) {
-                if (part == 0) localSetView(static_cast<int>(command - 1));
-                else localSetFlat(command == 2);
-                // The click's own save ran when the menu opened (sortListBy
-                // saves for itself).
-                scheduleAppSettingsSave();
-            }
-        } else if (command >= 1 && command <= kLocalSortCount) {
-            // The checked key chosen again reverses it; Random reshuffles.
+    if (part == 2) {
+        localSetFlat(!embyBrowser_.flat);
+        return;
+    }
+    const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
+    const int selected = std::max(0, localSortChoice(key));
+    PanelMenu menu;
+    for (int choice = 0; choice < kLocalSortCount; ++choice) {
+        menu.option(static_cast<unsigned>(choice + 1), localSortName(choice), choice == selected);
+    }
+    openPanelMenu(std::move(menu), SettingId::LocalToolbar, part, -1, [this](unsigned command) {
+        // The checked key chosen again reverses it; Random reshuffles.
+        // sortListBy saves for itself.
+        if (command >= 1 && command <= kLocalSortCount) {
             sortListBy(static_cast<int>(localSortKey(static_cast<int>(command - 1))));
         }
     });
 }
 
 // A folder has no posters: the shell's thumbnail is a frame of the video,
-// which a portrait tile only letterboxes. The folder's View is List or
-// Thumbnails; the browser's Posters shows as Thumbnails here, and choosing
-// Thumbnails over it leaves the browser's choice alone.
+// which a portrait tile only letterboxes. The folder is a list or
+// thumbnails, the toolbar's Thumbnails switching between them; the
+// browser's Posters shows as thumbnails here and stays the browser's choice
+// until the list is chosen.
 void App::localSetView(int part) {
     if (part == 0) embySetView(0);
     else if (part == 1 && embyBrowser_.view == 0) embySetView(2);
@@ -1330,8 +1332,10 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
         const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
         std::wstring sort = localSortName(std::max(0, localSortChoice(key)));
         if (key != emby::SortKey::Random) sort += embyBrowser_.descending ? L" \x2193" : L" \x2191";
-        row.options = {embyBrowser_.view == 0 ? L"List \x25BE" : L"Thumbnails \x25BE", sort + L" \x25BE",
-                       embyBrowser_.flat ? L"All videos \x25BE" : L"Folders \x25BE"};
+        // Sort opens its drop-down; Thumbnails and All videos switch at once,
+        // lit while they are on, as the Emby browser's filters do.
+        row.options = {L"Thumbnails", sort + L" \x25BE", L"All videos"};
+        row.buttonsOn = {embyBrowser_.view != 0, false, embyBrowser_.flat};
         rows.push_back(std::move(row));
     }
     // The folder, the way around and the view stay under the header while

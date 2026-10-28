@@ -1,7 +1,10 @@
 #pragma once
 
+#include "AudioSettings.hpp"
 #include "Core.hpp"
 #include "EmbyLibraryPrefs.hpp"
+#include "KeyBindings.hpp"
+#include "VideoOutput.hpp"
 
 #include <algorithm>
 #include <array>
@@ -71,12 +74,16 @@ struct AppSettings {
     PlayOrder playOrder{PlayOrder::InOrder};
     bool keyframeSeek{true};
     SubtitleSettings subtitles;
+    AudioSettings audio;
+    VideoOutputSettings video;
+    KeyBindings keys{defaultKeyBindings()};
     StyleState style;
     DecodeMode decode{DecodeMode::Automatic};
     SeekMode seek{SeekMode::Linked};
     bool repeatAll{true};
     unsigned audioMask{1};
     PaneArray<bool> paneRepeat{};
+    // Up to the audio's maxVolume over 100.
     float volume{1.0F};
     bool muted{};
     PaneArray<float> paneVolume{1.0F, 1.0F, 1.0F, 1.0F, 1.0F};
@@ -148,7 +155,33 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
 
 // The settings file version this build writes. A build reads every version up
 // to its own and refuses a newer one, so it must not save over a newer file.
-inline constexpr int kAppSettingsVersion = 15;
+// 17 is 16 with the arrangements' keys among the actions a `shortcut` line
+// may name: a 16 build would refuse such a line as an unknown action, copy
+// the file aside and save its defaults; a newer version leaves it alone.
+// 18 adds the audio lines -- the output, its limits and delay, the effects
+// and the equalizer -- the audio keys among the actions, and a volume that
+// may pass 1.
+// 19 is 18 with the release, last-played and last-updated orders' keys
+// among the actions, for the reason 17 was 16 with the arrangements'.
+// 20 adds the video lines -- the renderer, the graphics card, the display
+// fullscreen goes to, the depth, deinterlacing, the scaler, the levels and
+// the colour controls -- and the colour keys among the actions.
+// 21 is 20 with the Solo keys (each video alone, all videos) among the
+// actions, for the reason 17 was 16 with the arrangements'.
+// 22 adds the browser's favorites filter to the `embybrowser` line.
+inline constexpr int kAppSettingsVersion = 22;
+
+// The keys of the actions whose keys differ from their defaults, as
+// keyBindingsFrom takes them; nothing for keys that are not a table.
+inline std::optional<std::array<std::optional<KeySlots>, kKeyActionCount>> chosenKeys(const KeyBindings& keys) {
+    std::array<std::optional<KeySlots>, kKeyActionCount> chosen{};
+    for (std::size_t action = 0; action < kKeyActionCount; ++action) {
+        if (keyActionCustomized(keys, static_cast<KeyAction>(action))) chosen[action] = keys[action];
+    }
+    const auto table = keyBindingsFrom(chosen);
+    if (!table || *table != keys) return std::nullopt;
+    return chosen;
+}
 
 // The version a settings document names in its first line, or 0 when it
 // names none. Reads only the header, so it answers for a file the full
@@ -162,6 +195,8 @@ inline int appSettingsVersion(std::wistream& input) {
 
 inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
     if (!validateEmbyLibraryPrefs(state.embyLibraries)) return false;
+    const auto keys = chosenKeys(state.keys);
+    if (!keys) return false;
     output << L"QCONFIG " << kAppSettingsVersion << L'\n';
     output << L"playback " << static_cast<int>(state.decode) << L' '
            << static_cast<int>(state.seek) << L' ' << state.repeatAll << L' '
@@ -183,7 +218,7 @@ inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
            << state.rtxVideo.rtxHdr << L'\n';
     const auto browser = clampEmbyBrowserPrefs(state.embyBrowser);
     output << L"embybrowser " << browser.view << L' ' << browser.sort << L' ' << browser.descending
-           << L' ' << browser.unplayed << L' ' << browser.flat << L'\n';
+           << L' ' << browser.unplayed << L' ' << browser.flat << L' ' << browser.favorites << L'\n';
     output << L"playorder " << static_cast<int>(state.playOrder) << L'\n';
     output << L"keyframeseek " << state.keyframeSeek << L'\n';
     const auto subtitles = clampSubtitleSettings(state.subtitles);
@@ -199,6 +234,35 @@ inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
                << std::quoted(utf8ToWideText(library.libraryId)) << L' '
                << static_cast<int>(library.detailsEnabled) << L'\n';
     }
+    // Each chosen action by its id, then its two keys as a virtual-key code
+    // and the modifiers (0 0 for none).
+    output << L"shortcuts " << std::count_if(keys->begin(), keys->end(), [](const auto& slots) {
+        return slots.has_value();
+    }) << L'\n';
+    for (std::size_t action = 0; action < keys->size(); ++action) {
+        if (!(*keys)[action]) continue;
+        output << L"shortcut " << utf8ToWideText(keyActionInfo(static_cast<KeyAction>(action)).id);
+        for (const KeyChord& chord : *(*keys)[action]) output << L' ' << chord.key << L' ' << chord.modifiers;
+        output << L'\n';
+    }
+    const auto audio = clampAudioSettings(state.audio);
+    output << L"audio " << std::quoted(audio.deviceId) << L' ' << std::quoted(audio.deviceName) << L' '
+           << audio.deviceChannels << L' ' << audio.maxVolume << L' ' << audio.delayMs << L' '
+           << audio.pitchCorrection << L' ' << static_cast<int>(audio.language) << L'\n';
+    const auto& effects = audio.effects;
+    output << L"audioeffects " << effects.normalize << L' ' << effects.compression << L' '
+           << static_cast<int>(effects.stereo) << L' ' << effects.crossfeed << L' ' << effects.widening << L' '
+           << effects.voiceEmphasis << L'\n';
+    output << L"equalizer " << effects.equalizer << L' ' << audio.equalizerPreset << L' ' << effects.preamp;
+    for (float band : effects.bands) output << L' ' << band;
+    output << L'\n';
+    const auto video = clampVideoOutputSettings(state.video);
+    output << L"video " << static_cast<int>(video.renderer) << L' ' << std::quoted(video.adapter) << L' '
+           << video.adapterIndex << L' ' << std::quoted(video.display) << L' ' << std::quoted(video.displayName)
+           << L' ' << video.tenBit << L' ' << static_cast<int>(video.deinterlace) << L' '
+           << static_cast<int>(video.scaling) << L' ' << video.limitedRange << L'\n';
+    output << L"videocolor " << video.color.brightness << L' ' << video.color.contrast << L' '
+           << video.color.saturation << L' ' << video.color.hue << L' ' << video.color.gamma << L'\n';
     return writeStyle(output, state.style);
 }
 
@@ -217,6 +281,9 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
     state.embyLibraries = EmbyLibraryPrefs{};
     state.playOrder = PlayOrder::InOrder;
     state.keyframeSeek = true;
+    state.audio = AudioSettings{};
+    state.video = VideoOutputSettings{};
+    state.keys = defaultKeyBindings();
     state.paneRepeat.fill(false);
     state.paneVolume.fill(1.0F);
     state.paneMuted.fill(false);
@@ -262,6 +329,8 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
                            state.embyBrowser.descending >> state.embyBrowser.unplayed >>
                            state.embyBrowser.flat)))
         return false;
+    // Older files predate the favorites filter; the whole list shows.
+    if (version >= 22 && !(input >> state.embyBrowser.favorites)) return false;
     state.embyBrowser = clampEmbyBrowserPrefs(state.embyBrowser);
     // Older files predate the playback order; a single video plays on in order.
     if (version >= 9) {
@@ -316,13 +385,89 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
         if (!validateEmbyLibraryPrefs(libraries)) return false;
         state.embyLibraries = std::move(libraries);
     }
+    // Older files predate chosen keys: every action has its default keys.
+    // An action named twice or not known, a key that cannot be a shortcut
+    // or one key in two places refuses the file.
+    if (version >= 16) {
+        long long count{};
+        if (!(input >> key >> count) || key != L"shortcuts" || count < 0 ||
+            count > static_cast<long long>(kKeyActionCount)) return false;
+        std::array<std::optional<KeySlots>, kKeyActionCount> chosen{};
+        for (long long index = 0; index < count; ++index) {
+            std::wstring id;
+            if (!(input >> key >> id) || key != L"shortcut") return false;
+            const auto action = keyActionNamed(wideToUtf8Text(id));
+            if (!action || chosen[static_cast<std::size_t>(*action)]) return false;
+            KeySlots slots{};
+            for (KeyChord& chord : slots) {
+                if (!(input >> chord.key >> chord.modifiers)) return false;
+            }
+            chosen[static_cast<std::size_t>(*action)] = slots;
+        }
+        const auto keys = keyBindingsFrom(chosen);
+        if (!keys) return false;
+        state.keys = *keys;
+    }
+    // Older files predate the audio choices: Windows' default output in
+    // stereo, up to 100%, in step, no effects.
+    if (version >= 18) {
+        AudioSettings audio;
+        int language{};
+        int stereo{};
+        const auto readText = [&](std::wstring& text) {
+            input >> std::ws;
+            return input.peek() == L'"' && static_cast<bool>(input >> std::quoted(text));
+        };
+        if (!(input >> key) || key != L"audio" || !readText(audio.deviceId) || !readText(audio.deviceName) ||
+            !(input >> audio.deviceChannels >> audio.maxVolume >> audio.delayMs >> audio.pitchCorrection >> language))
+            return false;
+        audio.language = static_cast<AudioLanguage>(language);
+        auto& effects = audio.effects;
+        if (!(input >> key) || key != L"audioeffects" ||
+            !(input >> effects.normalize >> effects.compression >> stereo >> effects.crossfeed >> effects.widening >>
+              effects.voiceEmphasis))
+            return false;
+        effects.stereo = static_cast<AudioStereoMode>(stereo);
+        if (!(input >> key) || key != L"equalizer" ||
+            !(input >> effects.equalizer >> audio.equalizerPreset >> effects.preamp))
+            return false;
+        for (float& band : effects.bands) {
+            if (!(input >> band)) return false;
+        }
+        state.audio = clampAudioSettings(audio);
+    }
+    // Older files predate the video choices: Direct3D 11 on the card that
+    // drives the main display, fullscreen where the window is, 8-bit,
+    // deinterlaced, bilinear, PC levels, the colour as it comes.
+    if (version >= 20) {
+        VideoOutputSettings video;
+        int renderer{};
+        int deinterlace{};
+        int scaling{};
+        const auto readText = [&](std::wstring& text) {
+            input >> std::ws;
+            return input.peek() == L'"' && static_cast<bool>(input >> std::quoted(text));
+        };
+        if (!(input >> key) || key != L"video" || !(input >> renderer) || !readText(video.adapter) ||
+            !(input >> video.adapterIndex) || !readText(video.display) || !readText(video.displayName) ||
+            !(input >> video.tenBit >> deinterlace >> scaling >> video.limitedRange))
+            return false;
+        video.renderer = static_cast<VideoRenderer>(renderer);
+        video.deinterlace = static_cast<VideoDeinterlace>(deinterlace);
+        video.scaling = static_cast<VideoScaling>(scaling);
+        if (!(input >> key) || key != L"videocolor" ||
+            !(input >> video.color.brightness >> video.color.contrast >> video.color.saturation >>
+              video.color.hue >> video.color.gamma))
+            return false;
+        state.video = clampVideoOutputSettings(video);
+    }
     if (!readStyle(input, state.style) || !std::isfinite(state.volume)) return false;
     state.decode = static_cast<DecodeMode>(std::clamp(decode, 0, 2));
     state.seek = static_cast<SeekMode>(std::clamp(seek, 0, 1));
     const unsigned readableMask = version >= 5 ? kAllPaneMask : 0x0FU;
     state.audioMask = version >= 2 ? (audioValue & readableMask)
                                    : (1U << std::min(audioValue, 3U));
-    state.volume = std::clamp(state.volume, 0.0F, 1.0F);
+    state.volume = std::clamp(state.volume, 0.0F, static_cast<float>(state.audio.maxVolume) / 100.0F);
     state.windowWidth = std::clamp(state.windowWidth, 640, 10000);
     state.windowHeight = std::clamp(state.windowHeight, 400, 10000);
     state.windowX = std::clamp(state.windowX, -50000, 50000);

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <memory>
 #include <mutex>
@@ -67,6 +68,10 @@ struct HardwareVideoFrame {
     double duration{};
     int width{};
     int height{};
+    // How wide each of those pixels is shown against its height: 1 for
+    // square ones, 64/45 for a 16:9 PAL DVD stored at 720x576. A software
+    // frame is scaled alike in both directions, so it holds for its BGRA.
+    double pixelAspect{1.0};
     std::uint64_t serial{};
     std::uint64_t seekGeneration{};
     bool exactSeekFrame{};
@@ -109,6 +114,10 @@ struct SourceOptions {
     // asked on the decoder's thread the moment the container's streams are
     // known; it must hold what it needs by value.
     std::function<int(const std::vector<SubtitleTrackInfo>&)> chooseSubtitle;
+    // The language the sound starts in when the container has a track in
+    // it ("ja", "zh"), ahead of the track the owner asked for; empty leaves
+    // the choice to that request and then to FFmpeg.
+    std::string audioLanguage;
 };
 
 // One audio stream of the container, as the menu lists it.
@@ -118,6 +127,8 @@ struct AudioTrackInfo {
     std::string title;
     std::string codec;
     int channels{};
+    bool isDefault{};
+    bool commentary{};
 };
 
 struct AudioChunk {
@@ -128,6 +139,10 @@ struct AudioChunk {
     // voices across VideoSource replacement, so a source-local counter would
     // eventually collide with a generation already invalidated by flush().
     std::uint64_t generation{};
+    // Source seconds each frame stands for, times the sample rate: above 1
+    // when the decoder stretched the sound to keep its pitch at a faster
+    // speed, 1 when the voice is to speed it up itself.
+    double tempo{1.0};
     std::vector<float> samples;
 
     // The latest generation allocated by any VideoSource in this process.
@@ -219,12 +234,24 @@ public:
     double duration() const { return duration_.load(); }
     int videoWidth() const { return videoWidth_.load(); }
     int videoHeight() const { return videoHeight_.load(); }
+    // The picture's shape on screen, its width over its height: at open the
+    // stored size with the container's or the stream's pixel aspect, then
+    // the frame last handed out, by its own decoded size and pixel aspect,
+    // since a broadcast may change either as it plays. It is never the size
+    // read at open with a later frame's ratio: videoWidth() and videoHeight()
+    // stay what they were at open. Zero until a video is open.
+    float videoDisplayAspect() const { return videoDisplayAspect_.load(); }
     bool audioStreamKnown() const { return audioStreamAvailability_.load() != 0; }
     bool hasAudioStream() const { return audioStreamAvailability_.load() > 0; }
     AudioDecodeStatus audioDecodeStatus() const;
     bool exactSeekReady(std::uint64_t generation) const {
         return generation != 0 && exactSeekReadyGeneration_.load() >= generation;
     }
+    // The last seek this source ended with no frame to show for it, 0 for
+    // none: nothing from its target to the end of the stream decodes, and no
+    // picture was up to stand in. A seek barrier has no frame to wait for
+    // from that generation.
+    std::uint64_t seekEndedWithoutFrame() const { return seekEndedWithoutFrame_.load(); }
     std::uint64_t videoFramesDecoded() const { return videoFramesDecoded_.load(); }
     // Queue occupancy separates a decoder that cannot keep up from one that is
     // being held back: a queue sitting empty means the renderer is starved,
@@ -244,6 +271,19 @@ public:
     // next seek, so follow it with requestAudioSeek.
     void setAudioTrack(int streamIndex) { requestedAudioStream_.store(streamIndex); }
     int requestedAudioTrack() const { return requestedAudioStream_.load(); }
+    // The layout the sound is mixed to for the voices: its channel count and
+    // Windows' speaker mask for them. Read when a generation starts, so a
+    // change goes with the seek that follows it.
+    void setAudioOutputLayout(unsigned channels, unsigned mask) {
+        audioOutputLayout_.store(static_cast<std::uint64_t>(channels) << 32U | mask);
+    }
+    // How much later than its picture the sound plays, negative for earlier.
+    // Each sample is stamped that much later, so the sound's clock and the
+    // pane's stay comparable. Read when a generation starts.
+    void setAudioDelay(double seconds) { audioDelay_.store(seconds); }
+    // The speed the sound is stretched to, keeping its pitch; 1 leaves the
+    // speed to the voice. Read when a generation starts.
+    void setAudioTempo(double tempo) { audioTempo_.store(tempo); }
     // The stream the audio worker is actually decoding, -1 before it opens.
     int activeAudioTrack() const { return activeAudioStream_.load(); }
     // The container's subtitle streams, known once the video input is open.
@@ -294,6 +334,57 @@ private:
     bool handleVideoSeek(double seconds, bool showKeyframePreview, bool keyframe, int direction);
     std::uint64_t requestSeekInternal(double seconds, bool showKeyframePreview, bool keyframe, int direction);
     bool decodeVideoPacket(const AVPacket* packet);
+    // Errors a decoder reported for packets it could not use, which its
+    // worker passes over. Each worker keeps its own, touched by it alone.
+    struct DecodeErrors {
+        // In a row since the last frame decoded or the last seek, counted
+        // towards the limit that ends a stream nothing has been decoded
+        // from, and the earliest and the latest stream times they came near
+        // (NaN while unknown).
+        int run{};
+        double runFrom{std::numeric_limits<double>::quiet_NaN()};
+        double runTo{std::numeric_limits<double>::quiet_NaN()};
+        // How much of the stream such a run must cover as well before it
+        // ends the stream, where its times say; none for the picture's.
+        double runSeconds{};
+        // The last one passed over, as logged; empty until there is one.
+        std::string last;
+        // The log line about them, written at most once a second: the ones
+        // held back since the line before, and the stream times the first
+        // and the last of those came near (NaN while unknown).
+        std::uint64_t unlogged{};
+        double unloggedFrom{std::numeric_limits<double>::quiet_NaN()};
+        double unloggedTo{std::numeric_limits<double>::quiet_NaN()};
+        std::chrono::steady_clock::time_point logged{};
+        // A frame decoded, or a seek: the run starts over.
+        void restartRun() {
+            run = 0;
+            runFrom = runTo = std::numeric_limits<double>::quiet_NaN();
+        }
+    };
+    // Takes an error, worded for the log, that a decoder reported with
+    // `result` for a packet at `seconds` (NaN when unknown). Returns the
+    // error to end on: out of memory, or a run of them with no frame decoded
+    // since the decoder was opened, of kDecodeErrorLimit and, for the sound,
+    // covering errors.runSeconds of the stream. Otherwise the error is
+    // logged, or held back for a later line, and the packet passed over.
+    std::optional<std::string> passOverDecodeError(DecodeErrors& errors, std::string error, int result,
+                                                   double seconds, bool frameDecoded) const;
+    // Writes the line about the errors held back since the last one, if
+    // any: at once when `now` (a seek, the end of the stream), otherwise
+    // (a frame decoded) only once a second has passed since that line.
+    void logPassedOverErrors(DecodeErrors& errors, bool now) const;
+    // The video decoder's error for a packet, or for the drain when null.
+    // Returns false, with the source's error set, when the pane cannot go on.
+    bool passOverVideoDecodeError(const char* what, int result, const AVPacket* packet);
+    // Decoding that began at a seek's target, not at the stream's start,
+    // found no frame: `error` says how far it got. Asks for the start to be
+    // decoded, which tells a stream with nothing decodable from one opened
+    // or sought into damage.
+    void wantStartProbe(const std::string& error);
+    bool beginStartProbe();
+    // Ends a seek the end of the stream left with no frame of its own.
+    bool endSeekWithHeldFrame();
     // The video worker's: a decoder for each text subtitle stream, and a
     // packet's lines added to its stream's cues.
     void openSubtitleDecoders();
@@ -343,19 +434,41 @@ private:
     std::atomic<double> duration_{0.0};
     std::atomic<int> videoWidth_{0};
     std::atomic<int> videoHeight_{0};
+    std::atomic<float> videoDisplayAspect_{0.0F};
     std::atomic<int> audioStreamAvailability_{0};
     // Seeded with the previous fixed ceiling so frames decoded before the
     // first layout hint arrives are no larger than they used to be.
     std::atomic<int> preferredWidth_{1920};
     std::atomic<int> preferredHeight_{1080};
     std::atomic<std::uint64_t> exactSeekReadyGeneration_{0};
+    std::atomic<std::uint64_t> seekEndedWithoutFrame_{0};
     std::atomic<std::uint64_t> videoFramesDecoded_{0};
     bool actualVideoFrameLogged_{};  // Video worker only; reset before open.
+    DecodeErrors videoDecodeErrors_;  // Video worker only; reset before open.
+    // Video worker only, reset before open. Whether decoding since the last
+    // seek began at the stream's start, where finding no frame means the
+    // stream has none, and not at a target inside damage. The seek last
+    // handled, which a look at the start returns to. That look: asked for,
+    // decoding from the start without showing anything, or done, a frame
+    // having come.
+    bool videoDecodeFromStart_{true};
+    struct VideoSeekRequest {
+        double seconds{};
+        bool showKeyframePreview{};
+        bool keyframe{};
+        int direction{};
+    };
+    VideoSeekRequest lastVideoSeek_;
+    enum class StartProbe { None, Wanted, Running, Found };
+    StartProbe videoStartProbe_{StartProbe::None};
     std::atomic<unsigned> queuedVideoFrames_{0};
     std::atomic<std::uint64_t> videoCapacityWaits_{0};
     std::atomic<std::uint64_t> audioChunksDecoded_{0};
     std::atomic<int> requestedAudioStream_{-1};
     std::atomic<int> activeAudioStream_{-1};
+    std::atomic<std::uint64_t> audioOutputLayout_{std::uint64_t{2} << 32U | 0x3U};
+    std::atomic<double> audioDelay_{0.0};
+    std::atomic<double> audioTempo_{1.0};
     std::atomic<int> shownSubtitleStream_{-1};
     // The video worker's own: a decoder per text subtitle stream.
     struct SubtitleReader {

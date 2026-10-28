@@ -9,7 +9,10 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cwchar>
+#include <iterator>
 
 namespace quaddeck {
 
@@ -21,8 +24,6 @@ namespace {
 constexpr float kChromeFadeMs = 160.0F;
 // Notices fade over their last stretch rather than vanishing.
 constexpr ULONGLONG kNoticeFadeMs = 300;
-// A hot control shows its name after resting on it this long.
-constexpr ULONGLONG kTooltipDelayMs = 600;
 constexpr float kRailInset = 12.0F;
 constexpr float kBarSeekInset = 8.0F;
 constexpr float kVolumeInset = 10.0F;
@@ -31,18 +32,44 @@ constexpr float kPanelSlideMs = 200.0F;
 constexpr float kPanelMenuFadeMs = 110.0F;
 constexpr float kPanelMenuSlide = 6.0F;
 
+// A control's tooltip: its name, then the first key of the action it does
+// as the viewer has the keys (App::withShortcut), then any further words.
 const wchar_t* barItemName(BarItem item) {
     switch (item) {
-    case BarItem::Previous: return L"Previous video  (Page Up)";
-    case BarItem::Next: return L"Next video  (Page Down)";
-    case BarItem::Play: return L"Play / Pause  (Space)";
+    case BarItem::Previous: return L"Previous video";
+    case BarItem::Next: return L"Next video";
+    case BarItem::Play: return L"Play / Pause";
     case BarItem::Stop: return L"Stop";
-    case BarItem::Audio: return L"Mute  (M)";
+    case BarItem::Audio: return L"Mute";
     case BarItem::Volume: return L"Master volume  (mouse wheel)";
-    case BarItem::Subtitles: return L"Subtitles on / off  (Alt+H)  ·  right-click to choose";
+    case BarItem::Subtitles: return L"Subtitles on / off";
+    case BarItem::AllVideos: return L"All videos";
+    case BarItem::SoloV1: return L"Solo V1 / back to grid";
+    case BarItem::SoloV2: return L"Solo V2 / back to grid";
+    case BarItem::SoloV3: return L"Solo V3 / back to grid";
+    case BarItem::SoloV4: return L"Solo V4 / back to grid";
+    case BarItem::SoloV5: return L"Solo V5 / back to grid";
+    case BarItem::Sync: return L"Seek bars, offsets and repeat";
     case BarItem::Layout: return L"Arrangement of the videos";
-    case BarItem::Fullscreen: return L"Fullscreen  (Alt+Enter)";
+    case BarItem::Fullscreen: return L"Fullscreen";
     default: return L"";
+    }
+}
+
+std::optional<KeyAction> barItemKey(BarItem item) {
+    switch (item) {
+    case BarItem::Previous: return KeyAction::PreviousFile;
+    case BarItem::Next: return KeyAction::NextFile;
+    case BarItem::Play: return KeyAction::PlayPause;
+    case BarItem::Audio: return KeyAction::Mute;
+    case BarItem::Subtitles: return KeyAction::SubtitlesToggle;
+    case BarItem::AllVideos: return KeyAction::AllVideos;
+    case BarItem::Fullscreen: return KeyAction::Fullscreen;
+    default:
+        if (const int position = barItemSoloPosition(item); position >= 0) {
+            return soloKeyAction(static_cast<std::size_t>(position));
+        }
+        return std::nullopt;
     }
 }
 
@@ -50,7 +77,7 @@ const wchar_t* captionItemName(CaptionItem item, bool maximized, bool fullscreen
     switch (item) {
     case CaptionItem::Minimize: return L"Minimize";
     case CaptionItem::Maximize:
-        return fullscreen ? L"Exit fullscreen  (Alt+Enter)" : maximized ? L"Restore" : L"Maximize";
+        return fullscreen ? L"Exit fullscreen" : maximized ? L"Restore" : L"Maximize";
     case CaptionItem::Close: return L"Close  (Alt+F4)";
     default: return L"";
     }
@@ -58,15 +85,32 @@ const wchar_t* captionItemName(CaptionItem item, bool maximized, bool fullscreen
 
 const wchar_t* chipName(PaneChip chip) {
     switch (chip) {
-    case PaneChip::Audio: return L"Output this video's audio  (1-5)";
+    case PaneChip::Audio: return L"Output this video's audio";
     case PaneChip::Pause: return L"Pause / resume this video";
     case PaneChip::Solo: return L"Solo this video / back to grid";
     case PaneChip::Repeat: return L"Repeat this video  (Independent mode)";
     case PaneChip::Close: return L"Close this video";
-    case PaneChip::Subtitles: return L"This video's subtitles on / off  (Alt+H)  ·  right-click to choose";
+    case PaneChip::Subtitles: return L"This video's subtitles on / off";
     default: return L"";
     }
 }
+
+constexpr const wchar_t* kRightClickToChoose = L"  \x00B7  right-click to choose";
+
+// An offset as the sync panel reads it: signed, to the hundredth, its minus
+// the steps' own; zero bare.
+std::wstring syncOffsetText(double seconds) {
+    if (std::abs(seconds) < 0.005) return L"0.00 s";
+    wchar_t text[32]{};
+    std::swprintf(text, std::size(text), L"%+.2f s", seconds);
+    std::wstring result = text;
+    if (!result.empty() && result.front() == L'-') result.front() = L'\x2212';
+    return result;
+}
+
+// The sync panel's steps of an offset, and the wheel's a notch.
+constexpr std::array<double, kSyncSteps> kSyncOffsetSteps{-1.0, -0.1, 0.1, 1.0};
+constexpr double kSyncWheelStep = 0.1;
 
 }  // namespace
 
@@ -158,7 +202,9 @@ void App::updateAutoHideControls(POINT cursor) {
     ScreenToClient(window_, &local);
     RECT client{};
     GetClientRect(window_, &client);
-    const bool inside = local.x >= 0 && local.y >= 0 && local.x < client.right && local.y < client.bottom;
+    // Over the settings window the pointer is not on the picture beneath.
+    const bool inside = local.x >= 0 && local.y >= 0 && local.x < client.right && local.y < client.bottom &&
+                        !pointerOverSettingsWindow(cursor);
     // The bar wakes when a moving pointer reaches the bottom strip, and while
     // it is up its whole band keeps it up.
     const int bandHeight = static_cast<int>(std::lround(BarMetrics{}.bandHeight * uiScale_));
@@ -173,7 +219,8 @@ void App::updateAutoHideControls(POINT cursor) {
     const bool onCapsuleSpot = inside && capsuleRevealWanted(barLayout_, static_cast<float>(local.x),
                                                              static_cast<float>(local.y), 8.0F * uiScale_);
     const ULONGLONG now = GetTickCount64();
-    if (panelMenu_) {
+    // An open menu or sync panel holds the bar and the pointer.
+    if (panelMenu_ || syncPanel_) {
         pointerLastMoved_ = controlsLastInteraction_ = now;
         if (cursorHidden_) { ShowCursor(TRUE); cursorHidden_ = false; }
         return;
@@ -229,10 +276,7 @@ float App::paneCoveredBottom(const RectF& cell, bool settled) const {
     if (barLayout_.capsule &&
         (cell.x >= barLayout_.row.right() || cell.x + cell.width <= barLayout_.row.x)) return 0.0F;
     const float clearance = 8.0F * uiScale_;
-    const auto active = activePanes();
-    const bool multiple = std::count(active.begin(), active.end(), true) > 1;
-    const float rowTop = (multiple && barLayout_.scopeLabel.visible()
-        ? std::min(barLayout_.row.y, barLayout_.scopeLabel.y) : barLayout_.row.y) - clearance;
+    const float rowTop = barLayout_.row.y - clearance;
     const float cellBottom = cell.y + cell.height;
     if (cellBottom <= rowTop) return 0.0F;
     return (cellBottom - rowTop) * (settled ? 1.0F : dockProgress_);
@@ -305,7 +349,8 @@ void App::refreshChromeGeometry(const RECT& client) {
     barLayout_ = transportBarLayout(videoAreaWidth(static_cast<float>(client.right)),
                                     static_cast<float>(client.bottom), uiScale_, volumeOpen_,
                                     singleLoadedPane() >= 0, BarMetrics{}, bottomTimelineVisible(),
-                                    severalPanesLoaded(), static_cast<float>(client.right) * 0.5F);
+                                    severalPanesLoaded(), static_cast<float>(client.right) * 0.5F,
+                                    soloButtonCount());
     // Open file is always there; signed out there is no Open Emby beside
     // it: the hint's F6 and the menu still reach the sign-in page.
     emptyHint_ = emptyHintLayout(static_cast<float>(client.right), static_cast<float>(client.bottom), uiScale_,
@@ -337,7 +382,10 @@ void App::refreshChromeGeometry(const RECT& client) {
         // subtitles and pause the bar's. Sound and pause come back while
         // they are off, as a pane silenced or paused beside others is left,
         // so it can be set back here: the bar's play does not resume it.
-        options.withPill = options.withTime = options.withTimeline = !onlyVideo;
+        // Videos that share one timeline seek on the bar's rail, which
+        // marks where each ends; their strips are the row alone.
+        options.withPill = options.withTime = !onlyVideo;
+        options.withTimeline = !onlyVideo && !bottomTimelineVisible();
         options.withVolume = audioPaneEnabled(pane) && !onlyVideo;
         options.volumeOpen = paneVolumeOpen_ == static_cast<int>(pane);
         // The strips keep to their bottom edges under the capsule.
@@ -356,6 +404,7 @@ void App::refreshChromeGeometry(const RECT& client) {
     // Which lays an open menu out; one over the picture follows its button
     // without the sheet too.
     else layoutPanelMenu();
+    layoutSyncPanel();
 }
 
 OverlayHit App::hitTestAt(POINT local) const {
@@ -404,8 +453,11 @@ void App::updateHoverControls(POINT cursor) {
     GetClientRect(videoWindow_, &client);
     const auto active = activePanes();
     const bool pointerFresh = GetTickCount64() - pointerLastMoved_ < kPointerHideDelayMs;
+    // The settings window over the picture is not the picture: nothing
+    // beneath it lights, and the right edge under it opens no browser.
     const bool pointerInsidePlayer = local.x >= 0 && local.y >= 0 &&
-                                     local.x < client.right && local.y < client.bottom;
+                                     local.x < client.right && local.y < client.bottom &&
+                                     !pointerOverSettingsWindow(cursor);
     const bool playerForeground = GetForegroundWindow() == window_;
     refreshChromeGeometry(client);
 
@@ -444,7 +496,7 @@ void App::updateHoverControls(POINT cursor) {
             eligible, pointerFresh, pointerInsidePlayer, playerForeground, dragging);
     }
 
-    // The settings sheet, when up, takes the pointer before anything under
+    // The sheet, when up, takes the pointer before anything under
     // it; only the caption's strip stands above its column.
     PanelHit panelHit = pointerInsidePlayer && !overCaption ? panelHitAt(local) : PanelHit{};
     // An open menu holds the pointer: nothing under it lights, and the
@@ -453,11 +505,17 @@ void App::updateHoverControls(POINT cursor) {
         panelMenuHover(local);
         panelMenuTick();
     }
+    // So does the sync panel: only its own controls light.
+    if (syncPanel_) {
+        syncPanel_->hot = pointerInsidePlayer ? syncPanelHitTest(syncPanel_->layout, static_cast<float>(local.x),
+                                                                 static_cast<float>(local.y))
+                                              : SyncPanelHit{};
+    }
     if (panelMenu_ && panelMenu_->inSheet) {
         panelHit = panelMenu_->anchorRow >= 0
             ? PanelHit{PanelHitKind::Button, panelMenu_->anchorRow, panelMenu_->part}
             : PanelHit{PanelHitKind::Sheet, -1, -1};
-    } else if (panelMenu_) {
+    } else if (panelMenu_ || syncPanel_) {
         panelHit = sheetTakesPointer() ? PanelHit{PanelHitKind::Sheet, -1, -1} : PanelHit{};
     }
     const bool overSheet = panelHit.kind != PanelHitKind::None && panelHit.kind != PanelHitKind::Outside;
@@ -477,7 +535,8 @@ void App::updateHoverControls(POINT cursor) {
                           (panelMenu_ && !panelMenu_->inSheet && panelMenu_->pane == index);
         paneTimelineWanted_[pane] = paneTimelineRevealWanted(
             active[pane] && controls, pointerFresh, pointerInsidePlayer, playerForeground, held,
-            geometricPane == index, overSheet || overBar || overCaption || panelMenu_.has_value());
+            geometricPane == index,
+            overSheet || overBar || overCaption || panelMenu_.has_value() || syncPanel_.has_value());
     }
     hotPanelKind_ = overSheet ? panelHit.kind : PanelHitKind::None;
     hotPanelRow_ = overSheet ? panelHit.row : -1;
@@ -490,6 +549,7 @@ void App::updateHoverControls(POINT cursor) {
 
     // Hot states. A drag keeps its own target hot regardless of the pointer.
     const OverlayHit hit = panelMenu_ ? panelMenuAnchorHit()
+                         : syncPanel_ ? OverlayHit{OverlayHitKind::BarItem, -1, static_cast<int>(BarItem::Sync)}
                          : pointerInsidePlayer && !overSheet ? hitTestAt(local) : OverlayHit{};
     int hotBar = -1;
     int hotCaption = -1;
@@ -556,7 +616,7 @@ void App::updateHoverControls(POINT cursor) {
     tooltipText_.clear();
     tooltipAnchor_ = {};
     if (controlDrag_ == ControlDrag::None && pressedBarItem_ < 0 && pressedCaptionItem_ < 0 &&
-        !pressedEmptyOpen_ && !pressedEmptyEmby_ && !panelMenu_ && now - hotSince_ >= kTooltipDelayMs) {
+        !pressedEmptyOpen_ && !pressedEmptyEmby_ && !panelMenu_ && !syncPanel_ && now - hotSince_ >= kTooltipDelayMs) {
         if (overSheet) {
             const int row = panelHit.row;
             if (row >= 0 && row < static_cast<int>(panelRows_.size()) &&
@@ -567,16 +627,22 @@ void App::updateHoverControls(POINT cursor) {
         } else if (hotCaption >= 0) {
             tooltipText_ = captionItemName(static_cast<CaptionItem>(hotCaption), window_ && IsZoomed(window_),
                                            fullscreen_);
+            if (fullscreen_ && hotCaption == static_cast<int>(CaptionItem::Maximize)) {
+                tooltipText_ = withShortcut(tooltipText_, KeyAction::Fullscreen);
+            }
             tooltipAnchor_ = captionLayout_.items[static_cast<std::size_t>(hotCaption)];
         } else if (hotEmptyOpen) {
-            tooltipText_ = L"Open video files  (O)";
+            tooltipText_ = withShortcut(L"Open video files", KeyAction::OpenFiles);
             tooltipAnchor_ = emptyHint_.open;
         } else if (hotEmptyEmby) {
-            tooltipText_ = L"Emby browser  (Ctrl+E)";
+            tooltipText_ = withShortcut(L"Emby browser", KeyAction::Emby);
             tooltipAnchor_ = emptyHint_.emby;
         } else if (hotBar >= 0 && hotBar != static_cast<int>(BarItem::Seek) &&
             hotBar != static_cast<int>(BarItem::Time)) {
-            tooltipText_ = barItemName(static_cast<BarItem>(hotBar));
+            const auto item = static_cast<BarItem>(hotBar);
+            tooltipText_ = barItemName(item);
+            if (const auto key = barItemKey(item)) tooltipText_ = withShortcut(tooltipText_, *key);
+            if (item == BarItem::Subtitles) tooltipText_ += kRightClickToChoose;
             if (singleLoadedPane() < 0 && anyPaneLoaded() &&
                 (hotBar == static_cast<int>(BarItem::Play) || hotBar == static_cast<int>(BarItem::Stop) ||
                  hotBar == static_cast<int>(BarItem::Audio) || hotBar == static_cast<int>(BarItem::Volume))) tooltipText_ = L"All panes: " + tooltipText_;
@@ -587,7 +653,19 @@ void App::updateHoverControls(POINT cursor) {
                 ? L"Repeat this video when it ends"
                 : repeatChip && !paneRepeatFlagInForce(paneOrigins(), static_cast<std::size_t>(hotChipPane), seekMode_)
                 ? L"Repeat this video  (not beside F6 or Emby videos)"
+                : repeatChip && linkedBrowserSeekBars()
+                ? L"Repeat with the others once all have ended  (Linked)"
                 : chipName(static_cast<PaneChip>(hotChip));
+            // This video's own audio and Solo keys, by its place on the screen.
+            if (static_cast<PaneChip>(hotChip) == PaneChip::Audio) {
+                const auto position = positionForPane(static_cast<std::size_t>(hotChipPane));
+                tooltipText_ = withShortcut(tooltipText_, audioKeyAction(position));
+            } else if (static_cast<PaneChip>(hotChip) == PaneChip::Solo) {
+                const auto position = positionForPane(static_cast<std::size_t>(hotChipPane));
+                tooltipText_ = withShortcut(tooltipText_, soloKeyAction(position));
+            } else if (static_cast<PaneChip>(hotChip) == PaneChip::Subtitles) {
+                tooltipText_ = withShortcut(tooltipText_, KeyAction::SubtitlesToggle) + kRightClickToChoose;
+            }
             tooltipAnchor_ = paneChrome_[static_cast<std::size_t>(hotChipPane)]
                 .chips[static_cast<std::size_t>(hotChip)];
         } else if (hotPill >= 0) {
@@ -615,6 +693,7 @@ void App::buildOverlayScene() {
     const bool anyLoaded = !emptyHintShown();
     scene.anyLoaded = anyLoaded;
     scene.showEmptyHint = !anyLoaded;
+    if (!anyLoaded) scene.emptyHintKeys = emptyHintKeys();
     scene.emptyHint = emptyHint_;
     // The sheet lies over the buttons, the browser over the whole window.
     scene.emptyButtonsAlpha = 1.0F - settingsAlpha_;
@@ -625,12 +704,12 @@ void App::buildOverlayScene() {
 
     scene.bar = barLayout_;
     scene.barAlpha = dockProgress_;
-    scene.scopeText = bottomTimelineVisible() && severalPanesLoaded() ? L"All · linked" : L"All";
+    scene.scopeText = L"All";
     scene.playing = playbackIntended();
     scene.muted = audio_.muted();
     scene.fullscreen = fullscreen_;
     scene.seekable = duration_ > 0.0;
-    scene.volume01 = std::clamp(audio_.volume(), 0.0F, 1.0F);
+    scene.volume01 = std::clamp(audio_.volume() / maxMasterVolume(), 0.0F, 1.0F);
     scene.volumeOpen = volumeOpen_;
     scene.volumeDragging = controlDrag_ == ControlDrag::Volume;
     const double timeline = clock_.position();
@@ -645,6 +724,25 @@ void App::buildOverlayScene() {
     // One video's own rail, or the one video's, is in its colour.
     const int seekPane = barShown.pane >= 0 ? barShown.pane : singleLoadedPane();
     scene.seekPosition = seekPane >= 0 ? static_cast<int>(positionForPane(static_cast<std::size_t>(seekPane))) : -1;
+    // The rail several videos share marks where each of them ends: on the
+    // master timeline, or in source time where the browser's videos align.
+    scene.syncLinked = severalPanesLoaded() && bottomTimelineVisible();
+    scene.soloPosition = soloPane_ >= 0 && static_cast<std::size_t>(soloPane_) < kMaxPanes &&
+                                 active[static_cast<std::size_t>(soloPane_)]
+        ? static_cast<int>(positionForPane(static_cast<std::size_t>(soloPane_))) : -1;
+    scene.seekEnds.fill(-1.0F);
+    if (scene.syncLinked && scene.seekable) {
+        const bool sourceTimes = linkedBrowserSeekBars();
+        for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
+            if (!sources_[pane] || !sources_[pane]->ready() || sources_[pane]->duration() <= 0.0) continue;
+            const double end = sourceTimes ? sources_[pane]->duration() - browserOffsets_[pane]
+                : timelineDuration(sources_[pane]->duration(), startDelays_[pane], syncAdjustments_[pane],
+                                   playbackRates_[pane]);
+            const double fraction = end / shownDuration;
+            // The longest ends with the rail itself.
+            if (fraction < 0.999) scene.seekEnds[positionForPane(pane)] = static_cast<float>(std::max(0.0, fraction));
+        }
+    }
     scene.seekHot = seekHot_;
     scene.seekDragging = controlDrag_ == ControlDrag::MasterSeek;
     scene.seekHoverX = -1.0F;
@@ -790,20 +888,17 @@ void App::buildOverlayScene() {
 
     OverlayPanelScene& panel = scene.panel;
     panel.alpha = settingsAlpha_;
-    panel.title = embyBrowserOpen_ ? (browserSource_ == BrowserSource::Local ? L"Folder" : L"Emby")
-                  : L"Settings";
+    panel.title = embyBrowserOpen_ ? (browserSource_ == BrowserSource::Local ? L"Folder" : L"Emby") : L"Emby";
     panel.thumbnails = &thumbnails_;
     // App's rows and layout, not a copy: a long list would cost a copy of
     // every row each frame.
     const bool shown = settingsAlpha_ > 0.0F;
     panel.sharedLayout = shown ? &panelLayout_ : nullptr;
     panel.sharedRows = shown ? &panelRows_ : nullptr;
+    // The tabs are the settings window's; the sheet has none.
     panel.tabs.clear();
+    panel.tabGlyphs.clear();
     panel.tab = -1;
-    if (!embyBrowserOpen_) {
-        for (int i = 0; i < kSettingsTabCount; ++i) panel.tabs.emplace_back(settingsTabName(static_cast<SettingsTab>(i)));
-        panel.tab = static_cast<int>(settingsTab_);
-    }
     panel.switchCaptions.clear();
     for (const auto face : sheetSwitches()) panel.switchCaptions.emplace_back(sheetFaceCaption(face));
     panel.hotKind = hotPanelKind_;
@@ -853,20 +948,66 @@ void App::buildOverlayScene() {
     } else {
         menu = {};
     }
+
+    OverlaySyncPanelScene& sync = scene.syncPanel;
+    sync = {};
+    if (syncPanel_) {
+        const auto& open = *syncPanel_;
+        const float t = std::clamp(static_cast<float>(GetTickCount64() - open.openedAt) / kPanelMenuFadeMs, 0.0F, 1.0F);
+        const float eased = 1.0F - (1.0F - t) * (1.0F - t);
+        sync.layout = open.layout;
+        sync.alpha = eased;
+        // It rises out of its key, as a menu above its button comes down.
+        sync.offset = (1.0F - eased) * kPanelMenuSlide * uiScale_;
+        const SeekMode mode = perPaneTimelines() ? browserSeekMode_ : seekMode_;
+        sync.mode = static_cast<int>(mode);
+        sync.hint = mode == SeekMode::Independent ? L"Each video seeks on the rail along its own bottom edge."
+                  : perPaneTimelines() ? L"The bottom rail sets every video to one time."
+                  : L"One rail, at the bottom, moves every video together.";
+        const bool independent = activeSeekMode() == SeekMode::Independent;
+        for (std::size_t index = 0; index < open.layout.rowCount; ++index) {
+            const std::size_t pane = open.panes[index];
+            auto& row = sync.rows[index];
+            row.position = static_cast<int>(positionForPane(pane));
+            row.label = paneLabel(pane);
+            const double offset = paneOffsetSeconds(pane);
+            row.offsetSet = offset != 0.0;
+            row.offset = syncOffsetText(offset);
+            row.repeat = sourceAutoRepeat_[pane];
+            row.repeatInForce = independent && !paneRepeatSavedButIdle(pane) &&
+                                paneRepeatFlagInForce(paneOrigins(), pane, seekMode_);
+        }
+        sync.resetEnabled = anyPaneOffset();
+        sync.resetKey = shortcut(KeyAction::ResetOffsets);
+        sync.footHint = independent ? L"Wheel on a row: \x00B1" L"0.1 s" : L"Repeat needs Independent";
+        sync.hot = open.hot;
+        sync.pressed = open.pressing ? open.pressed : SyncPanelHit{};
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Notices
 
-void App::showNotice(const std::wstring& text) {
+void App::showNotice(const std::wstring& text, ULONGLONG milliseconds) {
     noticeText_ = text;
-    noticeUntil_ = GetTickCount64() + 1500;
+    noticeUntil_ = GetTickCount64() + milliseconds;
 }
 
 void App::expireNotice(ULONGLONG now) {
-    if (!noticeUntil_ || now < noticeUntil_) return;
-    noticeUntil_ = 0;
-    noticeText_.clear();
+    if (noticeUntil_ && now >= noticeUntil_) {
+        noticeUntil_ = 0;
+        noticeText_.clear();
+    }
+    // A build's WARP fallback, once run() has loaded the settings and a
+    // session and queued the launch's files, none of them is left to open
+    // and no notice is up: after the launch's or the rebuild's own notices,
+    // for its whole time.
+    if (warpFallbackNoticeDue_ && noticeText_.empty() && externalOpenReady_ &&
+        std::none_of(externalOpenBatches_.begin(), externalOpenBatches_.end(),
+                     [](const ExternalOpenBatch& batch) { return batch.startup; })) {
+        warpFallbackNoticeDue_ = false;
+        noticeWarpFallback();
+    }
 }
 
 void App::toggleMute() {
@@ -882,6 +1023,31 @@ void App::toggleSolo(int pane) {
     showNotice(soloPane_ >= 0
         ? L"Solo V" + std::to_wstring(positionForPane(static_cast<std::size_t>(pane)) + 1)
         : L"Back to grid");
+}
+
+std::size_t App::soloButtonCount() const {
+    const auto active = activePanes();
+    const auto count = static_cast<std::size_t>(std::count(active.begin(), active.end(), true));
+    return count >= 2 ? count : 0;
+}
+
+void App::soloVideoAt(std::size_t position) {
+    // The loaded videos have the first places (panesByPosition), numbered
+    // as in the grid whatever is alone now.
+    if (position >= soloButtonCount()) return;
+    const int pane = static_cast<int>(paneForPosition(position));
+    if (soloPane_ == pane) {
+        showAllVideos();
+        return;
+    }
+    soloPane_ = pane;
+    showNotice(L"Solo V" + std::to_wstring(position + 1));
+}
+
+void App::showAllVideos() {
+    if (soloPane_ < 0) return;
+    soloPane_ = -1;
+    showNotice(L"Back to grid");
 }
 
 // ---------------------------------------------------------------------------
@@ -901,7 +1067,8 @@ void App::seekFromSourceBar(std::size_t pane, double target) {
     target = std::clamp(target, 0.0, sourceDuration);
 
     if (linkedBrowserSeekBars()) {
-        alignBrowserPanesToTime(target);
+        // This video at that time, the others at it less its offset.
+        alignBrowserPanesToTime(target - browserOffsets_[pane]);
         return;
     }
 
@@ -929,14 +1096,20 @@ App::BarTime App::barTime() const {
         shown.position = 0.0;
         shown.duration = 0.0;
         if (const int reference = linkedBrowserReferencePane(); reference >= 0) {
+            // Its own time less its offset is where it stands among the others,
+            // counted from before its start while it waits.
+            const auto index = static_cast<std::size_t>(reference);
+            const double own = std::min(mappedSourceTime(index, clock_.position()), sources_[index]->duration());
             shown.position = browserSeekAligned_ ? clock_.position()
-                                                 : currentSourceTime(static_cast<std::size_t>(reference));
+                                                 : std::max(0.0, own - browserOffsets_[index]);
+            // The rail runs to where the last of them ends among the others,
+            // each counted from its offset, and the set starts over there.
             shown.duration = 0.0;
             const auto origins = paneOrigins();
             for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
                 if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto ||
                     !sources_[pane] || !sources_[pane]->ready()) continue;
-                shown.duration = std::max(shown.duration, sources_[pane]->duration());
+                shown.duration = std::max(shown.duration, sources_[pane]->duration() - browserOffsets_[pane]);
             }
         }
         if (deviceRecoveryPending_) {
@@ -945,8 +1118,9 @@ App::BarTime App::barTime() const {
             const auto origins = paneOrigins();
             for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
                 if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
-                longest = std::max(longest, sources_[pane] ? sources_[pane]->duration()
-                                                          : deviceRecoverySourceDurations_[pane]);
+                longest = std::max(longest, (sources_[pane] ? sources_[pane]->duration()
+                                                           : deviceRecoverySourceDurations_[pane]) -
+                                                browserOffsets_[pane]);
             }
             shown.duration = longest;
             if (longest <= 0.0) shown.position = 0.0;
@@ -1029,8 +1203,7 @@ void App::updateControlDrag(POINT local) {
     case ControlDrag::Volume: {
         dragFraction_ = verticalRailFraction(static_cast<float>(local.y), barLayout_[BarItem::Volume],
                                              kVolumeInset * uiScale_);
-        audio_.setVolume(dragFraction_);
-        if (dragFraction_ > 0.0F && audio_.muted()) audio_.setMuted(false);
+        setMasterVolume(dragFraction_ * maxMasterVolume());
         break;
     }
     case ControlDrag::PaneVolume:
@@ -1096,7 +1269,7 @@ void App::endControlDrag(bool commit) {
         }
         break;
     case ControlDrag::Volume:
-        showNotice(L"Volume " + std::to_wstring(static_cast<int>(std::lround(dragFraction_ * 100.0F))) + L"%");
+        showNotice(L"Volume " + std::to_wstring(static_cast<int>(std::lround(audio_.volume() * 100.0F))) + L"%");
         scheduleAppSettingsSave();
         break;
     case ControlDrag::PaneVolume:
@@ -1126,10 +1299,136 @@ void App::activateBarItem(BarItem item) {
     case BarItem::Audio: toggleMute(); break;
     // The only video's switch; its menu is on the right button.
     case BarItem::Subtitles: toggleSubtitles(singleLoadedPane()); break;
+    // A video's button shows it alone whatever is shown now, and the grid
+    // again once it is, as its key does.
+    case BarItem::AllVideos: showAllVideos(); break;
+    case BarItem::Sync: toggleSyncPanel(); break;
     case BarItem::Layout: showLayoutMenu(); break;
     case BarItem::Fullscreen: toggleFullscreen(); break;
-    default: break;
+    default:
+        if (const int position = barItemSoloPosition(item); position >= 0) {
+            soloVideoAt(static_cast<std::size_t>(position));
+        }
+        break;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The sync panel
+
+void App::toggleSyncPanel() {
+    if (syncPanel_) {
+        closeSyncPanel();
+        return;
+    }
+    closePanelMenu();
+    syncPanel_.emplace();
+    syncPanel_->openedAt = GetTickCount64();
+    layoutSyncPanel();
+}
+
+void App::closeSyncPanel() {
+    const bool captured = syncPanel_ && syncPanel_->pressing;
+    syncPanel_.reset();
+    if (captured && videoWindow_ && GetCapture() == videoWindow_) ReleaseCapture();
+}
+
+void App::layoutSyncPanel() {
+    if (!syncPanel_) return;
+    // It goes with its key: one video left, the bar narrowed past it.
+    const OverlayRect& key = barLayout_[BarItem::Sync];
+    if (!key.visible()) {
+        closeSyncPanel();
+        return;
+    }
+    auto& open = *syncPanel_;
+    std::size_t rows = 0;
+    for (std::size_t position = 0; position < kMaxPanes; ++position) {
+        const std::size_t pane = paneForPosition(position);
+        if (pane < sources_.size() && sources_[pane]) open.panes[rows++] = pane;
+    }
+    open.layout = syncPanelLayout(key, windowMenuBounds(), rows, uiScale_);
+}
+
+void App::syncPanelPress(POINT local) {
+    if (!syncPanel_) return;
+    const SyncPanelHit hit = syncPanelHitTest(syncPanel_->layout, static_cast<float>(local.x),
+                                              static_cast<float>(local.y));
+    // Anywhere else a press only closes it, as one off a menu does: on its
+    // key too, which would otherwise open it again.
+    if (hit.kind == SyncPanelHitKind::None) {
+        closeSyncPanel();
+        return;
+    }
+    controlsLastInteraction_ = GetTickCount64();
+    syncPanel_->pressed = hit;
+    syncPanel_->pressing = true;
+    if (videoWindow_) SetCapture(videoWindow_);
+}
+
+void App::syncPanelRelease(POINT local) {
+    if (!syncPanel_ || !syncPanel_->pressing) return;
+    const SyncPanelHit pressed = syncPanel_->pressed;
+    syncPanel_->pressing = false;
+    syncPanel_->pressed = {};
+    if (videoWindow_ && GetCapture() == videoWindow_) ReleaseCapture();
+    // The control it was pressed on, let go on.
+    if (!syncPanel_ || pressed.kind == SyncPanelHitKind::Card) return;
+    if (syncPanelHitTest(syncPanel_->layout, static_cast<float>(local.x), static_cast<float>(local.y)) == pressed) {
+        activateSyncPanel(pressed);
+    }
+}
+
+bool App::syncPanelWheel(POINT local, int wheelDelta) {
+    if (!syncPanel_) return false;
+    layoutSyncPanel();
+    if (!syncPanel_) return false;
+    const SyncPanelHit hit = syncPanelHitTest(syncPanel_->layout, static_cast<float>(local.x),
+                                              static_cast<float>(local.y));
+    if (hit.kind == SyncPanelHitKind::None) return false;
+    if (hit.row < 0 || hit.row >= static_cast<int>(syncPanel_->layout.rowCount) || wheelDelta == 0) return true;
+    const std::size_t pane = syncPanel_->panes[static_cast<std::size_t>(hit.row)];
+    if (!sources_[pane]) return true;
+    controlsLastInteraction_ = GetTickCount64();
+    const double notches = static_cast<double>(wheelDelta) / WHEEL_DELTA;
+    double offset = paneOffsetSeconds(pane) + notches * kSyncWheelStep;
+    // Tenths added up drift off zero; zero is zero.
+    if (std::abs(offset) < 0.0005) offset = 0.0;
+    setPaneOffset(pane, offset);
+    updateTitle();
+    scheduleAppSettingsSave();
+    return true;
+}
+
+void App::activateSyncPanel(const SyncPanelHit& hit) {
+    if (!syncPanel_) return;
+    controlsLastInteraction_ = GetTickCount64();
+    const auto& open = *syncPanel_;
+    const bool onRow = hit.row >= 0 && hit.row < static_cast<int>(open.layout.rowCount);
+    const std::size_t pane = onRow ? open.panes[static_cast<std::size_t>(hit.row)] : 0;
+    switch (hit.kind) {
+    case SyncPanelHitKind::Mode:
+        if (hit.part == 0 || hit.part == 1) chooseSeekMode(static_cast<SeekMode>(hit.part));
+        break;
+    case SyncPanelHitKind::Step:
+        if (onRow && sources_[pane] && hit.part >= 0 && hit.part < static_cast<int>(kSyncSteps)) {
+            double offset = paneOffsetSeconds(pane) + kSyncOffsetSteps[static_cast<std::size_t>(hit.part)];
+            if (std::abs(offset) < 0.0005) offset = 0.0;
+            setPaneOffset(pane, offset);
+        }
+        break;
+    case SyncPanelHitKind::Repeat:
+        // The strip's own repeat, with its notice.
+        if (onRow && sources_[pane]) activateChip(pane, PaneChip::Repeat);
+        return;
+    case SyncPanelHitKind::Reset:
+        resetAllOffsets();
+        break;
+    default:
+        return;
+    }
+    updateTitle();
+    scheduleAppSettingsSave();
 }
 
 // The bar's subtitle button's right click: the Subtitles menu, over the
@@ -1171,6 +1470,7 @@ void App::activateChip(std::size_t pane, PaneChip chip) {
         showNotice(L"V" + std::to_wstring(positionForPane(pane) + 1) +
                    (!enabled ? L" repeat off"
                     : paneRepeatSavedButIdle(pane) ? L" repeat saved; not in force beside F6 or Emby videos"
+                    : linkedBrowserSeekBars() ? L" repeats with the others once all have ended"
                     : L" repeats (Independent mode)"));
         break;
     }
@@ -1193,19 +1493,7 @@ std::optional<App::RepeatControl> App::repeatControlAt(POINT local) const {
     // the video beside a docked browser.
     if (sheetTakesPointer()) {
         const PanelHit hit = panelHitAt(local);
-        if (!(embyBrowserDocked() && hit.kind == PanelHitKind::Outside)) {
-            if (hit.kind == PanelHitKind::Scrollbar) return RepeatControl{1, static_cast<int>(hit.kind)};
-            if (hit.row < 0 || hit.row >= static_cast<int>(panelRows_.size())) return std::nullopt;
-            const auto& row = panelRows_[static_cast<std::size_t>(hit.row)];
-            const bool repeats =
-                hit.kind == PanelHitKind::Slider ||
-                (hit.kind == PanelHitKind::Button &&
-                 (row.id == SettingId::PaneOffset || row.id == SettingId::ZoomAll ||
-                  (row.id == SettingId::SubtitlePane && hit.part >= 0 && hit.part <= 2)));
-            if (!repeats) return std::nullopt;
-            return RepeatControl{1, static_cast<int>(hit.kind), static_cast<int>(row.id), hit.part,
-                                 panelRowParam(row, hit.part)};
-        }
+        if (!(embyBrowserDocked() && hit.kind == PanelHitKind::Outside)) return panelRepeatControl(hit, panelRows_);
     }
     const OverlayHit hit = hitTestAt(local);
     switch (hit.kind) {
@@ -1265,6 +1553,15 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (panelMenu_) {
                 menuTookPress_ = true;
                 panelMenuPress(local);
+                return 0;
+            }
+        }
+        // So does the sync panel: on it a control's, elsewhere its closing.
+        if (syncPanel_) {
+            layoutSyncPanel();
+            if (syncPanel_) {
+                menuTookPress_ = true;
+                syncPanelPress(local);
                 return 0;
             }
         }
@@ -1463,6 +1760,10 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             panelMenuRelease(local);
             return 0;
         }
+        if (syncPanel_ && syncPanel_->pressing) {
+            syncPanelRelease(local);
+            return 0;
+        }
         // Read before the click acts: what it opens may stand here next.
         releasedControl_ = repeatControlAt(local);
         const bool sheetPress = panelPressArmed_;
@@ -1578,6 +1879,10 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 panelMenu_->pressing = false;
                 panelMenu_->pressed = -1;
             }
+            if (syncPanel_) {
+                syncPanel_->pressing = false;
+                syncPanel_->pressed = {};
+            }
         }
         return 0;
     case WM_RBUTTONUP: {
@@ -1585,6 +1890,14 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         const POINT local{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         if (panelMenu_) {
             panelMenuRightClick(local);
+            return 0;
+        }
+        // The right button off the sync panel closes it; on it, nothing.
+        if (syncPanel_) {
+            if (syncPanelHitTest(syncPanel_->layout, static_cast<float>(local.x), static_cast<float>(local.y)).kind ==
+                SyncPanelHitKind::None) {
+                closeSyncPanel();
+            }
             return 0;
         }
         if (sheetTakesPointer()) {
@@ -1622,7 +1935,8 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         // The second of two quick clicks is a press for an open drop-down,
         // and after one the first click closed: a Windows menu took that
         // click in its own window, so it was never half a double-click.
-        if (panelMenu_ || menuTookPress_) return handleVideoMessage(WM_LBUTTONDOWN, wParam, lParam);
+        // The sync panel's steps take quick presses one by one, as presses.
+        if (panelMenu_ || syncPanel_ || menuTookPress_) return handleVideoMessage(WM_LBUTTONDOWN, wParam, lParam);
         // The window class asks for double-clicks, so the second of two
         // quick clicks comes here rather than as a press. On the stepper
         // or rail the first one let go on, it is a second click like the

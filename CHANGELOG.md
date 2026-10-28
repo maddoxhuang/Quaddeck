@@ -2,6 +2,157 @@
 
 Public releases start at 1.0.0. See [README.md](README.md) for current usage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation and file-format details.
 
+## 1.4.0 (2026-10-28)
+
+This release moves settings into a window of their own, lets you choose
+keyboard shortcuts, adds audio output, sound and video output settings, and
+fixes crashes and stalls on damaged or unusual media. Settings are now
+`QCONFIG 22`, which 1.3.0 and earlier cannot read, so back up
+`settings.qconfig` before trying this version. Sessions and styles remain
+`QDECK 6` and `QSTYLE 3`.
+
+### Settings and keys
+
+- Open settings in a window of their own with `F5` or **Settings...**,
+  instead of a sheet over the right of the picture. Its tabs form a column
+  down the left with an icon each; the chosen tab's rows scroll beside them.
+  The window belongs to the player: it stays above it, minimises and closes
+  with it and has no taskbar button. It first opens landscape in the middle
+  of the player; drag its caption or the tab's title to move it and its
+  edges to resize it, and it returns where it was left for the rest of the
+  run. `F5`, `Esc`, its close button or `Alt+F4` put it away. Playback keys
+  still reach the player while it has the keyboard.
+- Keep the right-hand sheet for the Emby browser and the F6 folder list
+  only; its **‹ Settings** switch is gone. Signing out of Emby, or a sign-in
+  that expires, closes the browser's sheet.
+- Group each tab's rows on rounded cards, as Windows 11 Settings does, with
+  headings above the cards and hints under the rows they explain. Size
+  choices and buttons to their text and set them at the right of their row;
+  a choice that does not fit wraps into an even grid below its name.
+- Draw the settings window, browser, menus, drop-downs, sync panel, bottom
+  bar and control strips in one palette: the same buttons, chosen segments,
+  40 × 20 switches, boxes, dividers, scrollbars and corners. The settings
+  window has the player's caption strip, with a square close button.
+- Choose keyboard shortcuts on the new **Keys** tab: up to two keys for each
+  action, grouped by Playback, Volume and audio, Files and lists, Subtitles,
+  Arrangement, Picture colour and Window. Click a key box and press the new
+  key, with `Ctrl`, `Alt` or `Shift` if wanted; **Clear this key**, **Default
+  keys** and **Reset all keys to the defaults** undo changes. A key does one
+  thing, so taking it from another action says which one lost it. Windows'
+  own combinations, lone modifiers, lock, input-method and media keys cannot
+  be assigned. Menus and tooltips show the current keys. `Ctrl` is now part
+  of a key: `Ctrl+Space`, `Ctrl+M` and similar no longer act as the key
+  without it.
+- Add default keys for the six arrangements (`Alt+1`–`Alt+6`), for sorting
+  by release date, last played and last updated (`Ctrl+1`, `Ctrl+2`,
+  `Ctrl+3`), and for showing one video alone (`Shift+1`–`Shift+5`) or all
+  videos again (`Shift+0`). A key you had already given to another action
+  stays with it.
+- Turn off the input method outside the Emby search box and the server and
+  user-name fields, so letter shortcuts work while a Chinese or other input
+  method is active, and the Keys tab can take letter keys.
+
+### Multi-video controls
+
+- Add a sync button beside the arrangement button with two or more videos.
+  Its panel switches **Linked** / **Independent** seek bars and has a row for
+  each video: offset steps of 0.1 s and 1 s, the current offset, a repeat
+  switch, and the mouse wheel for 0.1 s steps; **Reset all offsets** (`0`) is
+  at the bottom. Videos keep playing while it is open.
+- Leave the per-video seek bars out in Linked mode and seek with the bottom
+  bar, which marks where each shorter video ends in its colour. A Linked
+  strip is two rounded capsules, and the "All · linked" label is gone.
+- Keep each F6 or Emby video's offset in Linked mode: seeking, the arrow
+  keys and Stop place every video at the shared time plus its own offset,
+  and a negative offset still waits. Changing one video's offset moves only
+  that video. Repeat Linked F6 and Emby videos together: those that end
+  first hold their last frame until the last one ends, then all restart with
+  their offsets.
+- Switch straight from one video shown alone to another with
+  `Shift+1`–`Shift+5`, or with the new **All videos** and **V1**…**V5**
+  buttons in the **All** capsule and the Linked bar; press the same key, or
+  **All videos**, to show every video again.
+- Show each video's place in its list in the window title, for example
+  `Name  (3/48)`, and the number of videos on each Emby browser page.
+
+### Audio
+
+- Choose the audio output under **Audio → Output**, `F5 → Audio` or
+  `Ctrl+Shift+A`. **Windows default** follows Windows' choice; an unplugged
+  device falls back to the default with a notice and is used again when it
+  returns. Every video's sound continues at the picture's position, and the
+  audio engine restarts by itself after an error.
+- Add **Speakers** (Stereo or every speaker of the device), a **Volume can
+  reach** limit from 100% to 200%, a sound delay for every video and for each
+  one (`Shift+,` / `Shift+.` / `Shift+/`, 50 ms steps), **Keep pitch at other
+  speeds** (on by default), and a **Preferred audio language**.
+- Add effects for the whole mix: a 10-band equalizer with preamp, 18 presets
+  and vertical faders; loudness normalisation; night mode; swapped, mono,
+  left-only or right-only channels and voice removal; voice emphasis;
+  headphone crossfeed and stereo widening. `Alt+A` steps the audio track, and
+  `Shift+E`, `Shift+N`, `Shift+D`, `Shift+T`, `Shift+V` and `Shift+A` switch
+  the effects.
+- Rebuild the Audio tab around drop-down lists that open below their box,
+  as Windows combo boxes do, and a spin box for the volume limit.
+- Follow audio timestamps by resampling slightly instead of cutting or
+  repeating samples, which removes the clicks some MKV and MP4 files had.
+  Learn files whose timestamps run at another rate, ignore a single stray
+  timestamp, catch up a lasting shift slowly, and fill a real gap with
+  silence. The log records each correction.
+- Replace the limiter with one that looks 5 ms ahead and lowers the gain
+  smoothly, so loud passages above 100% volume no longer clip.
+- Rebuild the resampler when a track changes channel layout, sample format
+  or rate, such as a broadcast recording switching between 5.1 and 2.0;
+  switching from 5.1 to 2.0 used to crash.
+- Stop the equalizer and loudness normalisation from releasing a stored
+  thump or click when a band or the normaliser is switched back on.
+- Tick a newly chosen audio track at once in the menu of a video that is not
+  being heard.
+
+### Video output
+
+- Add a **Video** tab and a **Video** submenu: the renderer (Direct3D 11,
+  Direct3D 11 with bitblt for older capture tools, or WARP on the CPU), the
+  graphics card, the display used for full screen, 8-bit or 10-bit output,
+  deinterlacing, the scaler for enlarged pictures (Bilinear, Bicubic, Lanczos
+  or Nearest neighbour), PC or TV levels, and brightness, contrast,
+  saturation, hue and gamma. The colour keys follow PotPlayer: `W` / `E`,
+  `Shift+R` / `T`, `Y` / `Shift+U`, `I` / `Shift+O`, and `Q` to reset.
+- Open on WARP when no graphics card can make a device, as in a virtual
+  machine, with only the Microsoft Basic Display Adapter or while a driver
+  is being installed, and say so; a device without video support decodes in
+  software instead of failing.
+- Show anamorphic video at its display aspect ratio, including 16:9 DVDs
+  and 1440 × 1080 HDV, following the container's aspect first and then each
+  frame's.
+- Skip a damaged video or audio packet instead of stopping the video, and
+  continue after a damaged stretch when opening, resuming or seeking into
+  it. The log summarises the decode errors passed over.
+- Draw PotPlayer and MPC shaders whose `main()` reads only `TEXCOORD0` (or
+  another coordinate) correctly instead of as one flat colour; a shader the
+  vertex stage cannot feed is refused with a message naming what it reads.
+
+### Emby and browsing
+
+- Make the browsers' filters toolbar buttons that switch at once:
+  **Unplayed**, **All videos** and **Info pages**, plus **♥ Favorites**,
+  which lists the current page's favorites, including those in subfolders.
+  The F6 list's view is a **Thumbnails** button.
+- Search the current library, folder, series or season when searching from
+  it, with **In *folder*** / **Every library** under the search box.
+- Draw thumbnails of non-square-pixel videos, such as portrait phone videos,
+  in their real shape.
+- List a local folder that contains a broken link, skipping the link.
+- Keep the viewer's audio track, subtitle and delays when videos reopen
+  after a decoder, renderer or graphics-card change.
+- Do not overwrite `settings.qconfig` with defaults when the window could
+  not be created at start.
+
+The new controls have been built and packaged but not yet exercised by hand
+in the running player. Real-media playback, live Emby, input methods,
+physical audio devices, HDR and display-transition acceptance remain
+unverified.
+
 ## 1.3.0 (2026-10-20)
 
 This release organises multi-video controls around each video, draws every

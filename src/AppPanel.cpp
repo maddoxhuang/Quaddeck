@@ -1,6 +1,8 @@
-// App: the settings sheet. Fills the SettingsPanel rows from player state,
-// turns hits on them into the same state changes the popup menu and keys
-// make, and owns the sheet's open/close, scroll and slide.
+// App: the sheet and the settings' rows. Fills the SettingsPanel rows from
+// player state -- the settings tabs' for their window, the sheet's faces'
+// through their own builders -- turns hits on them into the same state
+// changes the popup menu and keys make, and owns the sheet's open/close,
+// scroll and slide.
 
 #include "App.hpp"
 #include "AppInternal.hpp"
@@ -24,10 +26,6 @@ namespace {
 constexpr std::array<float, 4> kVibranceMin{0.0F, 0.2F, 0.0005F, 5.0F};
 constexpr std::array<float, 4> kVibranceMax{3.0F, 1.0F, 0.01F, 80.0F};
 
-std::wstring percent(float value) {
-    return std::to_wstring(static_cast<int>(std::lround(std::clamp(value, 0.0F, 1.0F) * 100.0F))) + L"%";
-}
-
 std::wstring seconds(double value, int precision = 2) {
     std::wostringstream text;
     text << std::showpos << std::fixed << std::setprecision(precision) << value << L" s";
@@ -36,20 +34,11 @@ std::wstring seconds(double value, int precision = 2) {
 
 }  // namespace
 
-void App::toggleSettingsPanel() {
-    // F5 and Settings in the menu always address normal settings, even
-    // when the shared sheet last showed Emby or still shows it now.
-    if (settingsOpen_ && !embyBrowserOpen_) {
-        closeSettingsPanel();
-        return;
-    }
-    if (embyBrowserOpen_) {
-        closeSettingsPanel();
-        embyBrowserOpen_ = false;
-    }
+void App::openSheet() {
+    if (settingsOpen_) return;
+    // The face is chosen by the caller, which sets it right after.
+    embyBrowserOpen_ = false;
     settingsOpen_ = true;
-    restoreSheetScroll();
-    refreshFileTypesStatus();
     controlsLastInteraction_ = GetTickCount64();
     setControlsVisible(true);
 }
@@ -81,9 +70,6 @@ float App::videoAreaWidth(float clientWidth) const {
 }
 
 float& App::sheetScrollSlot() {
-    if (!embyBrowserOpen_) {
-        return settingsTabScroll_[static_cast<std::size_t>(settingsTab_)];
-    }
     if (browserSource_ == BrowserSource::Emby && embyDetails_) return embyDetails_->scroll;
     return browserSource_ == BrowserSource::Local ? localListScroll_ : embyListScroll_;
 }
@@ -92,10 +78,10 @@ void App::rememberSheetScroll() { sheetScrollSlot() = settingsScroll_; }
 
 void App::restoreSheetScroll() { settingsScroll_ = sheetScrollSlot(); }
 
-// The header switches between settings and the Emby browser.
-std::vector<SheetFace> App::sheetSwitches() const {
-    return {embyBrowserOpen_ ? SheetFace::Settings : SheetFace::Emby};
-}
+// The sheet has one face, the browser or the folder list, so its header has
+// no switch; the settings are a window of their own, which F5 and the menu
+// bring up.
+std::vector<SheetFace> App::sheetSwitches() const { return {}; }
 
 void App::switchSheet(int part) {
     if (!settingsOpen_) return;
@@ -104,29 +90,17 @@ void App::switchSheet(int part) {
     showSheetFace(switches[static_cast<std::size_t>(part)]);
 }
 
-// Signed out, the Emby side is the sign-in page, as Ctrl+E. Each face
-// takes the sheet at once, keeping its own scroll.
+// Signed out, the Emby side is the sign-in page, as Ctrl+E.
 void App::showSheetFace(SheetFace face) {
     controlsLastInteraction_ = GetTickCount64();
-    if (face == SheetFace::Emby) {
-        embyOpenBrowser();
-        return;
-    }
-    if (!settingsOpen_) toggleSettingsPanel();
-    embyCancelReplacement();
-    localCancelReplacement();
-    rememberSheetScroll();
-    embyBrowserOpen_ = false;
-    restoreSheetScroll();
+    if (face == SheetFace::Emby) embyOpenBrowser();
 }
 
 void App::selectSettingsTab(SettingsTab tab) {
-    if (!settingsOpen_ || embyBrowserOpen_ || tab == settingsTab_) return;
-    rememberSheetScroll();
+    if (!settingsWindow_.open || tab == settingsTab_) return;
     settingsTab_ = tab;
-    restoreSheetScroll();
     if (tab == SettingsTab::General) refreshFileTypesStatus();
-    controlsLastInteraction_ = GetTickCount64();
+    if (tab == SettingsTab::Video) refreshVideoDevices();
 }
 
 void App::closeSettingsPanel() {
@@ -150,6 +124,14 @@ void App::closeSettingsPanel() {
 
 std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<PanelListRun>* runs) const {
     if (runs) runs->clear();
+    if (embyBrowserOpen_) {
+        return browserSource_ == BrowserSource::Local ? buildLocalRows(clientWidth, runs)
+                                                      : buildEmbyRows(clientWidth, runs);
+    }
+    return buildSettingsTabRows();
+}
+
+std::vector<PanelRow> App::buildSettingsTabRows() const {
     std::vector<PanelRow> rows;
     const auto header = [&](const wchar_t* text) {
         PanelRow row;
@@ -216,10 +198,11 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
         return L"V" + std::to_wstring(position + 1);
     };
 
-    if (embyBrowserOpen_) {
-        return browserSource_ == BrowserSource::Local ? buildLocalRows(clientWidth, runs)
-                                                      : buildEmbyRows(clientWidth, runs);
-    }
+    // A button's caption with the key that does the same, as a menu line has it.
+    const auto captionWithKey = [&](const wchar_t* caption, KeyAction action) {
+        const std::wstring key = shortcut(action);
+        return key.empty() ? std::wstring(caption) : caption + std::wstring(L"  ") + key;
+    };
 
     switch (settingsTab_) {
     case SettingsTab::Playback: {
@@ -246,8 +229,7 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
             const auto pane = paneForPosition(position);
             const bool loaded = sources_[pane] != nullptr;
             if (!loaded) continue;
-            const double offset = effectiveTimelineOffset(
-                startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]);
+            const double offset = paneOffsetSeconds(pane);
             buttons(SettingId::PaneOffset, static_cast<int>(position),
                     positionName(position) + L" offset", {L"−1 s", L"−0.1 s", L"+0.1 s", L"+1 s"},
                     seconds(offset), loaded);
@@ -264,29 +246,17 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
             rows.back().video = static_cast<int>(position);
         }
         note(perPaneTimelines()
-            ? L"F6 and Emby videos repeat on their own; a video opened by hand repeats only among "
-              L"several opened by hand, with Independent seek bars."
+            ? L"F6 and Emby videos repeat on their own, or with Linked seek bars all together once the "
+              L"last has ended; a video opened by hand repeats only among several opened by hand, with "
+              L"Independent seek bars."
             : L"Per-video repeat needs Independent seek bars and several videos.");
         break;
     }
 
-    case SettingsTab::Audio: {
-        slider(SettingId::MasterVolume, -1, L"Master volume", audio_.volume(), percent(audio_.volume()));
-        toggle(SettingId::Mute, -1, L"Mute", audio_.muted());
-        for (std::size_t position = 0; position < kMaxPanes; ++position) {
-            const auto pane = paneForPosition(position);
-            const bool loaded = sources_[pane] != nullptr;
-            if (!loaded) continue;
-            toggle(SettingId::PaneAudio, static_cast<int>(position),
-                   positionName(position) + L" audio output", audioPaneEnabled(pane), loaded);
-            rows.back().video = static_cast<int>(position);
-            slider(SettingId::PaneVolume, static_cast<int>(position),
-                   positionName(position) + L" volume", audio_.paneVolume(pane),
-                   percent(audio_.paneVolume(pane)), loaded, true, audio_.paneMuted(pane));
-            rows.back().video = static_cast<int>(position);
-        }
+    case SettingsTab::Audio:
+        // Its rows are AppAudio.cpp's, beside what they act on.
+        appendAudioSettingsRows(rows);
         break;
-    }
 
     case SettingsTab::Subtitles: {
         {
@@ -390,11 +360,19 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
         toggle(SettingId::SuperResolution, -1, L"NVIDIA RTX Video Super Resolution", rtxVideo_.superResolution);
         toggle(SettingId::RtxHdr, -1, L"NVIDIA RTX Video HDR  (SDR video shown as HDR)", rtxVideo_.rtxHdr);
         note(videoEnhancementNote(rtxVideo_, renderer_.enhancementStatus()));
+        note(L"The renderer, the graphics card, deinterlacing, scaling and the colour controls are on the "
+             L"Video tab.");
         break;
     }
 
+    case SettingsTab::Video:
+        // Its rows are AppVideo.cpp's, beside what they act on.
+        appendVideoSettingsRows(rows);
+        break;
+
     case SettingsTab::General: {
-        toggle(SettingId::PinBar, -1, L"Keep the control bar visible  (U)", controlsPinned_);
+        toggle(SettingId::PinBar, -1, withShortcut(L"Keep the control bar visible", KeyAction::PinBar),
+               controlsPinned_);
         toggle(SettingId::NasCache, -1, L"NAS read-ahead cache for new videos", nasCacheEnabled_);
         {
             std::wostringstream status;
@@ -420,9 +398,14 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
         buttons(SettingId::Style, -1, L"Visual preset  (layout, view, shader; no videos)",
                 {L"Load…", L"Save…"});
         buttons(SettingId::Session, -1, L"Session  (videos, positions, everything)",
-                {L"Open…  Ctrl+O", L"Save…  Ctrl+S"});
+                {captionWithKey(L"Open…", KeyAction::OpenSession),
+                 captionWithKey(L"Save…", KeyAction::SaveSession)});
         break;
     }
+
+    case SettingsTab::Keys:
+        appendKeyRows(rows);
+        break;
     }
     return rows;
 }
@@ -595,8 +578,7 @@ void App::placePanelScrollMarks(const ListRowMarks& marks) {
 void App::refreshPanelGeometry(const RECT& client) {
     const float clientWidth = static_cast<float>(client.right);
     // The browser is the whole window with nothing playing and docked at
-    // the right beside a video; normal settings and the sign-in page keep
-    // their sheet.
+    // the right beside a video; the sign-in page keeps its sheet.
     float sheetWidth = 0.0F;
     if (embyBrowserOpen_ && !embySignInPage()) {
         sheetWidth = embyBrowserDocked() ? embyDockWidth(clientWidth) : clientWidth;
@@ -615,8 +597,8 @@ void App::refreshPanelGeometry(const RECT& client) {
     composePanelRows(std::move(rows), std::move(runs));
     settingsPanelLayoutInto(
         panelLayout_, clientWidth, static_cast<float>(client.bottom), uiScale_,
-        panelRows_, settingsScroll_, settingsAlpha_, PanelMetrics{}, sheetWidth, captionInset(),
-        embyBrowserOpen_ ? 0 : kSettingsTabCount, static_cast<int>(sheetSwitches().size()));
+        panelRows_, settingsScroll_, settingsAlpha_, PanelMetrics{}, sheetWidth, captionInset(), 0,
+        static_cast<int>(sheetSwitches().size()));
     settingsScroll_ = std::clamp(settingsScroll_, 0.0F, panelLayout_.maxScroll);
     panelScrollMarks_.clear();
     if (!panelRuns_.empty()) {
@@ -645,15 +627,21 @@ void App::scrollSettingsPanel(int wheelDelta) {
 
 void App::applyPanelSlider(int rowIndex, float fraction) {
     if (rowIndex < 0 || rowIndex >= static_cast<int>(panelRows_.size())) return;
-    const auto& row = panelRows_[static_cast<std::size_t>(rowIndex)];
+    applyPanelSlider(panelRows_[static_cast<std::size_t>(rowIndex)], fraction);
+}
+
+void App::applyPanelSlider(const PanelRow& row, float fraction, int part) {
     fraction = std::clamp(fraction, 0.0F, 1.0F);
     switch (row.id) {
     case SettingId::MasterVolume:
-        audio_.setVolume(fraction);
-        if (fraction > 0.0F && audio_.muted()) audio_.setMuted(false);
+        setMasterVolume(fraction * maxMasterVolume());
         break;
     case SettingId::PaneVolume:
         if (row.param >= 0) audio_.setPaneVolume(paneForPosition(static_cast<std::size_t>(row.param)), fraction);
+        break;
+    case SettingId::EqualizerBand:
+        // A band of the graphic equalizer, or a slider of its own.
+        setEqualizerGain(panelRowParam(row, part), kEqualizerRange * (2.0F * fraction - 1.0F));
         break;
     case SettingId::Vibrance:
         if (row.param >= 0 && row.param < 4) {
@@ -679,6 +667,14 @@ void App::applyPanelSlider(int rowIndex, float fraction) {
         subtitleSettings_.position = std::round(kSubtitlePositionMaximum * fraction * 100.0F) / 100.0F;
         subtitleSettings_ = clampSubtitleSettings(subtitleSettings_);
         break;
+    case SettingId::VideoColor:
+        // A whole step at a time, 0 in the middle of the rail.
+        if (row.param >= 0 && row.param < kVideoColorControlCount) {
+            const auto control = static_cast<VideoColorControl>(row.param);
+            const int range = videoColorControlRange(control);
+            setVideoColor(control, static_cast<int>(std::lround((2.0F * fraction - 1.0F) * static_cast<float>(range))));
+        }
+        break;
     default:
         break;
     }
@@ -692,6 +688,8 @@ void App::takePointerAndKeysForPanelMenu() {
     pressedPanelId_ = SettingId::None;
     pressedPanelParam_ = -1;
     blurField();
+    // One card over the picture at a time.
+    closeSyncPanel();
 }
 
 void App::openPanelMenu(PanelMenu menu, SettingId id, int part, int param, std::function<void(unsigned)> choose) {
@@ -717,7 +715,7 @@ void App::openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsign
     takePointerAndKeysForPanelMenu();
     OpenPanelMenu open;
     open.menu = std::move(menu);
-    open.anchor ={static_cast<float>(local.x), static_cast<float>(local.y), 0.0F, 0.0F};
+    open.anchor = {static_cast<float>(local.x), static_cast<float>(local.y), 0.0F, 0.0F};
     open.choose = std::move(choose);
     open.openedAt = GetTickCount64();
     open.pointer = local;
@@ -1176,9 +1174,6 @@ void App::activatePanelHit(const PanelHit& hit) {
     case PanelHitKind::Outside:
         closeSettingsPanel();
         return;
-    case PanelHitKind::Tab:
-        if (hit.part >= 0 && hit.part < kSettingsTabCount) selectSettingsTab(static_cast<SettingsTab>(hit.part));
-        return;
     case PanelHitKind::Switch:
         switchSheet(hit.part);
         return;
@@ -1194,7 +1189,12 @@ void App::activatePanelHit(const PanelHit& hit) {
         return;
     }
     if (hit.row < 0 || hit.row >= static_cast<int>(panelRows_.size())) return;
+    // A copy: what the row does can rebuild the rows.
     const PanelRow row = panelRows_[static_cast<std::size_t>(hit.row)];
+    activatePanelRow(row, hit);
+}
+
+void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::optional<KeyCapture> ended) {
     const std::size_t position = row.param >= 0 ? static_cast<std::size_t>(row.param) : 0;
     const std::size_t pane = row.param >= 0 && position < kMaxPanes ? paneForPosition(position) : 0;
     switch (row.id) {
@@ -1215,6 +1215,9 @@ void App::activatePanelHit(const PanelHit& hit) {
     case SettingId::Mute:
         toggleMute();
         break;
+    case SettingId::MasterVolume:
+        if (hit.kind == PanelHitKind::Trailing) toggleMute();
+        break;
     case SettingId::PaneAudio:
         toggleAudioPane(pane);
         break;
@@ -1224,9 +1227,7 @@ void App::activatePanelHit(const PanelHit& hit) {
     case SettingId::PaneOffset: {
         constexpr std::array<double, 4> steps{-1.0, -0.1, 0.1, 1.0};
         if (hit.part >= 0 && hit.part < 4 && sources_[pane]) {
-            const double current = effectiveTimelineOffset(
-                startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]);
-            setPaneOffset(pane, current + steps[static_cast<std::size_t>(hit.part)]);
+            setPaneOffset(pane, paneOffsetSeconds(pane) + steps[static_cast<std::size_t>(hit.part)]);
         }
         break;
     }
@@ -1357,6 +1358,9 @@ void App::activatePanelHit(const PanelHit& hit) {
     case SettingId::EmbySearch:
         if (hit.kind == PanelHitKind::Trailing) embyClearSearch();
         break;
+    case SettingId::EmbySearchScope:
+        embyChooseSearchScope(hit.part);
+        break;
     case SettingId::PlayOrder:
         if (hit.part >= 0 && hit.part < kPlayOrderCount) setPlayOrder(clampPlayOrder(hit.part));
         break;
@@ -1368,7 +1372,7 @@ void App::activatePanelHit(const PanelHit& hit) {
         localNavigate(hit.part);
         break;
     case SettingId::LocalToolbar:
-        showLocalToolbarMenu(hit.part);
+        localToolbarAction(hit.part);
         break;
     case SettingId::LocalRetry:
         retryLocalList();
@@ -1409,11 +1413,122 @@ void App::activatePanelHit(const PanelHit& hit) {
             else if (hit.part == 3) loadSubtitleDialog(pane);
         }
         break;
+    case SettingId::ShortcutKey:
+        keyBoxClicked(row, hit.part, ended);
+        break;
+    case SettingId::ShortcutCommand:
+        keyCommand(hit.part, ended);
+        break;
+    case SettingId::PaneAudioTrack:
+        // Its tracks as the video lists them.
+        if (sources_[pane] && hit.part >= 0) {
+            const auto tracks = sources_[pane]->audioTracks();
+            if (static_cast<std::size_t>(hit.part) < tracks.size()) {
+                selectAudioTrack(pane, tracks[static_cast<std::size_t>(hit.part)].streamIndex);
+            }
+        }
+        break;
+    case SettingId::PaneAudioDelay:
+        if (paneLogicallyLoaded(pane)) {
+            if (hit.part == 0) nudgePaneAudioDelay(pane, -kAudioDelayStepMs / 1000.0);
+            else if (hit.part == 1) nudgePaneAudioDelay(pane, kAudioDelayStepMs / 1000.0);
+            else if (hit.part == 2) resetPaneAudioDelay(pane);
+        }
+        break;
+    case SettingId::AudioDevice:
+        // Windows' default, then the outputs as listed; the one not
+        // connected, last, is already the choice.
+        if (hit.part == 0) chooseAudioOutput({});
+        else if (hit.part > 0 && static_cast<std::size_t>(hit.part) <= audioOutputs_.size()) {
+            chooseAudioOutput(audioOutputs_[static_cast<std::size_t>(hit.part) - 1].id);
+        }
+        break;
+    case SettingId::AudioSpeakers:
+        if (hit.part == 0 || hit.part == 1) setAudioDeviceChannels(hit.part == 1);
+        break;
+    case SettingId::AudioMaxVolume:
+        // The spin box's arrows, a percent a step.
+        if (hit.part == 0 || hit.part == 1) {
+            setSpinBoxValue(row.id, audioSettings_.maxVolume + (hit.part == 0 ? 1 : -1));
+        }
+        break;
+    case SettingId::AudioDelayAll:
+        if (hit.part == 0) nudgeAllAudioDelay(-kAudioDelayStepMs);
+        else if (hit.part == 1) nudgeAllAudioDelay(kAudioDelayStepMs);
+        else if (hit.part == 2) nudgeAllAudioDelay(0);
+        break;
+    case SettingId::AudioNormalize:
+        toggleNormalizer();
+        break;
+    case SettingId::AudioNightMode:
+        if (hit.part >= 0 && hit.part < kAudioStrengthCount) setNightMode(hit.part);
+        break;
+    case SettingId::AudioChannels:
+        if (hit.part >= 0 && hit.part < kAudioStereoModeCount) setStereoMode(static_cast<AudioStereoMode>(hit.part));
+        break;
+    case SettingId::AudioVoice:
+        toggleVoiceEmphasis();
+        break;
+    case SettingId::AudioCrossfeed:
+        toggleCrossfeed();
+        break;
+    case SettingId::AudioWidening:
+        if (hit.part >= 0 && hit.part < kAudioStrengthCount) setStereoWidening(hit.part);
+        break;
+    case SettingId::AudioPitch:
+        setPitchCorrection(!audioSettings_.pitchCorrection);
+        break;
+    case SettingId::AudioLanguage:
+        if (hit.part >= 0 && hit.part < kAudioLanguageCount) setAudioLanguage(static_cast<AudioLanguage>(hit.part));
+        break;
+    case SettingId::Equalizer:
+        toggleEqualizer();
+        break;
+    case SettingId::EqualizerPreset:
+        if (hit.part >= 0) chooseEqualizerPreset(static_cast<std::size_t>(hit.part));
+        break;
+    case SettingId::VideoRenderer:
+    case SettingId::VideoAdapter:
+    case SettingId::VideoDisplay:
+    case SettingId::VideoDepth:
+    case SettingId::VideoDeinterlace:
+    case SettingId::VideoScaling:
+    case SettingId::VideoLevels:
+    case SettingId::VideoColorReset:
+        videoPanelAction(row, hit.part);
+        break;
     default:
         break;
     }
     updateTitle();
     scheduleAppSettingsSave();
+}
+
+std::optional<int> App::spinBoxValue(SettingId id) const {
+    if (id == SettingId::AudioMaxVolume) return audioSettings_.maxVolume;
+    return std::nullopt;
+}
+
+void App::setSpinBoxValue(SettingId id, int value) {
+    // Held to its range by what it sets.
+    if (id == SettingId::AudioMaxVolume) setMaxMasterVolume(value);
+}
+
+std::optional<App::RepeatControl> App::panelRepeatControl(const PanelHit& hit, const std::vector<PanelRow>& rows) {
+    if (hit.kind == PanelHitKind::Scrollbar) return RepeatControl{1, static_cast<int>(hit.kind)};
+    if (hit.row < 0 || hit.row >= static_cast<int>(rows.size())) return std::nullopt;
+    const auto& row = rows[static_cast<std::size_t>(hit.row)];
+    const bool repeats =
+        hit.kind == PanelHitKind::Slider ||
+        (hit.kind == PanelHitKind::Button &&
+         (row.id == SettingId::PaneOffset || row.id == SettingId::ZoomAll ||
+          (row.id == SettingId::SubtitlePane && hit.part >= 0 && hit.part <= 2) ||
+          (row.id == SettingId::PaneAudioDelay && (hit.part == 0 || hit.part == 1)) ||
+          (row.id == SettingId::AudioDelayAll && (hit.part == 0 || hit.part == 1)) ||
+          (row.spinBox && (hit.part == 0 || hit.part == 1))));
+    if (!repeats) return std::nullopt;
+    return RepeatControl{1, static_cast<int>(hit.kind), static_cast<int>(row.id), hit.part,
+                         panelRowParam(row, hit.part)};
 }
 
 void App::releasePanelPress(POINT local) {

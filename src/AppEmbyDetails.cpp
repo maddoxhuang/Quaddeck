@@ -80,7 +80,8 @@ std::string App::embyCurrentLibraryId() const {
     for (auto page = embyPages_.rbegin(); page != embyPages_.rend(); ++page) {
         // A search, the favorites and a person's titles list every library
         // at once: what was opened from them is not known to be in the
-        // library beneath.
+        // library beneath. A search in the folder beneath stays in it.
+        if (page->kind == EmbyPage::Kind::Search && page->searchesScope()) continue;
         if (page->kind == EmbyPage::Kind::Search || page->kind == EmbyPage::Kind::Favorites ||
             page->kind == EmbyPage::Kind::Person) {
             return {};
@@ -250,6 +251,10 @@ void App::embyDetailsArrived(std::uint64_t serial, const EmbyClient::Response& r
     const std::string entryId = detail.item.playlistItemId;
     detail.item = *item;
     detail.item.playlistItemId = entryId;
+    // The page's poster of a video is drawn in the video's shape.
+    if (item->streamsRead && item->primaryImageItemId.empty()) {
+        thumbnails_.setVideoShape(item->id, VideoShape{item->storedAspect, item->displayAspect});
+    }
 }
 
 void App::embyRequestDetailChildren(int startIndex) {

@@ -36,7 +36,6 @@ constexpr std::size_t kSubtitleMenuLimit = CmdSubtitleLast - CmdSubtitleFirst + 
 // one with lines in it.
 constexpr std::size_t kSidecarReadAttempts = 4;
 constexpr double kSubtitleDelayLimit = 600.0;
-constexpr float kSubtitleDefaultPosition = SubtitleSettings{}.position;
 
 std::wstring lowercase(std::wstring text) {
     for (auto& character : text) character = static_cast<wchar_t>(std::towlower(character));
@@ -473,12 +472,15 @@ App::SidecarScan App::scanSidecars(const std::wstring& path, const std::vector<s
     return scan;
 }
 
-void App::loadSidecarSubtitles(std::size_t pane, const std::wstring& path) {
+void App::loadSidecarSubtitles(std::size_t pane, const std::wstring& path, bool sameMedia) {
     if (pane >= sources_.size()) return;
     subtitleFiles_[pane].clear();
     subtitles_[pane].reset();
     subtitleSelection_[pane] = {};
-    const std::uint64_t serial = subtitleSerial_[pane] = ++subtitleSerialCounter_;
+    // A scan from before the same video was opened again comes back to it
+    // too: the same folder, applied as the one made now is.
+    if (!sameMedia || subtitleSerial_[pane] == 0) subtitleSerial_[pane] = ++subtitleSerialCounter_;
+    const std::uint64_t serial = subtitleSerial_[pane];
     if (emby::isLocator(path) || path.find(L"://") != std::wstring::npos) return;
     // The listing and the read happen off the window thread: a share that
     // has gone away must not freeze the player. The result comes back
@@ -573,7 +575,14 @@ void App::noteSubtitleRead(std::size_t pane, const std::filesystem::path& file, 
 }
 
 void App::addSubtitleFile(std::size_t pane, const std::filesystem::path& file) {
-    if (pane >= sources_.size() || !paneLogicallyLoaded(pane)) return;
+    if (pane >= sources_.size()) return;
+    if (!paneLogicallyLoaded(pane)) {
+        // An Emby item still being resolved, also when asked of the server
+        // again for a decoder or renderer change, has nothing to show them
+        // on; the Load dialog answered meanwhile says so.
+        if (paneOpening(pane)) showNotice(L"The video is still opening; open its subtitles again once it plays");
+        return;
+    }
     auto& files = subtitleFiles_[pane];
     if (std::find(files.begin(), files.end(), file) == files.end()) files.push_back(file);
     selectSubtitle(pane, {SubtitleKind::File, -1, file}, true);
@@ -581,7 +590,13 @@ void App::addSubtitleFile(std::size_t pane, const std::filesystem::path& file) {
 }
 
 void App::loadSubtitleDialog(std::size_t pane) {
-    if (pane >= sources_.size() || !paneLogicallyLoaded(pane)) return;
+    if (pane >= sources_.size()) return;
+    if (!paneLogicallyLoaded(pane)) {
+        // As for the file the dialog returns: a menu left open over an Emby
+        // item asked of the server again is told why nothing opens.
+        if (paneOpening(pane)) showNotice(L"The video is still opening; open its subtitles again once it plays");
+        return;
+    }
     wchar_t path[MAX_PATH]{};
     // Beside the video is where its subtitles usually are.
     std::wstring folder;
@@ -653,7 +668,14 @@ void App::toggleSubtitles(int target) {
         return;
     }
     // Nothing chosen for this video: what the player would have chosen, the
-    // viewer's earlier choice of Off notwithstanding.
+    // viewer's earlier choice of Off notwithstanding. As for the step: an
+    // Emby item still being resolved lists no streams until the reply, and a
+    // file loaded by hand would be chosen in place of them, so the choice is
+    // left alone.
+    if (!sources_[pane] && paneOpening(pane)) {
+        showNotice(L"The video is still opening; open its subtitles again once it plays");
+        return;
+    }
     const auto options = subtitleOptions(pane);
     const int best = preferredSubtitle(pane, options, -1);
     if (best < 0) {
@@ -672,6 +694,16 @@ void App::toggleSubtitles(int target) {
 
 void App::cycleSubtitle(std::size_t pane) {
     if (pane >= sources_.size()) return;
+    // An Emby item still being resolved, also when asked of the server again
+    // for a decoder or renderer change, has no streams listed until the
+    // reply: a step would go round the files loaded by hand alone and could
+    // put one in place of the viewer's stream. The choice is left alone --
+    // also while the device is rebuilt, when every pane with a path reads as
+    // loaded. With no source, only such an item reads as opening.
+    if (!sources_[pane] && paneOpening(pane)) {
+        showNotice(L"The video is still opening; open its subtitles again once it plays");
+        return;
+    }
     const auto options = subtitleOptions(pane);
     // A file that could not be read is left to the menu.
     const auto stepped = [](const SubtitleOption& option) { return option.usable && !option.unreadable; };
@@ -745,21 +777,6 @@ void App::setSubtitleLanguage(int language) {
         if (paneLogicallyLoaded(pane)) autoChooseSubtitle(pane);
     }
     scheduleAppSettingsSave();
-}
-
-bool App::handleAltKey(WPARAM key) {
-    const int pane = subtitlePane();
-    switch (key) {
-    case 'H': toggleSubtitles(pane); return true;
-    case 'L': if (pane >= 0) cycleSubtitle(static_cast<std::size_t>(pane)); return true;
-    case 'O': if (pane >= 0) loadSubtitleDialog(static_cast<std::size_t>(pane)); return true;
-    case VK_PRIOR: setSubtitleSize(subtitleSettings_.size + 0.1F); return true;
-    case VK_NEXT: setSubtitleSize(subtitleSettings_.size - 0.1F); return true;
-    case VK_UP: setSubtitlePosition(subtitleSettings_.position + 0.02F); return true;
-    case VK_DOWN: setSubtitlePosition(subtitleSettings_.position - 0.02F); return true;
-    case VK_HOME: setSubtitlePosition(kSubtitleDefaultPosition); return true;
-    default: return false;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -853,12 +870,20 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
     const RectF& cell = chromeCells_[pane];
     const int videoWidth = sources_[pane]->videoWidth();
     const int videoHeight = sources_[pane]->videoHeight();
+    // The picture as the renderer shapes it: the shown frame's own shape.
+    // libass is still given the size read at open as its storage size and
+    // works out the pixels' shape from it and the frame, so the rectangles
+    // take the pixel aspect against that same size -- a DVD's 64:45, so a
+    // script's lines stretch with its pixels, and square for a broadcast
+    // that opened at 1920x1080 and now shows 1440x1080 at 4:3, 16:9 alike.
+    const float pixelAspect =
+        storedPixelAspect(videoWidth, videoHeight, sources_[pane]->videoDisplayAspect());
     const ViewMode mode = paneViews_[pane].mode;
     const AssPane& state = assPanes_[pane];
     const SubtitlePlacement placement = subtitlePlacement(
-        cell, visiblePictureRect(cell, videoWidth, videoHeight, mode),
-        pictureRect(cell, videoWidth, videoHeight, mode, paneViews_[pane].zoom), videoWidth, videoHeight,
-        state.plain);
+        cell, visiblePictureRect(cell, videoWidth, videoHeight, mode, pixelAspect),
+        pictureRect(cell, videoWidth, videoHeight, mode, paneViews_[pane].zoom, pixelAspect), videoWidth,
+        videoHeight, state.plain);
     const SubtitleFrame& frame = placement.frame;
     if (frame.width <= 0 || frame.height <= 0) return nullptr;
     origin = {placement.originX, placement.originY};
@@ -903,19 +928,21 @@ void App::appendSubtitleMenu(PanelMenu& menu, std::size_t pane) const {
                     options[choice].what == selection, {}, options[choice].usable);
     }
     if (options.size() > kSubtitleMenuLimit) {
-        menu.option(0, std::to_wstring(options.size() - kSubtitleMenuLimit) + L" more  (Alt+L steps through them all)",
+        const std::wstring next = shortcut(KeyAction::SubtitleNext);
+        menu.option(0, std::to_wstring(options.size() - kSubtitleMenuLimit) + L" more" +
+                           (next.empty() ? L"" : L"  (" + next + L" steps through them all)"),
                     false, {}, false);
     }
     menu.separator();
-    menu.option(CmdSubtitleCycle, L"Next subtitle", false, L"Alt+L", !options.empty());
-    menu.option(CmdSubtitleLoad, L"Load subtitle file...", false, L"Alt+O", loaded);
+    menu.option(CmdSubtitleCycle, L"Next subtitle", false, shortcut(KeyAction::SubtitleNext), !options.empty());
+    menu.option(CmdSubtitleLoad, L"Load subtitle file...", false, shortcut(KeyAction::SubtitleLoad), loaded);
     menu.separator();
     const bool timed = loaded && selection.kind != SubtitleKind::None;
-    menu.option(CmdSubtitleEarlier, L"Earlier by 0.5 s", false, L".", timed);
-    menu.option(CmdSubtitleLater, L"Later by 0.5 s", false, L",", timed);
+    menu.option(CmdSubtitleEarlier, L"Earlier by 0.5 s", false, shortcut(KeyAction::SubtitleEarlier), timed);
+    menu.option(CmdSubtitleLater, L"Later by 0.5 s", false, shortcut(KeyAction::SubtitleLater), timed);
     menu.option(CmdSubtitleSyncReset,
                 L"Timing as in the file  (now " + signedSeconds(loaded ? subtitleDelay_[pane] : 0.0) + L")", false,
-                L"/", timed && subtitleDelay_[pane] != 0.0);
+                shortcut(KeyAction::SubtitleTimingReset), timed && subtitleDelay_[pane] != 0.0);
 }
 
 void App::showSubtitleMenu(int pane, WindowMenuAnchor anchor) {

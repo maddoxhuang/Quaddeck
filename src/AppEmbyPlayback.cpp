@@ -376,8 +376,15 @@ void App::embyStartResolved(std::size_t pane, const emby::Item& item, const emby
     // The stream the server names for this account, or, when it names none
     // -- an account set to show subtitles only over foreign audio with no
     // language given names none for anything -- the player's own choice.
+    // The viewer's own, kept when the same video is opened again, goes to
+    // the new source instead.
     state.subtitleStream = -1;
-    autoChooseSubtitle(pane, source->defaultSubtitleStreamIndex);
+    if (subtitleChosenByViewer_[pane]) {
+        const SubtitleSelection viewerChoice = subtitleSelection_[pane];
+        selectSubtitle(pane, viewerChoice, false);
+    } else {
+        autoChooseSubtitle(pane, source->defaultSubtitleStreamIndex);
+    }
     subtitleEmbeddedPending_[pane] = true;
     appendDiagnostic("Emby: playing item " + state.itemId + " (" + emby::displayTitle(item) + ") from " +
                      session.serverUrl + streamPath);

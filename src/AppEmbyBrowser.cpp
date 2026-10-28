@@ -1,4 +1,4 @@
-// App: the Emby library browser drawn in the settings sheet. Its rows and
+// App: the Emby library browser drawn in the sheet. Its rows and
 // tiles, pages, views, sort and filters, search, pictures, playlists, and
 // what activating an item does. Replies arrive on the window thread
 // through EmbyClient::pump(), as described in AppEmby.cpp.
@@ -43,6 +43,8 @@ constexpr int kEmbyPersonLimit = 2000;
 constexpr std::size_t kEmbyImageQueue = 24;
 // Subtitle questions out at once on the client clicks and reports use.
 constexpr std::size_t kSubtitleQuestionsAtOnce = 2;
+// Videos one shape question names: more than a screenful of tiles.
+constexpr std::size_t kEmbyShapeBatch = 48;
 constexpr const char* kEmbyListFields = emby::kBrowserItemFields;
 
 std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
@@ -338,6 +340,19 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
                                 : L"\x201C" + wide(page.term) + L"\x201D");
     }
     header(crumb);
+    // How many videos the page lists -- folders are not counted -- or, while
+    // a long one has come only in part, how many entries it has in all.
+    if (!home && !searchPage && !embyItems_.empty()) {
+        const auto held = static_cast<int>(embyItems_.size());
+        if (embyPageIsPaged() && embyTotal_ > held) {
+            rows.back().value = std::to_wstring(embyTotal_) + L" items";
+        } else {
+            // A flag of each entry, not its type's name: this runs every
+            // frame, over lists of thousands.
+            rows.back().value = videoCountText(static_cast<std::size_t>(std::count_if(
+                embyItems_.begin(), embyItems_.end(), [](const emby::Item& item) { return !item.isFolder; })));
+        }
+    }
     // The way back to the settings is the header's switch, so the home
     // page's row starts at Search; the other pages lead with Back.
     if (home) {
@@ -347,6 +362,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     }
     rows.back().buttonMinWidth = kEmbyNavButtonWidth;
     if (searchPage) rows.push_back(embySearchRow());
+    if (searchPage && !embyPages_.back().scopeId.empty()) rows.push_back(embySearchScopeRow());
     const std::string libraryId = embyCurrentLibraryId();
     const std::string libraryType = embyLibraryType(libraryId);
     const bool arrange = !home && embyPageAcceptsFilters() && !searchEmpty;
@@ -355,17 +371,34 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     const auto sortKey = emby::sortKeyFromIndex(embyBrowser_.sort);
     std::wstring sort = ownOrder ? L"Playlist" : emby::sortKeyName(sortKey);
     if (!ownOrder && sortKey != emby::SortKey::Random) sort += embyBrowser_.descending ? L" \u2193" : L" \u2191";
-    const int filters = arrange ? (embyBrowser_.unplayed ? 1 : 0) +
-        (embyPageAcceptsFlat() && embyBrowser_.flat ? 1 : 0) : 0;
+    const bool flatOffered = arrange && embyPageAcceptsFlat();
+    // The favorites page lists nothing else.
+    const bool favoritesOffered = arrange && embyPages_.back().kind != EmbyPage::Kind::Favorites;
     const std::wstring view = embyBrowser_.view == 0 ? L"List" : embyBrowser_.view == 1 ? L"Posters" : L"Thumbs";
+    // View and Sort open their drop-downs. Each filter is a button of its
+    // own that switches it at once, lit while it is on: Unplayed, the
+    // favorites under the page, All videos where the page lists folders, a
+    // movie or TV library's information pages. One the page does not offer
+    // leaves its slot empty, so a part always names the same button
+    // (embyToolbarAction).
     buttons(SettingId::EmbyToolbar,
-            {view + L" \u25BE", arrange ? sort + L" \u25BE" : L"",
-             arrange || libraryDetails ? L"Filters" + (filters ? L" (" + std::to_wstring(filters) + L")" : L"") + L" \u25BE" : L""});
+            {view + L" \x25BE", arrange ? sort + L" \x25BE" : L"", arrange ? L"Unplayed" : L"",
+             favoritesOffered ? L"\x2665 Favorites" : L"", flatOffered ? L"All videos" : L"",
+             libraryDetails ? L"Info pages" : L""});
     rows.back().buttonMinWidth = 80.0F;
+    rows.back().buttonsOn = {false, false, arrange && embyBrowser_.unplayed,
+                             favoritesOffered && embyBrowser_.favorites, flatOffered && embyBrowser_.flat,
+                             libraryDetails && embyLibraryDetailsEnabled(embyLibraries_, emby_.session().serverId,
+                                                                         libraryId, libraryType)};
     // Navigation and the compact arrangement stay available while the list scrolls.
     for (auto& row : rows) row.pinned = true;
     if (personPage) rows.push_back(embyPersonRow(embyPages_.back()));
-    if (searchEmpty) note(L"Type part of a title: every library is searched as you type.");
+    if (searchEmpty) {
+        const auto& page = embyPages_.back();
+        note(page.searchesScope()
+                 ? L"Type part of a title: everything under " + wide(page.scopeTitle) + L" is searched as you type."
+                 : L"Type part of a title: every library is searched as you type.");
+    }
     else if (embyLoading_) note(searchPage ? L"Searching\x2026" : L"Loading\x2026");
     else if (!embyNote_.empty()) {
         note(embyNote_);
@@ -429,7 +462,8 @@ void App::embyEdgeHover(POINT local, const RECT& client, bool inside) {
                              (gui.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)) != 0;
     const bool composing = fieldTyping() != TextFieldId::None && !fieldComposition_.empty();
     const bool busy = controlDrag_ != ControlDrag::None || draggingPane_ || pressedBarItem_ >= 0 ||
-                      pressedPanelKind_ != PanelHitKind::None || panelMenu_.has_value() || windowsMenu || composing;
+                      pressedPanelKind_ != PanelHitKind::None || panelMenu_.has_value() || syncPanel_.has_value() ||
+                      windowsMenu || composing;
     const float edge = std::max(2.0F, 6.0F * uiScale_);
     // The caption's strip is left out: a pointer heading for Close in the
     // top-right corner is not asking for the list.
@@ -569,7 +603,8 @@ std::string App::embyPageKey(const EmbyPage& page) {
     case EmbyPage::Kind::Playlist: return "playlist:" + page.id;
     case EmbyPage::Kind::Series: return "series:" + page.id;
     case EmbyPage::Kind::Season: return "season:" + page.seriesId + "/" + page.id;
-    case EmbyPage::Kind::Search: return "search:" + page.term;
+    case EmbyPage::Kind::Search:
+        return page.searchesScope() ? "search:" + page.scopeId + ":" + page.term : "search:" + page.term;
     case EmbyPage::Kind::Favorites: return "favorites";
     case EmbyPage::Kind::Person: return "person:" + page.id;
     default: return "home";
@@ -619,24 +654,34 @@ std::string App::embyListPath(const EmbyPage& page, int startIndex, int limit) c
     arrangement.descending = embyBrowser_.descending;
     arrangement.unplayed = embyBrowser_.unplayed;
     arrangement.flat = embyBrowser_.flat;
+    arrangement.favorites = embyBrowser_.favorites;
     return emby::itemsPath(userId,
                            emby::listQuery(embyListPage(page), arrangement, startIndex, limit, kEmbyListFields));
 }
 
-std::string App::embySearchPath(const std::string& libraryId, const std::string& term) const {
-    emby::ItemsQuery query;
-    query.parentId = libraryId;
-    query.recursive = true;
-    query.includeTypes = "Series,Movie,Episode,Video,Photo";
-    query.searchTerm = term;
-    query.limit = kEmbySearchPerLibrary;
-    query.fields = kEmbyListFields;
-    query.filters = embyBrowser_.unplayed ? "IsUnplayed" : "";
-    return emby::itemsPath(emby_.session().userId, query);
+std::vector<std::string> App::embySearchParents(const EmbyPage& page) const {
+    // Opened in a folder: what is under it, at any depth, is one request.
+    if (page.searchesScope()) return {page.scopeId};
+    // The server matches the start of words, and honours a library's
+    // "exclude from search" only when asked without a ParentId; asking
+    // each library by name finds everything the account can see.
+    std::vector<std::string> libraries;
+    for (const auto& view : embyViews_) {
+        if (view.type == "CollectionFolder" || view.type == "UserView") libraries.push_back(view.id);
+    }
+    if (libraries.empty()) libraries.push_back({});
+    return libraries;
+}
+
+std::string App::embySearchPath(const std::string& parentId, const std::string& term) const {
+    return emby::itemsPath(emby_.session().userId,
+                           emby::searchQuery(parentId, term,
+                                             emby::arrangementFilters(embyBrowser_.unplayed, embyBrowser_.favorites),
+                                             kEmbySearchPerLibrary, kEmbyListFields));
 }
 
 void App::embyToolbarAction(int part) {
-    if (!emby_.session().signedIn() || embyDetails_ || embyPages_.empty() || part < 0 || part > 2) return;
+    if (!emby_.session().signedIn() || embyDetails_ || embyPages_.empty() || part < 0 || part > 5) return;
     const auto account = embyAccountSerial_;
     const auto pageKey = embyPageKey(embyPages_.back());
     const bool home = embyPages_.size() <= 1;
@@ -644,39 +689,33 @@ void App::embyToolbarAction(int part) {
     const bool arrange = !home && embyPageAcceptsFilters() && !searchEmpty;
     const bool playlist = embyPages_.back().kind == EmbyPage::Kind::Playlist;
     const bool ownOrder = playlist && embyPages_.back().ownOrder;
-    const auto libraryId = embyCurrentLibraryId();
-    const auto libraryType = embyLibraryType(libraryId);
-    const bool libraryDetails = libraryType == "movies" || libraryType == "tvshows";
-    if ((part == 1 && !arrange) || (part == 2 && !arrange && !libraryDetails)) return;
+    // The filters, each its own button, switch at once; the row saves them
+    // (activatePanelRow). Information pages are only a movie or TV
+    // library's, which embyToggleLibraryDetails checks.
+    if (part >= 2) {
+        if (part == 2 && arrange) embyToggleUnplayed();
+        else if (part == 3 && arrange && embyPages_.back().kind != EmbyPage::Kind::Favorites) {
+            embyToggleFavoritesFilter();
+        } else if (part == 4 && arrange && embyPageAcceptsFlat()) embyToggleFlat();
+        else if (part == 5) embyToggleLibraryDetails();
+        return;
+    }
+    if (part == 1 && !arrange) return;
     PanelMenu menu;
     if (part == 0) {
         menu.option(1, L"List", embyBrowser_.view == 0)
             .option(2, L"Posters", embyBrowser_.view == 1)
             .option(3, L"Thumbnails", embyBrowser_.view == 2);
-    } else if (part == 1) {
+    } else {
         if (playlist) menu.option(1, L"Playlist order", ownOrder);
         for (int index = 0; index < emby::kSortKeyCount; ++index) {
-            const wchar_t* shortcut = index == 0 ? L"Ctrl+4" : index == 4 ? L"Ctrl+9"
-                : index == 6 ? L"Ctrl+6" : index == 1 ? L"Ctrl+7" : index == 3 ? L"Ctrl+8" : L"";
-            menu.option(static_cast<unsigned>(10 + index), emby::sortKeyName(emby::sortKeyFromIndex(index)),
-                        !ownOrder && embyBrowser_.sort == index, shortcut);
-        }
-    } else {
-        if (arrange) {
-            menu.check(1, L"Unplayed only", embyBrowser_.unplayed);
-            if (embyPageAcceptsFlat()) {
-                menu.separator()
-                    .segment(2, L"Folders", !embyBrowser_.flat)
-                    .segment(3, L"All videos", embyBrowser_.flat);
-            }
-        }
-        if (libraryDetails) {
-            menu.separator().check(4, L"Information pages", embyLibraryDetailsEnabled(
-                embyLibraries_, emby_.session().serverId, libraryId, libraryType));
+            const auto key = emby::sortKeyFromIndex(index);
+            menu.option(static_cast<unsigned>(10 + index), emby::sortKeyName(key),
+                        !ownOrder && embyBrowser_.sort == index, sortShortcut(key));
         }
     }
     openPanelMenu(std::move(menu), SettingId::EmbyToolbar, part, -1,
-                  [this, part, account, pageKey, playlist, arrange, libraryDetails, libraryId](unsigned command) {
+                  [this, part, account, pageKey, playlist](unsigned command) {
         // Chosen later: replies may have moved the account or the page on.
         if (!command || account != embyAccountSerial_ || embyDetails_ || embyPages_.empty() ||
             pageKey != embyPageKey(embyPages_.back()) || !settingsOpen_ || !embyBrowserOpen_ ||
@@ -689,10 +728,6 @@ void App::embyToolbarAction(int part) {
             else if (command >= 10 && command < 10 + emby::kSortKeyCount) {
                 embyChooseSort(static_cast<int>(command) - 10 + (playlist ? 1 : 0));
             }
-        } else if (part == 2) {
-            if (command == 1 && arrange) embyToggleUnplayed();
-            else if ((command == 2 || command == 3) && embyPageAcceptsFlat()) embySetFlat(command == 3);
-            else if (command == 4 && libraryDetails) embyToggleLibraryDetails(libraryId);
         }
         scheduleAppSettingsSave();
     });
@@ -834,6 +869,24 @@ void App::embyToggleUnplayed() {
     if (embyBrowserOpen_ && embyPageAcceptsFilters()) embyRequestPage();
 }
 
+void App::embyToggleFavoritesFilter() {
+    embyBrowser_.favorites = !embyBrowser_.favorites;
+    if (embyBrowserOpen_ && embyPageAcceptsFilters() && embyPages_.back().kind != EmbyPage::Kind::Favorites) {
+        embyRequestPage();
+    }
+}
+
+bool App::embyListsFavoritesOnly() const {
+    // The list under an information page counts too: what is unmarked
+    // there leaves it.
+    if (embyPages_.empty()) return false;
+    const auto kind = embyPages_.back().kind;
+    return kind == EmbyPage::Kind::Favorites ||
+           (embyBrowser_.favorites && (kind == EmbyPage::Kind::Library || kind == EmbyPage::Kind::Folder ||
+                                       kind == EmbyPage::Kind::Playlist || kind == EmbyPage::Kind::Search ||
+                                       kind == EmbyPage::Kind::Person));
+}
+
 void App::embySetFlat(bool flat) {
     if (flat == embyBrowser_.flat) return;
     embyBrowser_.flat = flat;
@@ -849,6 +902,7 @@ void App::embyRequestVisibleImages() {
     const float margin = content.height;
     const float top = content.y - margin;
     const float bottom = content.bottom() + margin;
+    if (signedIn) embyAskVisibleShapes(top, bottom);
     // False once both queues are full.
     const auto requestRow = [&](std::size_t i) {
         const auto& row = panelRows_[i];
@@ -909,6 +963,84 @@ void App::embyRequestVisibleImages() {
     }
 }
 
+// The server takes a video's picture from its frame as stored, so a video
+// whose pixels are not square (a 9:16 phone clip stored as 1280x720) has a
+// stretched one; the painter draws it in the video's shape once that is
+// known (pictureDrawAspect). The videos -- and the children whose pictures
+// folders borrow -- of the tiles in the band are asked about once each, a
+// screenful at a time, one question out.
+void App::embyAskVisibleShapes(float top, float bottom) {
+    if (embyShapeQuestionOut_ || !emby_.session().signedIn()) return;
+    std::vector<std::string> ids;
+    const auto consider = [&](const emby::Item& entry) {
+        if (entry.primaryImageTag.empty()) return;
+        const bool borrowed = !entry.primaryImageItemId.empty();
+        if (!borrowed && !emby::isPlayableVideo(entry)) return;
+        const std::string& source = borrowed ? entry.primaryImageItemId : entry.id;
+        if (source.empty() || thumbnails_.knowsVideoShape(source) ||
+            std::find(ids.begin(), ids.end(), source) != ids.end()) {
+            return;
+        }
+        ids.push_back(source);
+    };
+    const std::size_t count = std::min(panelRows_.size(), panelLayout_.rows.size());
+    for (std::size_t i = panelFirstRowReaching(panelLayout_, top);
+         i < count && panelLayout_.rows[i].row.y <= bottom && ids.size() < kEmbyShapeBatch; ++i) {
+        const auto& row = panelRows_[i];
+        if (row.kind != PanelRowKind::Tiles || row.id != SettingId::EmbyItem) continue;
+        for (const int param : row.tileParams) {
+            const emby::Item* entry = nullptr;
+            if (param >= 0 && static_cast<std::size_t>(param) < embyItems_.size()) {
+                entry = &embyItems_[static_cast<std::size_t>(param)];
+            } else if (param < 0 && static_cast<std::size_t>(-(param + 1)) < embyResume_.size()) {
+                entry = &embyResume_[static_cast<std::size_t>(-(param + 1))];
+            }
+            if (entry) consider(*entry);
+        }
+    }
+    if (ids.empty()) return;
+    if (ids.size() > kEmbyShapeBatch) ids.resize(kEmbyShapeBatch);
+    embyShapeQuestionOut_ = true;
+    const auto session = emby_.session();
+    emby_.request("GET", emby::videoShapesPath(session.userId, ids), "",
+                  [this, account = embyAccountSerial_, asked = ids](const EmbyClient::Response& response) {
+        embyShapesArrived(account, asked, response);
+    });
+}
+
+void App::embyShapesArrived(std::uint64_t account, const std::vector<std::string>& asked,
+                            const EmbyClient::Response& response) {
+    if (account != embyAccountSerial_) return;
+    embyShapeQuestionOut_ = false;
+    // Called off with a page left: asked again when they show.
+    if (response.error == "Cancelled") return;
+    const auto list = response.ok ? emby::parseItems(response.body) : std::nullopt;
+    if (!list) {
+        // Unanswered, their pictures are drawn as they came, and they are
+        // not asked about again every frame; a 401 is the list's to report.
+        if (response.status != 401) {
+            appendDiagnostic("Emby: could not ask the shape of " + std::to_string(asked.size()) +
+                             " videos: " + (response.ok ? std::string("unreadable reply") : response.error));
+        }
+        for (const auto& id : asked) thumbnails_.setVideoShape(id, VideoShape{});
+        return;
+    }
+    for (const auto& item : list->items) {
+        if (std::find(asked.begin(), asked.end(), item.id) == asked.end()) continue;
+        const VideoShape shape{item.storedAspect, item.displayAspect};
+        if (shape.stored > 0.0F && shape.display > 0.0F &&
+            std::abs(shape.display / shape.stored - 1.0F) > kVideoShapeTolerance) {
+            appendDiagnostic("Emby: item " + item.id + " is stored at " + std::to_string(shape.stored) +
+                             " and shown at " + std::to_string(shape.display) + ", its picture drawn so");
+        }
+        thumbnails_.setVideoShape(item.id, shape);
+    }
+    // One the reply left out has nothing to say about its shape.
+    for (const auto& id : asked) {
+        if (!thumbnails_.knowsVideoShape(id)) thumbnails_.setVideoShape(id, VideoShape{});
+    }
+}
+
 void App::embyOpenBrowser() {
     localCancelReplacement();
     if (!emby_.session().signedIn()) {
@@ -917,7 +1049,7 @@ void App::embyOpenBrowser() {
         return;
     }
     if (settingsOpen_) rememberSheetScroll();
-    if (!settingsOpen_) toggleSettingsPanel();
+    openSheet();
     embyBrowserOpen_ = true;
     browserSource_ = BrowserSource::Emby;
     // Where the browser was left, not its top: the page shown stays and is
@@ -1181,21 +1313,18 @@ void App::embyRequestPage(int startIndex, bool inPlace) {
             embyLoading_ = false;
             break;
         }
-        // The server matches the start of words, and honours a library's
-        // "exclude from search" only when asked without a ParentId; asking
-        // each library by name finds everything the account can see.
-        std::vector<std::string> libraries;
-        for (const auto& view : embyViews_) {
-            if (view.type == "CollectionFolder" || view.type == "UserView") libraries.push_back(view.id);
-        }
-        if (libraries.empty()) libraries.push_back({});
+        const auto parents = embySearchParents(page);
         auto search = std::make_shared<EmbySearch>();
-        search->libraries = search->remaining = libraries.size();
+        search->libraries = search->remaining = parents.size();
         search->sortKey = sortKey;
+        // A folder's results are in the library the folder is in.
+        if (page.searchesScope()) search->folder = page.scopeId;
+        const std::string folderLibrary = page.searchesScope() ? embyCurrentLibraryId() : std::string();
         const auto dropped = std::make_shared<std::atomic<bool>>(false);
         embySearchDropped_ = dropped;
-        for (const auto& library : libraries) {
-            emby_.request("GET", embySearchPath(library, page.term), "",
+        for (const auto& parent : parents) {
+            const std::string library = page.searchesScope() ? folderLibrary : parent;
+            emby_.request("GET", embySearchPath(parent, page.term), "",
                           [this, serial, search, library](const EmbyClient::Response& response) {
                 embySearchArrived(serial, search, library, response);
             }, dropped);
@@ -1222,7 +1351,9 @@ void App::embySearchArrived(std::uint64_t serial, const std::shared_ptr<EmbySear
         // Said in the log by the library's id alone: the words searched for
         // may be a title, and the log goes into bug reports.
         const std::string error = response.ok ? std::string("unreadable reply") : response.error;
-        appendDiagnostic("Emby: search in library " + (library.empty() ? std::string("(all)") : library) +
+        appendDiagnostic("Emby: search in " +
+                         (!search->folder.empty() ? "folder " + search->folder
+                          : "library " + (library.empty() ? std::string("(all)") : library)) +
                          " failed: " + error);
         if (search->failed++ == 0) search->firstError = error;
     }
@@ -1246,8 +1377,9 @@ void App::embySearchArrived(std::uint64_t serial, const std::shared_ptr<EmbySear
                     L" libraries could not be searched.";
         embyNoteError_ = true;
     } else {
-        embyNote_ = embyItems_.empty() ? L"No title starts a word with that."
-                                       : L"Matches the start of a word in a title.";
+        embyNote_ = !embyItems_.empty()  ? L"Matches the start of a word in a title."
+                  : embyBrowser_.favorites ? L"No favorite's title starts a word with that."
+                                           : L"No title starts a word with that.";
         embyNoteError_ = false;
     }
 }
@@ -1399,6 +1531,7 @@ void App::embyListParsed(std::uint64_t serial, int startIndex, const EmbyClient:
     if (embyItems_.empty()) {
         embyNote_ = embyBrowser_.unplayed && embyPageAcceptsFilters() ? L"No unplayed videos match these filters."
                   : favorites ? L"No favorites yet. Right-click an item to add it."
+                  : embyListsFavoritesOnly() ? L"No favorites here."
                   : person && !embyBrowser_.unplayed ? L"No title in these libraries names this person."
                                                      : L"Nothing here.";
     } else if (refreshed || !embyNote_.empty()) {
@@ -1534,9 +1667,10 @@ void App::embyFavoriteArrived(std::uint64_t account, const std::string& itemId, 
     appendDiagnostic("Emby: item " + itemId + (favorite ? " is a favorite" : " is not a favorite"));
     if (favorite != wanted) showNotice(L"Emby did not change the favorite: " + title);
     else showNotice((favorite ? L"\x2665 Added to Emby favorites: " : L"Removed from Emby favorites: ") + title);
-    // The favorites page shown drops what was unmarked, and shows what was
-    // marked from its information pages, when it is next kept fresh.
-    if (!embyPages_.empty() && embyPages_.back().kind == EmbyPage::Kind::Favorites) embyWantRefresh();
+    // The favorites page, or a page showing only its favorites, drops what
+    // was unmarked, and shows what was marked from its information pages,
+    // when it is next kept fresh.
+    if (embyListsFavoritesOnly()) embyWantRefresh();
 }
 
 void App::embyApplyFavorite(const std::string& itemId, bool favorite) {

@@ -59,6 +59,7 @@ void App::loadFiles(const std::vector<std::wstring>& files) {
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) resetPaneMediaState(pane);
     startDelays_.fill(0.0);
     syncAdjustments_.fill(0.0);
+    browserOffsets_.fill(0.0);
     playbackRates_.fill(1.0);
     sourcePaused_.fill(false);
     sourcePausedTimes_.fill(0.0);
@@ -89,24 +90,32 @@ void App::openSource(std::size_t pane, const std::wstring& path, bool resetAdjus
         browserSeekAligned_ = false;
         deviceRecoverySourceDurations_[pane] = 0.0;
     }
-    const bool retainEmbyQueue = !resetAdjustment && paths_[pane] == path &&
-        emby::isLocator(path) && embyPaneAccountMatches(pane);
+    // The same video opened again where it was: a decoder, renderer or card
+    // change, a device recovery.
+    const bool sameMedia = !resetAdjustment && paths_[pane] == path;
+    const bool retainEmbyQueue = sameMedia && emby::isLocator(path) && embyPaneAccountMatches(pane);
     auto retainedQueue = retainEmbyQueue ? std::optional<emby::PlaybackQueue>(embyPanes_[pane]->queue)
                                         : std::nullopt;
     const bool retainedAddedMuted = retainEmbyQueue && embyPanes_[pane]->addedMuted;
-    auto retainedLocal = !resetAdjustment && paths_[pane] == path
-        ? localPanes_[pane] : std::optional<LocalPanePlayback>{};
+    auto retainedLocal = sameMedia ? localPanes_[pane] : std::optional<LocalPanePlayback>{};
     if (perPaneTimelines() || emby::isLocator(path)) detachPaneSeekBarrier(pane);
     const double position = clock_.position();
     const bool playing = clock_.isPlaying();
     embyReport(pane, "stopped");
     if (sources_[pane]) sources_[pane]->setAudioEnabled(false);
     audio_.flush(pane);
+    // An Emby video as it stands, its Stopped report sent, for a reopen that
+    // waits for the device below.
+    auto waitingEmby = retainEmbyQueue && (deviceRecoveryPending_ || renderer_.deviceLost())
+        ? embyPanes_[pane] : std::optional<EmbyPane>{};
     retireSource(pane);
-    resetPaneMediaState(pane);
+    // It keeps what the viewer chose for it, also through a reopen that
+    // waits for the device below.
+    resetPaneMediaState(pane, sameMedia);
     localPanes_[pane] = std::move(retainedLocal);
     if (resetAdjustment) {
         syncAdjustments_[pane] = 0.0;
+        browserOffsets_[pane] = 0.0;
         sourcePaused_[pane] = false;
         sourcePausedTimes_[pane] = 0.0;
         sourceLoopEnabled_[pane] = false;
@@ -119,6 +128,15 @@ void App::openSource(std::size_t pane, const std::wstring& path, bool resetAdjus
     // guarantees that a retry cannot release a device underneath a source
     // opened during the one-second retry interval.
     if (deviceRecoveryPending_ || renderer_.deviceLost()) {
+        // An Emby video waits as one whose reply came during the rebuild
+        // does: its item, its list and how it was added stay for the reopen
+        // made once there is a device, which keeps them; a reply still out
+        // for it from before no longer finds it.
+        if (waitingEmby) {
+            waitingEmby->serial = ++embyPaneSerial_;
+            waitingEmby->resolving = false;
+            embyPanes_[pane] = std::move(waitingEmby);
+        }
         sourceInitialAlignmentPending_[pane] = false;
         sourceProvisionalTargets_[pane] = 0.0;
         lastVideoMappedTimes_[pane] = -1.0;
@@ -138,9 +156,16 @@ void App::openSource(std::size_t pane, const std::wstring& path, bool resetAdjus
     }
     // Its subtitles: the files beside it, found off this thread, and the
     // stream inside it that suits the viewer, read from the first packet.
-    loadSidecarSubtitles(pane, path);
+    // The same video opened again keeps the files loaded by hand, which the
+    // scan puts after those it finds, and gives the new source the viewer's
+    // own choice.
+    auto heldFiles = std::move(subtitleFiles_[pane]);
+    const SubtitleSelection viewerChoice = subtitleSelection_[pane];
+    loadSidecarSubtitles(pane, path, sameMedia);
+    subtitleFiles_[pane] = std::move(heldFiles);
     startSourceStream(pane, path, localSourceOptions(), -1, position, playing);
     subtitleEmbeddedPending_[pane] = true;
+    if (subtitleChosenByViewer_[pane]) selectSubtitle(pane, viewerChoice, false);
     // The only video brings its folder with it: the list F6 shows and the
     // step keys walk.
     if (singleLoadedPane() == static_cast<int>(pane)) localFollowVideo(path);
@@ -155,6 +180,9 @@ void App::openSource(std::size_t pane, const std::wstring& path, bool resetAdjus
 // The pane's next source counts its frames from zero, and so does its Perf line.
 void App::retireSource(std::size_t pane) {
     if (pane >= sources_.size() || !sources_[pane]) return;
+    // The track the viewer picked, as the source last asked for it: one it
+    // could not switch to was given up there.
+    if (audioTrackChoices_[pane] >= 0) audioTrackChoices_[pane] = sources_[pane]->requestedAudioTrack();
     sourceReaper_.retire(std::move(sources_[pane]));
     lastDecodedFrames_[pane] = 0;
     lastCapacityWaits_[pane] = 0;
@@ -166,12 +194,25 @@ void App::startSourceStream(std::size_t pane, const std::wstring& url, const Sou
     sources_[pane] = std::make_unique<VideoSource>();
     VideoSource* sourceIdentity = sources_[pane].get();
     sourceIdentity->setAudioOutputPane(pane);
+    // A track the viewer picked for this video holds when it is opened
+    // again, ahead of the one asked for and of the language below.
+    const bool viewerTrack = audioTrackChoices_[pane] >= 0;
+    if (viewerTrack) audioStream = audioTrackChoices_[pane];
     if (audioStream >= 0) sourceIdentity->setAudioTrack(audioStream);
+    // The voices' layout, its delay and tempo, and the language its sound
+    // starts in, before the worker reads them.
+    prepareSourceAudio(*sourceIdentity, pane);
+    SourceOptions sourceOptions = options;
+    if (viewerTrack) {
+        sourceOptions.audioLanguage.clear();
+    } else if (sourceOptions.audioLanguage.empty()) {
+        sourceOptions.audioLanguage = std::string(audioLanguageTag(audioSettings_.language));
+    }
     sources_[pane]->open(
         url, renderer_.device(), renderer_.deviceContext(),
         &renderer_.deviceMutex(), decodeMode_, [this, sourceIdentity](AudioChunk&& chunk) {
             return audio_.submit(sourceIdentity->audioOutputPane(), std::move(chunk));
-        }, nasCacheEnabled_ ? CacheMode::Network : CacheMode::Off, options);
+        }, nasCacheEnabled_ ? CacheMode::Network : CacheMode::Off, sourceOptions);
     sources_[pane]->setAudioEnabled(false);
     const double provisionalTarget = mappedSourceTime(pane, position);
     sourceInitialAlignmentPending_[pane] = true;
@@ -263,16 +304,47 @@ void App::applyPaneOffset(std::size_t pane, double seconds) {
 
 void App::setPaneOffset(std::size_t pane, double seconds) {
     if (pane >= sources_.size() || !std::isfinite(seconds)) return;
+    seconds = std::clamp(seconds, -86400.0, 86400.0);
+    if (perPaneTimelines()) {
+        moveBrowserPaneOffset(pane, seconds);
+        return;
+    }
     browserSeekAligned_ = false;
-    applyPaneOffset(pane, std::clamp(seconds, -86400.0, 86400.0));
+    applyPaneOffset(pane, seconds);
     seekAbsolute(clock_.position());
+}
+
+// A browser video's offset moves that video alone: to the aligned time plus
+// its offset once the Linked rail has aligned the videos, by the change
+// before that. Every later alignment keeps it.
+void App::moveBrowserPaneOffset(std::size_t pane, double seconds) {
+    if (pane >= sources_.size()) return;
+    const double change = seconds - browserOffsets_[pane];
+    browserOffsets_[pane] = seconds;
+    if (!sources_[pane]) return;
+    const bool aligned = linkedBrowserSeekBars() && browserSeekAligned_;
+    if (aligned) placeBrowserPane(pane, clock_.position());
+    else seekPaneTo(pane, currentSourceTime(pane) + change);
+    // seekPaneTo forgets the alignment, which still holds with the offset.
+    browserSeekAligned_ = aligned;
+}
+
+// One browser video at the aligned time plus its offset under the current
+// clock; one sent before its start waits there, as an offset below zero
+// keeps a video waiting.
+void App::placeBrowserPane(std::size_t pane, double alignedTime) {
+    const double target = alignedTime + browserOffsets_[pane];
+    seekPaneTo(pane, target);
+    if (target < 0.0) syncAdjustments_[pane] += target;
 }
 
 // The signed value the UI calls Offset, which folds the legacy start delay into
 // the adjustment so that sessions written before the two merged still read back
-// as one number.
+// as one number. On a deck of browser videos it is each one's own, kept apart
+// from an adjustment that also carries when the video was opened.
 double App::paneOffsetSeconds(std::size_t pane) const {
     if (pane >= sources_.size()) return 0.0;
+    if (perPaneTimelines()) return browserOffsets_[pane];
     return effectiveTimelineOffset(
         startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]);
 }
@@ -286,9 +358,13 @@ bool App::anyPaneOffset() const {
 
 void App::resetPaneOffset(std::size_t pane) {
     if (pane >= sources_.size() || !sources_[pane]) return;
-    browserSeekAligned_ = false;
-    applyPaneOffset(pane, 0.0);
-    seekAbsolute(clock_.position());
+    if (perPaneTimelines()) {
+        moveBrowserPaneOffset(pane, 0.0);
+    } else {
+        browserSeekAligned_ = false;
+        applyPaneOffset(pane, 0.0);
+        seekAbsolute(clock_.position());
+    }
     showNotice(L"V" + std::to_wstring(positionForPane(pane) + 1) + L" offset reset");
     updateControls();
     updateTitle();
@@ -298,15 +374,20 @@ void App::resetPaneOffset(std::size_t pane) {
 // freeze the clock and wait for every pane to land, which is the slowest thing
 // this player does.
 void App::resetAllOffsets() {
+    // Browser videos move one by one, each on its own; none waits for another.
+    const bool browser = perPaneTimelines();
     bool changed = false;
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
         if (!sources_[pane] || paneOffsetSeconds(pane) == 0.0) continue;
-        applyPaneOffset(pane, 0.0);
+        if (browser) moveBrowserPaneOffset(pane, 0.0);
+        else applyPaneOffset(pane, 0.0);
         changed = true;
     }
     if (!changed) return;
-    browserSeekAligned_ = false;
-    seekAbsolute(clock_.position());
+    if (!browser) {
+        browserSeekAligned_ = false;
+        seekAbsolute(clock_.position());
+    }
     showNotice(L"All offsets reset");
     updateControls();
     updateTitle();
@@ -441,6 +522,15 @@ bool App::paneRepeatSavedButIdle(std::size_t pane) const {
     return !paneRepeatFlagInForce(paneOrigins(), pane, seekMode_);
 }
 
+// Whether a video on a Linked deck of F6 and Emby videos starts over with the
+// others: its own repeat as paneTiming reads it elsewhere, or "Repeat it".
+bool App::repeatsWithLinkedVideos(std::size_t pane) const {
+    if (pane >= sources_.size()) return false;
+    if (playOrder_ == PlayOrder::RepeatOne) return true;
+    return sourceAutoRepeat_[pane] && !(localPanes_[pane] && localPanes_[pane]->suppressInheritedRepeat) &&
+           paneRepeatFlagInForce(paneOrigins(), pane, seekMode_);
+}
+
 PaneTiming App::paneTiming(std::size_t pane) const {
     PaneTiming timing;
     if (pane >= sources_.size()) return timing;
@@ -461,6 +551,9 @@ PaneTiming App::paneTiming(std::size_t pane) const {
     // retain their previous seek policy: one is Linked, several use the
     // saved mode. Adding a pane must not suddenly wrap an ended local source.
     if (!paneRepeatFlagInForce(paneOrigins(), pane, seekMode_)) timing.autoRepeat = false;
+    // Linked, the F6 and Emby videos repeat together (finishLinkedBrowserSet):
+    // one wrapping alone would leave its place among the others.
+    if (linkedBrowserSeekBars()) timing.autoRepeat = false;
     if (sources_[pane]) {
         timing.loaded = true;
         timing.ready = sources_[pane]->ready();
@@ -509,11 +602,10 @@ PaneArray<float> App::paneAspectRatios() const {
     PaneArray<float> aspects{};
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
         if (!sources_[pane]) continue;
-        const int width = sources_[pane]->videoWidth();
-        const int height = sources_[pane]->videoHeight();
-        if (width > 0 && height > 0) {
-            aspects[pane] = static_cast<float>(width) / static_cast<float>(height);
-        }
+        // The picture's shape on screen, the shown frame's own: a DVD's wide
+        // pixels make its 720x576 a 16:9 pane, and a broadcast gone from
+        // 1920x1080 to 1440x1080 at 4:3 stays 16:9.
+        if (const float aspect = sources_[pane]->videoDisplayAspect(); aspect > 0.0F) aspects[pane] = aspect;
     }
     return aspects;
 }
@@ -657,7 +749,7 @@ void App::closePane(std::size_t pane) {
     retireSource(pane);
     paths_[pane].clear();
     resetPaneMediaState(pane);
-    startDelays_[pane] = syncAdjustments_[pane] = sourcePausedTimes_[pane] = 0.0;
+    startDelays_[pane] = syncAdjustments_[pane] = sourcePausedTimes_[pane] = browserOffsets_[pane] = 0.0;
     playbackRates_[pane] = 1.0;
     sourcePaused_[pane] = sourceLoopEnabled_[pane] = false;
     sourceLoopA_[pane] = sourceLoopB_[pane] = 0.0;
@@ -740,6 +832,8 @@ void App::swapPanes(std::size_t first, std::size_t second) {
     std::swap(subtitleChosenByViewer_[first], subtitleChosenByViewer_[second]);
     std::swap(subtitleEmbeddedPending_[first], subtitleEmbeddedPending_[second]);
     std::swap(subtitleDelay_[first], subtitleDelay_[second]);
+    std::swap(audioDelays_[first], audioDelays_[second]);
+    std::swap(audioTrackChoices_[first], audioTrackChoices_[second]);
     {
         // Whether its lines are shown goes with the video too.
         const bool firstShown = subtitlesShownFor(subtitleSettings_, first);

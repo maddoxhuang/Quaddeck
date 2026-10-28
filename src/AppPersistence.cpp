@@ -197,6 +197,7 @@ AppSettings App::captureAppSettings() const {
     state.playOrder = playOrder_;
     state.keyframeSeek = keyframeSeek_;
     state.subtitles = subtitleSettings_;
+    state.keys = keyBindings_;
     state.style = captureStyle();
     state.decode = decodeMode_;
     state.seek = seekMode_;
@@ -209,6 +210,8 @@ AppSettings App::captureAppSettings() const {
         state.paneVolume[pane] = audio_.paneVolume(pane);
         state.paneMuted[pane] = audio_.paneMuted(pane);
     }
+    state.audio = audioSettings_;
+    state.video = videoOutput_;
     WINDOWPLACEMENT placement{sizeof(placement)};
     if (fullscreen_) {
         placement = previousPlacement_;
@@ -225,6 +228,9 @@ AppSettings App::captureAppSettings() const {
 }
 
 bool App::saveAppSettings() const {
+    // Before the file is read the App holds only its defaults, which would
+    // replace the user's file whole.
+    if (!settingsRead_) return true;
     // The refusal was logged once at startup; there is nothing to retry.
     if (settingsReadOnly_) return true;
     const auto path = settingsPath();
@@ -269,6 +275,7 @@ void App::flushScheduledAppSettingsSave() {
 }
 
 bool App::loadAppSettings() {
+    settingsRead_ = true;
     settingsReadOnly_ = false;
     const auto path = settingsPath();
     std::error_code missing;
@@ -322,11 +329,16 @@ bool App::loadAppSettings() {
     nasCacheEnabled_ = state.nasCache;
     rtxVideo_ = state.rtxVideo;
     renderer_.setVideoEnhancements(rtxVideo_);
+    // primeVideoOutput built the renderer as these say already; a file that
+    // changed since, or failed then, has it built again.
+    videoOutput_ = clampVideoOutputSettings(state.video);
+    applyVideoOutput();
     embyBrowser_ = clampEmbyBrowserPrefs(state.embyBrowser);
     embyLibraries_ = state.embyLibraries;
     playOrder_ = state.playOrder;
     keyframeSeek_ = state.keyframeSeek;
     subtitleSettings_ = clampSubtitleSettings(state.subtitles);
+    keyBindings_ = state.keys;
     decodeMode_ = state.decode;
     seekMode_ = state.seek;
     repeatAll_ = state.repeatAll;
@@ -352,7 +364,18 @@ bool App::loadAppSettings() {
             showNotice(L"Shader file not loaded; the preset runs until it can be read");
         }
     }
-    audio_.setVolume(state.volume);
+    {
+        // The output opened at startup on Windows' default and in stereo:
+        // opened again only when the settings want another or more speakers.
+        const AudioSettings previous = audioSettings_;
+        audioSettings_ = clampAudioSettings(state.audio);
+        if (audioStarted_ && (audioSettings_.deviceId != previous.deviceId ||
+                              audioSettings_.deviceChannels != previous.deviceChannels)) {
+            reopenAudioOutput("Audio output from the settings");
+        }
+        applyAudioEffects();
+    }
+    audio_.setVolume(std::min(state.volume, maxMasterVolume()));
     audio_.setMuted(state.muted);
     for (std::size_t pane = 0; pane < state.paneVolume.size(); ++pane) {
         audio_.setPaneVolume(pane, state.paneVolume[pane]);
@@ -405,6 +428,7 @@ void App::loadStyleDialog() {
 
 void App::applySession(const SessionState& state) {
     browserSeekAligned_ = false;
+    browserOffsets_.fill(0.0);
     deviceRecoverySourceDurations_.fill(0.0);
     cancelSeekBarrier();
     clock_.pause();

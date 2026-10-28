@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(QuadDeck VERSION 1.3.0 LANGUAGES CXX)
+project(QuadDeck VERSION 1.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,13 +65,18 @@ if(WIN32)
     src/AppChrome.cpp
     src/Overlay.cpp
     src/AppPanel.cpp
+    src/AppSettingsWindow.cpp
+    src/WindowSurface.cpp
     src/AppEmby.cpp
     src/AppEmbyBrowser.cpp
     src/AppEmbyPlayback.cpp
     src/AppEmbyDetails.cpp
     src/AppEmbySearch.cpp
     src/AppTextFields.cpp
+    src/AppKeys.cpp
     src/AppSubtitles.cpp
+    src/AppAudio.cpp
+    src/AppVideo.cpp
     src/AssSubtitles.cpp
     src/AppLocal.cpp
     src/LocalThumbnails.cpp
@@ -79,9 +84,11 @@ if(WIN32)
     src/EmbyClient.cpp
     src/FilePersistence.cpp
     src/D3DRenderer.cpp
+    src/VideoDevices.cpp
     src/VideoSource.cpp
     src/ReadAheadCache.cpp
     src/AudioOutput.cpp
+    src/AudioDevices.cpp
     src/HangWatchdog.cpp
     src/QuadDeck.rc
   )

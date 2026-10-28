@@ -111,9 +111,14 @@ struct OverlayPanelScene {
     const std::vector<PanelRow>* sharedRows{};
     const PanelLayout& shownLayout() const { return sharedLayout ? *sharedLayout : layout; }
     const std::vector<PanelRow>& shownRows() const { return sharedRows ? *sharedRows : rows; }
-    // The tab strip's captions and the chosen tab; empty for a sheet without tabs.
+    // The tabs' captions and the chosen tab; empty for a sheet without tabs.
+    // With tabs, `title` stands over them and the chosen tab's caption
+    // heads the rows.
     std::vector<std::wstring> tabs;
     int tab{-1};
+    // One icon a tab, beside its caption (settingsTabGlyph), drawn where the
+    // icon face is installed; empty for none.
+    std::wstring tabGlyphs;
     // The header switches' captions, one per layout.sheetSwitches: the
     // sheet's other faces.
     std::vector<std::wstring> switchCaptions;
@@ -127,6 +132,8 @@ struct OverlayPanelScene {
     int pressedRow{-1};
     int pressedPart{-1};
     int dragRow{-1};
+    // The band of an Equalizer row being dragged.
+    int dragPart{-1};
     bool scrollbarHot{};
     bool scrollbarDragging{};
     // The videos being played, where the list shows them, marked across the
@@ -169,6 +176,38 @@ struct OverlayPanelMenuScene {
     int position{-1};
 };
 
+// One video's row of the sync panel.
+struct OverlaySyncPanelRowScene {
+    // Its place on the screen, 0 for V1: its tag and lit marks are in that
+    // place's colour.
+    int position{};
+    std::wstring label;
+    // Its offset as read, and whether it has one: then it is lit.
+    std::wstring offset;
+    bool offsetSet{};
+    // Its repeat flag, and whether the flag acts where it is: dimmed if not.
+    bool repeat{};
+    bool repeatInForce{};
+};
+
+// The sync panel that is open; an invisible card when none is.
+struct OverlaySyncPanelScene {
+    SyncPanelLayout layout{};
+    // Fading in, and the distance it still has to rise to its place.
+    float alpha{};
+    float offset{};
+    // The seek bars' mode chosen, by SeekMode, and what it means.
+    int mode{};
+    std::wstring hint;
+    std::array<OverlaySyncPanelRowScene, kMaxPanes> rows{};
+    bool resetEnabled{};
+    // The key that sets every offset to zero, as the viewer has it.
+    std::wstring resetKey;
+    std::wstring footHint;
+    SyncPanelHit hot{};
+    SyncPanelHit pressed{};
+};
+
 struct OverlayScene {
     float width{};
     float height{};
@@ -189,6 +228,15 @@ struct OverlayScene {
     // The place of the video the rail is the timeline of, whose colour it
     // is filled in; -1 while it is all of them.
     int seekPosition{-1};
+    // While the rail is the timeline of several videos: where each ends on
+    // it, by its place on the screen, as a share of the rail; negative for
+    // none marked (no video there, or one that ends with the rail).
+    PaneArray<float> seekEnds{-1.0F, -1.0F, -1.0F, -1.0F, -1.0F};
+    // The Sync key: lit while the videos share one timeline.
+    bool syncLinked{};
+    // The place of the video shown alone, whose button on the bar is lit;
+    // -1 while every video shows, and All videos is lit.
+    int soloPosition{-1};
     bool seekHot{};
     bool seekDragging{};
     // Pointer x over the rail for the time bubble; negative when absent.
@@ -231,6 +279,8 @@ struct OverlayScene {
     OverlayRect tooltipAnchor{};
 
     bool showEmptyHint{};
+    // The hint's line of keys, as the viewer has them.
+    std::wstring emptyHintKeys;
     // Where the hint's lines and its Open file and Open Emby buttons stand,
     // how far the buttons show (they fade under the sheet) and their
     // pointer states.
@@ -243,6 +293,7 @@ struct OverlayScene {
 
     OverlayPanelScene panel;
     OverlayPanelMenuScene panelMenu;
+    OverlaySyncPanelScene syncPanel;
 };
 
 enum class OverlayTextStyle { Body, BodyBold, Small, Title, Icon, MediaTitle, MediaTitleCompact, CaptionIcon };
@@ -277,6 +328,11 @@ public:
     // Opt-in wrapped notes use the same layout for measurement and paint.
     void measureWrappedNote(PanelRow& row, float rowWidth, float scale);
 
+    // A Choice or Buttons row's caption, label and value widths, in the
+    // styles a compact row is drawn in, for panelCompactRow; left to its
+    // estimate where no font is ready.
+    void measureCaptions(PanelRow& row, float scale);
+
     // A drop-down's text widths by item, in the styles it is drawn in, for
     // panelMenuLayout; 0 where no font is ready.
     void measurePanelMenu(const std::vector<PanelMenuItem>& items, float scale,
@@ -288,8 +344,22 @@ public:
     // BGRA layer the renderer composites itself (its 10-bit PQ output mode):
     // it is cleared first and drawn with premultiplied alpha.
     void draw(IDXGISurface* surface, const OverlayScene& scene, bool transparentLayer = false);
+    // Paints the settings window: the scene's sheet over the whole of a
+    // surface of its own, cleared to the sheet's colour first, and the
+    // tooltip over it; nothing else of the scene. Called with the device
+    // lock held, as draw is.
+    void drawSheetWindow(IDXGISurface* surface, const OverlayScene& scene);
+    // Paints a drop-down's list in a window of its own: the scene's menu,
+    // its card the whole surface -- the window's corners, frame and shadow
+    // are Windows' -- with a hairline round it where Windows draws no frame
+    // (`border`). Called with the device lock held, as draw is.
+    void drawMenuWindow(IDXGISurface* surface, const OverlayScene& scene, bool border);
 
 private:
+    // Points the context at `surface` and begins drawing; false when the
+    // surface cannot be drawn on. endFrame finishes what beginFrame began.
+    bool beginFrame(IDXGISurface* surface, bool transparentLayer);
+    void endFrame();
     struct Formats {
         float scale{};
         Microsoft::WRL::ComPtr<IDWriteTextFormat> body;
@@ -337,6 +407,48 @@ private:
     void button(const OverlayRect& box, wchar_t code, const wchar_t* fallback,
                 bool hot, bool pressed, bool toggled, float alpha, float scale, bool dimmed = false,
                 int video = -1);
+    // A button of words: the bar's button for the video at place `video`,
+    // its name in a pale shade of its colour, lit in it while `toggled`.
+    void labelButton(const OverlayRect& box, const wchar_t* label, bool hot, bool pressed, bool toggled,
+                     float alpha, float scale, int video);
+    // What is behind a button's glyph or words: lit, pressed, under the pointer.
+    void buttonGround(const OverlayRect& box, bool hot, bool pressed, bool toggled, float alpha, float scale,
+                      int video);
+    // The faces every surface draws its controls with, so the bar, the
+    // menus, the sync panel, the sheet and the settings window are one
+    // app's (Overlay.cpp has the palette they take their colours from).
+    // A button with a face at rest, a little lighter under the pointer and
+    // pressed; `edged` outlines it where it stands over a picture.
+    void quietButton(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale, bool edged = false);
+    // A form's own button, the one its Enter presses: in the accent, or in
+    // the colour of the video at place `video` it acts for.
+    void primaryButton(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale, int video = -1);
+    // What is chosen -- a segment, a filter that is on, a key being set --
+    // in the video's colour (the accent for none); its words in its ink.
+    void chosenFace(const OverlayRect& box, bool hot, float alpha, float scale, int video = -1);
+    // A line or a segment not chosen: bare at rest, lit under the pointer
+    // and while pressed. A list's lines, a menu's, the tabs.
+    void litFace(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale);
+    // The track a line of segments is cut from.
+    void segmentTrack(const OverlayRect& box, float alpha, float scale);
+    // A box something is chosen or typed in -- a drop-down's, a spin box's,
+    // a text box -- ringed in the video's colour while it is `active`: open,
+    // or being typed into.
+    void fieldBox(const OverlayRect& box, bool hot, bool active, float alpha, float scale, int video = -1);
+    // A key in a dim cap, as a menu shows a line's key.
+    void keyCap(const OverlayRect& box, const std::wstring& key, float alpha, float scale);
+    // A card in the page, as the settings window's rows stand on: a raised
+    // card's ground and edge, `radius` round, with no shadow.
+    void flatCard(const OverlayRect& box, float radius, float alpha, float scale);
+    // What is being played, or the tab being shown: tinted in the video's
+    // colour with a bar at its left.
+    void currentMark(const OverlayRect& box, int video, float alpha, float scale);
+    // A window's caption button: square, edge to edge, Close turning red.
+    void captionButton(const OverlayRect& box, wchar_t code, const wchar_t* fallback, bool close, bool hot,
+                       bool pressed, float alpha);
+    // A scrolled list's thumb, `right` its right edge: thin, wider while it
+    // is under the pointer or dragged.
+    void scrollThumb(float right, float y, float height, bool active, float alpha, float scale);
     // Filled to the playhead in the accent, or in the video's colour.
     void rail(const OverlayRect& band, float inset, float thickness, float position01,
               float buffered01, bool showThumb, float thumbRadius, float alpha, int video = -1);
@@ -359,6 +471,8 @@ private:
     void trimBitmaps();
     void drawTile(const PanelRow& row, std::size_t part, const OverlayRect& box, bool hot, bool pressed,
                   float alpha, float scale, const ThumbnailCache* cache);
+    void drawEqualizer(const PanelRow& row, const PanelRowGeometry& geometry, int hotPart, int dragPart,
+                       float alpha, float scale);
     void drawMediaBackdrop(const PanelMediaDetail& detail, const OverlayRect& box,
                            float alpha, const ThumbnailCache* cache);
     void drawMediaDetail(const PanelRow& row, const PanelRowGeometry& geometry,
@@ -378,9 +492,14 @@ private:
     void drawEmptyHint(const OverlayScene& scene);
     void drawPanel(const OverlayScene& scene);
     void drawPanelMenu(const OverlayScene& scene);
-    // One card of it: `opened` is the line whose submenu is open.
+    // One card of it: `opened` is the line whose submenu is open. Not
+    // `raised`, the card is a window's whole surface, already its colour.
     void drawPanelMenuCard(const std::vector<PanelMenuItem>& items, const PanelMenuLayout& layout, int highlighted,
-                           int pressed, int opened, float alpha, float offset, float scale, int video);
+                           int pressed, int opened, float alpha, float offset, float scale, int video,
+                           bool raised = true);
+    // A menu's raised card, softly shadowed: the sync panel's too.
+    void raisedCard(const OverlayRect& card, float alpha, float scale);
+    void drawSyncPanel(const OverlayScene& scene);
 
     Microsoft::WRL::ComPtr<ID2D1Factory1> factory_;
     Microsoft::WRL::ComPtr<ID2D1Device> device_;

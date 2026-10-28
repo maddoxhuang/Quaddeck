@@ -20,7 +20,7 @@ namespace quaddeck {
 
 using namespace app_internal;
 
-namespace {
+namespace app_internal {
 
 std::wstring clipboardText(HWND owner) {
     std::wstring text;
@@ -53,6 +53,10 @@ void setClipboardText(HWND owner, const std::wstring& text) {
     }
     CloseClipboard();
 }
+
+}  // namespace app_internal
+
+namespace {
 
 bool signInField(TextFieldId id) {
     return id == TextFieldId::EmbyServer || id == TextFieldId::EmbyUser || id == TextFieldId::EmbyPassword;
@@ -369,10 +373,14 @@ void App::fieldPlaceIme() {
 }
 
 void App::fieldSyncIme() {
-    // A password is typed key by key, never composed: the input method is
-    // off while its box has the typing, as in Windows' own password box.
+    // The input method is on only while a box that composes has the typing.
+    // Anywhere else a letter is a shortcut, and an input method in its
+    // native mode would take it for a composition, the key coming as
+    // VK_PROCESSKEY. A password is typed key by key, never composed, as in
+    // Windows' own password box.
     // Turned off only with the keyboard here; on again whenever it was off.
-    const bool off = maskedField(fieldTyping());
+    const TextFieldId typing = fieldTyping();
+    const bool off = typing == TextFieldId::None || maskedField(typing);
     if (!window_ || off == fieldImeOff_ || (off && !keyboardFocus_)) return;
     ImmAssociateContextEx(window_, nullptr, off ? 0 : IACE_DEFAULT);
     fieldImeOff_ = off;

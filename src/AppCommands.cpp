@@ -66,22 +66,28 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
         const std::size_t index = static_cast<std::size_t>(pane);
         const bool loaded = paneLogicallyLoaded(index);
         menu.option(CmdOpenPane, loaded ? L"Replace video..." : L"Open video...");
-        menu.option(CmdOpenEmby, L"Open from Emby...", false, L"Ctrl+E");
-        menu.option(CmdPreviousFile, L"Previous file in folder", false, L"Page Up", loaded);
-        menu.option(CmdNextFile, L"Next file in folder", false, L"Page Down", loaded);
+        menu.option(CmdOpenEmby, L"Open from Emby...", false, shortcut(KeyAction::Emby));
+        menu.option(CmdPreviousFile, L"Previous file in folder", false, shortcut(KeyAction::PreviousFile), loaded);
+        menu.option(CmdNextFile, L"Next file in folder", false, shortcut(KeyAction::NextFile), loaded);
         menu.option(CmdClosePane, L"Close video", false, {}, loaded);
         appendEmbyFavoriteMenu(menu, index);
-        menu.check(CmdSelectAudio, L"Output this audio", audioPaneEnabled(index), L"1-5", loaded);
+        menu.check(CmdSelectAudio, L"Output this audio", audioPaneEnabled(index),
+                   shortcut(audioKeyAction(positionForPane(index))), loaded);
         menu.check(CmdPaneMute, L"Mute this video", audio_.paneMuted(index), {}, loaded);
         menu.check(CmdTogglePanePause, L"Pause this video", sources_[index] && sourcePaused_[index], {},
                    sources_[index] != nullptr);
         const bool onlyVideo = singleLoadedPane() == pane;
         menu.check(CmdTogglePaneRepeat,
                    onlyVideo ? L"Repeat this video"
-                       : paneRepeatFlagInForce(paneOrigins(), index, seekMode_) ? L"Repeat this video (Independent mode)"
-                       : L"Repeat this video (not beside F6 or Emby videos)",
+                       : !paneRepeatFlagInForce(paneOrigins(), index, seekMode_)
+                       ? L"Repeat this video (not beside F6 or Emby videos)"
+                       : linkedBrowserSeekBars() ? L"Repeat this video (with the others, Linked)"
+                       : L"Repeat this video (Independent mode)",
                    onlyVideo ? playOrder_ == PlayOrder::RepeatOne : sourceAutoRepeat_[index], {}, loaded);
-        if (severalPanesLoaded()) menu.check(CmdToggleSolo, L"Solo this video", soloPane_ == pane, {}, loaded);
+        if (severalPanesLoaded()) {
+            menu.check(CmdToggleSolo, L"Solo this video", soloPane_ == pane,
+                       shortcut(soloKeyAction(positionForPane(index))), loaded);
+        }
         menu.option(CmdResetPaneOffset, L"Reset this video's offset", false, {},
                     sources_[index] && paneOffsetSeconds(index) != 0.0);
         const auto active = activePanes();
@@ -115,6 +121,9 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
         PanelMenu audioTracks;
         const std::size_t listedTracks = appendAudioTrackMenu(audioTracks, index);
         menu.submenu(L"Audio track", std::move(audioTracks), listedTracks > 1);
+        PanelMenu audioSync;
+        appendPaneAudioSyncMenu(audioSync, index);
+        menu.submenu(L"Audio sync", std::move(audioSync), loaded);
         // Never greyed: with nothing on offer it is still where a subtitle
         // file is loaded from.
         PanelMenu subtitles;
@@ -134,9 +143,15 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
 
     const bool group = severalPanesLoaded();
     menu.option(CmdPlayPause, group ? (playbackIntended() ? L"Pause all" : L"Play all")
-                                    : (playbackIntended() ? L"Pause" : L"Play"), false, L"Space");
+                                    : (playbackIntended() ? L"Pause" : L"Play"), false, shortcut(KeyAction::PlayPause));
     menu.option(CmdStop, group ? L"Stop all" : L"Stop");
-    menu.check(CmdMute, group ? L"Mute all" : L"Mute", audio_.muted(), L"M");
+    menu.check(CmdMute, group ? L"Mute all" : L"Mute", audio_.muted(), shortcut(KeyAction::Mute));
+    PanelMenu audio;
+    appendAudioMenu(audio);
+    menu.submenu(L"Audio", std::move(audio));
+    PanelMenu video;
+    appendVideoMenu(video);
+    menu.submenu(L"Video", std::move(video));
     PanelMenu order;
     for (int i = 0; i < kPlayOrderCount; ++i) {
         const PlayOrder value = clampPlayOrder(i);
@@ -144,9 +159,10 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
     }
     menu.submenu(L"When a video ends", std::move(order));
     PanelMenu masterLoop;
-    masterLoop.option(CmdMasterLoopSetA, L"Set A at master time  (loops to the end until B is set)", false, L"[")
-        .option(CmdMasterLoopSetB, L"Set B at master time", false, L"]")
-        .check(CmdMasterLoopToggle, L"Enable master A-B loop", masterLoopEnabled_, L"L",
+    masterLoop.option(CmdMasterLoopSetA, L"Set A at master time  (loops to the end until B is set)", false,
+                      shortcut(KeyAction::LoopA))
+        .option(CmdMasterLoopSetB, L"Set B at master time", false, shortcut(KeyAction::LoopB))
+        .check(CmdMasterLoopToggle, L"Enable master A-B loop", masterLoopEnabled_, shortcut(KeyAction::LoopToggle),
                loopArmed(masterLoopA_, masterLoopB_, duration_))
         .option(CmdMasterLoopClear, L"Clear master loop");
     menu.submenu(L"Master A-B loop", std::move(masterLoop));
@@ -165,14 +181,14 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
     // Away from any pane, the whole empty window too: a file, as O, and
     // Emby. Over a pane its own section opens them, into that pane.
     if (pane < 0) {
-        menu.option(CmdOpenFiles, L"Open file...", false, L"O");
-        menu.option(CmdOpenEmby, L"Open from Emby...", false, L"Ctrl+E");
+        menu.option(CmdOpenFiles, L"Open file...", false, shortcut(KeyAction::OpenFiles));
+        menu.option(CmdOpenEmby, L"Open from Emby...", false, shortcut(KeyAction::Emby));
     }
-    menu.option(CmdSessionOpen, L"Open session...", false, L"Ctrl+O");
-    menu.option(CmdSessionSave, L"Save session...", false, L"Ctrl+S");
+    menu.option(CmdSessionOpen, L"Open session...", false, shortcut(KeyAction::OpenSession));
+    menu.option(CmdSessionSave, L"Save session...", false, shortcut(KeyAction::SaveSession));
     menu.separator();
-    menu.check(CmdFullscreen, L"Fullscreen", fullscreen_, L"Alt+Enter");
-    menu.option(CmdSettings, L"Settings...", false, L"F5");
+    menu.check(CmdFullscreen, L"Fullscreen", fullscreen_, shortcut(KeyAction::Fullscreen));
+    menu.option(CmdSettings, L"Settings...", false, shortcut(KeyAction::Settings));
     // The pane's lists as they were listed go with the menu, for its command.
     openWindowMenu(std::move(menu), anchor,
                    [this, snapshot = takePaneMenuSnapshot(), pane](unsigned command) {
@@ -213,7 +229,7 @@ void App::runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command,
 
 std::size_t App::appendAudioTrackMenu(PanelMenu& menu, std::size_t pane) {
     const auto tracks = sources_[pane] ? sources_[pane]->audioTracks() : std::vector<AudioTrackInfo>{};
-    const int activeTrack = sources_[pane] ? sources_[pane]->activeAudioTrack() : -1;
+    const int activeTrack = paneAudioTrack(pane);
     // Kept for the command the menu returns, as the subtitle entries are:
     // the next video may open under the menu with other tracks.
     audioMenuTracks_.clear();
@@ -269,6 +285,8 @@ void App::handleContextCommand(unsigned command, int pane) {
         change(current);
         realignPaneAfterMappingChange(index, timeline, before);
     };
+    if (handleAudioCommand(command, pane)) return;
+    if (handleVideoCommand(command)) return;
     if (command == CmdOpenPane && validPane) openFileForPane(index);
     else if (command == CmdOpenFiles) openFilesDialog();
     else if (command == CmdOpenEmby) embyOpenBrowser();
@@ -341,6 +359,8 @@ void App::handleContextCommand(unsigned command, int pane) {
             : rateChangeAdjustment(clock_.position(), startDelays_[index],
                                    syncAdjustments_[index], playbackRates_[index], rate, held);
         playbackRates_[index] = rate;
+        // The seek below starts the sound's next generation at the new tempo.
+        syncPaneAudioTempo(index);
         sourcePausedTimes_[index] = held;
         lastVideoMappedTimes_[index] = held;
         if (seekBarrier_.active()) seekAbsolute(clock_.position());
@@ -708,6 +728,37 @@ bool App::siblingFiles(const std::wstring& path, std::vector<std::wstring>& file
     return true;
 }
 
+bool App::playlistPlace(std::size_t pane, int& position, std::size_t& count) const {
+    position = -1;
+    count = 0;
+    if (pane >= paths_.size() || paths_[pane].empty()) return false;
+    const std::wstring& path = paths_[pane];
+    if (emby::isLocator(path)) {
+        // The page it was chosen on; past its ends the server's neighbours
+        // are asked for at the step, which is no list to count.
+        if (!embyPanes_[pane]) return false;
+        count = embyPanes_[pane]->queue.items.size();
+        position = embyPlaylistIndex(embyPanes_[pane]->itemId, pane);
+        return count > 0;
+    }
+    if (localPanes_[pane]) {
+        count = localPanes_[pane]->queue.size();
+        position = localEntryIndex(localPanes_[pane]->queue, path);
+        return count > 0;
+    }
+    // The F6 list without copying it: the title asks this a few times a
+    // second, and the list can hold thousands.
+    if (localListCovers(path) && !localList_.empty()) {
+        count = localList_.size();
+        position = localEntryIndex(localList_, path);
+        return true;
+    }
+    std::vector<std::wstring> files;
+    if (!siblingFiles(path, files, position)) return false;
+    count = files.size();
+    return count > 0;
+}
+
 void App::waitForSiblingFolder(std::size_t pane, int step, bool atEnd) {
     if (pane >= paths_.size() || paths_[pane].empty()) return;
     requestSiblingFolder(paths_[pane]);
@@ -811,7 +862,24 @@ void App::chooseLayout(LayoutMode mode) {
 void App::chooseSeekMode(SeekMode choice) {
     if (perPaneTimelines()) {
         if (choice != browserSeekMode_) {
+            // Independent wraps each repeating video alone and Linked none:
+            // one already wrapped stays on its frame, and one held at its end
+            // for the others starts over as Independent would have had it.
+            const double timeline = clock_.position();
+            PaneArray<double> shown{};
+            for (std::size_t pane = 0; pane < sources_.size(); ++pane) shown[pane] = mappedSourceTime(pane, timeline);
+            const bool leavingLinked = linkedBrowserSeekBars();
             browserSeekMode_ = choice;
+            for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
+                if (!sources_[pane]) continue;
+                const bool heldAtEnd = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
+                                       (localPanes_[pane] && localPanes_[pane]->endHandled);
+                if (leavingLinked && heldAtEnd && repeatsWithLinkedVideos(pane)) {
+                    seekPaneTo(pane, 0.0);
+                } else if (timelineMappingChanged(shown[pane], mappedSourceTime(pane, timeline))) {
+                    syncAdjustments_[pane] = shown[pane] - (timeline - startDelays_[pane]) * playbackRates_[pane];
+                }
+            }
             browserSeekAligned_ = false;
             showNotice(choice == SeekMode::Linked
                 ? L"Linked: click a seek bar to align all videos"
@@ -833,7 +901,7 @@ void App::chooseSeekMode(SeekMode choice) {
 void App::appendLayoutMenu(PanelMenu& menu) const {
     for (unsigned i = 0; i < 6; ++i) {
         const auto mode = static_cast<LayoutMode>(i);
-        menu.option(CmdLayoutGrid + i, layoutModeName(mode), layoutMode_ == mode);
+        menu.option(CmdLayoutGrid + i, layoutModeName(mode), layoutMode_ == mode, shortcut(arrangementKeyAction(i)));
     }
 }
 
@@ -988,7 +1056,9 @@ void App::embyFinishPane(std::size_t pane) {
     audio_.flush(pane);
     detachPaneSeekBarrier(pane);
     embyReport(pane, "stopped");
-    if (playOrder_ == PlayOrder::RepeatOne) {
+    if (linkedBrowserSeekBars() && repeatsWithLinkedVideos(pane)) {
+        // It waits here for the others: finishLinkedBrowserSet.
+    } else if (playOrder_ == PlayOrder::RepeatOne) {
         sourcePaused_[pane] = false;
         seekPaneTo(pane, 0.0);
     } else if (playOrder_ != PlayOrder::PlayOne) {
@@ -1021,7 +1091,9 @@ void App::localFinishPane(std::size_t pane) {
     if (sources_[pane]) sources_[pane]->setAudioEnabled(false);
     audio_.flush(pane);
     detachPaneSeekBarrier(pane);
-    if (playOrder_ == PlayOrder::RepeatOne) {
+    if (linkedBrowserSeekBars() && repeatsWithLinkedVideos(pane)) {
+        // It waits here for the others: finishLinkedBrowserSet.
+    } else if (playOrder_ == PlayOrder::RepeatOne) {
         sourcePaused_[pane] = false;
         seekPaneTo(pane, 0.0, true);
     } else if (playOrder_ != PlayOrder::PlayOne) {
@@ -1030,6 +1102,28 @@ void App::localFinishPane(std::size_t pane) {
     updateControls();
     updateHoverControls();
     updateTitle();
+}
+
+// Once no Linked video plays -- each held at its end, paused, or at the end
+// of what it has -- and one held at its end repeats, they all start over as
+// the rail sent to its start puts them: each at its offset, one below zero
+// waiting, and the rail's time back at zero rather than counting on.
+void App::finishLinkedBrowserSet() {
+    if (!clock_.isPlaying() || seekBarrier_.active() || !linkedBrowserSeekBars()) return;
+    const auto origins = paneOrigins();
+    const double timeline = clock_.position();
+    bool repeat = false;
+    for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
+        if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
+        if (!sources_[pane] || !sources_[pane]->ready() || !sources_[pane]->error().empty() ||
+            sources_[pane]->duration() <= 0.0) return;
+        if (!sourcePaused_[pane] &&
+            mappedSourceTime(pane, timeline) + kSourceEndEpsilon < sources_[pane]->duration()) return;
+        const bool ended = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
+                           (localPanes_[pane] && localPanes_[pane]->endHandled);
+        repeat = repeat || (ended && repeatsWithLinkedVideos(pane));
+    }
+    if (repeat) alignBrowserPanesToTime(0.0, false);
 }
 
 void App::advanceAtEnd(std::size_t pane) {

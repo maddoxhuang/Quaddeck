@@ -97,6 +97,7 @@ struct EmbyBrowserPrefs {
     bool descending{};
     bool unplayed{};
     bool flat{};         // every video under a folder, subfolders flattened
+    bool favorites{};    // only the account's favorites under the page
     friend bool operator==(const EmbyBrowserPrefs&, const EmbyBrowserPrefs&) = default;
 };
 
@@ -150,7 +151,7 @@ inline SubtitleSettings clampSubtitleSettings(SubtitleSettings value) {
 }
 
 // What happens when the only video ends: PotPlayer's playback orders.
-// Ctrl+4 / 6 / 7 / 8 / 9 in the window, a choice in the settings sheet and
+// Ctrl+4 / 6 / 7 / 8 / 9 in the window, a choice in the settings window and
 // a submenu of the popup menu. Several videos keep "Restart all when the
 // set finishes".
 enum class PlayOrder { PlayOne, RepeatOne, InOrder, RepeatList, Shuffle };
@@ -189,7 +190,7 @@ inline int playOrderNextIndex(PlayOrder order, int current, int count, unsigned 
     }
 }
 
-// The one line under the two toggles in the settings sheet. Pure so that
+// The one line under the two toggles in the settings window. Pure so that
 // every branch can be exhausted without a device. A note row is one line
 // of about sixty characters at the sheet's width, so one problem is
 // reported at a time, the one the user has to fix first.
@@ -652,9 +653,10 @@ struct SurfaceSize {
 //
 // Two properties matter to the callers. The source aspect ratio is preserved
 // exactly, because the renderer derives Fit and Fill geometry from these
-// dimensions rather than from the decoded frame. And the scale is snapped to a
-// small number of steps, so dragging a window edge cannot recreate the video
-// processor and its textures on every pixel of movement.
+// dimensions (and the frame's pixel aspect) rather than from the decoded
+// frame. And the scale is snapped to a small number of steps, so dragging a
+// window edge cannot recreate the video processor and its textures on every
+// pixel of movement.
 // allowMagnify lets the intermediate grow past the source, in sixteenths so a
 // window drag still recreates it rarely. That is only worth doing when the
 // video processor's upscaler is better than the sampler's bilinear filter --
@@ -699,11 +701,31 @@ inline SurfaceSize presentationSize(
     return result;
 }
 
-inline RectF fitInside(const RectF& cell, int sourceWidth, int sourceHeight) {
+// How wide one of a video's stored pixels is shown against its height: the
+// sample aspect ratio its stream or frame declares (num:den), as DVDs,
+// broadcasts and HDV keep a 16:9 picture in 720 or 1440 columns. Unknown
+// (0:1) means square, as FFmpeg reports it; so does a ratio no real video
+// has, which only a damaged header gives.
+inline double pixelAspectRatio(int numerator, int denominator) {
+    if (numerator <= 0 || denominator <= 0) return 1.0;
+    const double ratio = static_cast<double>(numerator) / static_cast<double>(denominator);
+    return ratio >= 0.1 && ratio <= 10.0 ? ratio : 1.0;
+}
+
+// A picture's shape on screen, its width over its height: its stored size,
+// each pixel `pixelAspect` times as wide as it is tall. A 720x576 DVD at
+// 64:45 is 16:9, not 5:4; square pixels give exactly width / height.
+inline float displayAspect(int width, int height, float pixelAspect = 1.0F) {
+    if (width <= 0 || height <= 0) return 0.0F;
+    if (!std::isfinite(pixelAspect) || pixelAspect <= 0.0F) pixelAspect = 1.0F;
+    return static_cast<float>(width) / static_cast<float>(height) * pixelAspect;
+}
+
+inline RectF fitInside(const RectF& cell, int sourceWidth, int sourceHeight, float pixelAspect = 1.0F) {
     if (sourceWidth <= 0 || sourceHeight <= 0 || cell.width <= 0 || cell.height <= 0) {
         return cell;
     }
-    const float sourceAspect = static_cast<float>(sourceWidth) / static_cast<float>(sourceHeight);
+    const float sourceAspect = displayAspect(sourceWidth, sourceHeight, pixelAspect);
     const float cellAspect = cell.width / cell.height;
     RectF result = cell;
     if (sourceAspect > cellAspect) {
@@ -719,8 +741,10 @@ inline RectF fitInside(const RectF& cell, int sourceWidth, int sourceHeight) {
 // Where a pane's picture is on screen: the renderer's viewport, fitted inside
 // the cell for Fit and the cell for Fill and Stretch. A zoom crops within it
 // and does not move it; what lies outside it (Fit's bars) is never picture.
-inline RectF visiblePictureRect(const RectF& cell, int sourceWidth, int sourceHeight, ViewMode mode) {
-    return mode == ViewMode::Fit ? fitInside(cell, sourceWidth, sourceHeight) : cell;
+// The source is its stored size with its pixel aspect, as for displayAspect.
+inline RectF visiblePictureRect(const RectF& cell, int sourceWidth, int sourceHeight, ViewMode mode,
+                                float pixelAspect = 1.0F) {
+    return mode == ViewMode::Fit ? fitInside(cell, sourceWidth, sourceHeight, pixelAspect) : cell;
 }
 
 // Where a pane's whole picture lies as the renderer draws it: fitted inside
@@ -729,12 +753,13 @@ inline RectF visiblePictureRect(const RectF& cell, int sourceWidth, int sourceHe
 // pane's zoom. Subtitles are placed against this rectangle, as their script
 // places them against the video's frame; only its part inside
 // visiblePictureRect is on screen.
-inline RectF pictureRect(const RectF& cell, int sourceWidth, int sourceHeight, ViewMode mode, float zoom) {
+inline RectF pictureRect(const RectF& cell, int sourceWidth, int sourceHeight, ViewMode mode, float zoom,
+                         float pixelAspect = 1.0F) {
     RectF picture = cell;
     if (sourceWidth > 0 && sourceHeight > 0 && cell.width > 0.0F && cell.height > 0.0F) {
-        const float sourceAspect = static_cast<float>(sourceWidth) / static_cast<float>(sourceHeight);
+        const float sourceAspect = displayAspect(sourceWidth, sourceHeight, pixelAspect);
         if (mode == ViewMode::Fit) {
-            picture = fitInside(cell, sourceWidth, sourceHeight);
+            picture = fitInside(cell, sourceWidth, sourceHeight, pixelAspect);
         } else if (mode == ViewMode::Fill) {
             if (sourceAspect > cell.width / cell.height) {
                 picture.width = cell.height * sourceAspect;
@@ -755,6 +780,54 @@ inline RectF pictureRect(const RectF& cell, int sourceWidth, int sourceHeight, V
         picture.y = centreY - picture.height * 0.5F;
     }
     return picture;
+}
+
+// How wide a pixel of a picture stored at width x height is shown for the
+// picture to be `aspect` wide on screen: a 720x576 DVD shown 16:9 has 64:45
+// pixels, and a broadcast whose size read at open is 1920x1080 has square
+// ones while its 1440x1080 frames at 4:3 are shown 16:9. Square when the
+// shape is the stored one, or not known.
+inline float storedPixelAspect(int width, int height, float aspect) {
+    const float stored = displayAspect(width, height);
+    if (stored <= 0.0F || !std::isfinite(aspect) || aspect <= 0.0F || aspect == stored) return 1.0F;
+    return aspect / stored;
+}
+
+// How the renderer draws one pane's picture. The texture is outputWidth x
+// outputHeight in the picture's stored proportions, each of its pixels
+// `pixelAspect` wide; the viewport and the part of the texture sampled
+// stretch it to its shape on screen. Fit draws the picture's display shape
+// fitted inside the cell; Fill and Stretch draw into the whole cell, Fill
+// sampling the centre of the texture that has the cell's shape. A zoom then
+// samples the centre 1/zoom of that. Square pixels give exactly what the
+// stored proportions alone gave.
+struct PanePictureGeometry {
+    // Where the picture is drawn, before the renderer's one-pixel inset.
+    RectF viewport;
+    // The texture coordinates sampled: u = scaleX * x + offsetX for x from 0
+    // to 1 across the viewport, and v alike.
+    float scaleX{1.0F};
+    float scaleY{1.0F};
+    float offsetX{0.0F};
+    float offsetY{0.0F};
+};
+
+inline PanePictureGeometry panePictureGeometry(const RectF& cell, int outputWidth, int outputHeight,
+                                               float pixelAspect, ViewMode mode, float zoom) {
+    PanePictureGeometry geometry;
+    geometry.viewport = mode == ViewMode::Fit ? fitInside(cell, outputWidth, outputHeight, pixelAspect) : cell;
+    if (mode == ViewMode::Fill) {
+        const float sourceAspect = displayAspect(outputWidth, std::max(1, outputHeight), pixelAspect);
+        const float cellAspect = cell.width / std::max(1.0F, cell.height);
+        if (sourceAspect > cellAspect) geometry.scaleX = cellAspect / sourceAspect;
+        else geometry.scaleY = sourceAspect / cellAspect;
+    }
+    const float scale = std::clamp(zoom, 1.0F, 4.0F);
+    geometry.scaleX /= scale;
+    geometry.scaleY /= scale;
+    geometry.offsetX = (1.0F - geometry.scaleX) * 0.5F;
+    geometry.offsetY = (1.0F - geometry.scaleY) * 0.5F;
+    return geometry;
 }
 
 inline PaneArray<RectF> layoutCells(

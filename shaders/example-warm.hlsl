@@ -1,5 +1,6 @@
 // QuadDeck external pixel shader contract:
-// entry point: main, target: ps_4_0, input TEXCOORD0, texture t0, sampler s0.
+// entry point: main, target: ps_4_0, inputs SV_POSITION then TEXCOORD0,
+// texture t0, sampler s0.
 Texture2D videoTexture : register(t0);
 SamplerState videoSampler : register(s0);
 

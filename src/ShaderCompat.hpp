@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <iterator>
 #include <regex>
 #include <string>
 #include <vector>
@@ -119,7 +121,25 @@ inline std::vector<bool> declarationColons(const std::string& code) {
 
 }  // namespace shader_compat_detail
 
-inline std::string adaptPotPlayerShader(std::string source) {
+// How adaptPotPlayerShader gives a legacy main() the position.
+enum class MainPosition {
+    // First, unless main's first input is a position already: a parameter,
+    // or the first member of a struct parameter, with SV_POSITION, VPOS or
+    // POSITION.
+    Given,
+    // Not at all: main's parameters as written, as they were before main()
+    // was given the position.
+    AsWritten,
+    // As Given, but before a struct parameter whatever its struct is found
+    // to begin with. The code is not preprocessed, so the struct found is
+    // the first definition of that name in the code, which may be one an #if
+    // leaves out.
+    BeforeStructs,
+};
+
+// A PotPlayer/MPC (D3D9) shader made a ps_4_0 one; a native shader is
+// returned as it is.
+inline std::string adaptPotPlayerShader(std::string source, MainPosition mainPosition = MainPosition::Given) {
     if (source.size() >= 3 && static_cast<unsigned char>(source[0]) == 0xEF &&
         static_cast<unsigned char>(source[1]) == 0xBB && static_cast<unsigned char>(source[2]) == 0xBF) {
         source.erase(0, 3);
@@ -171,6 +191,167 @@ inline std::string adaptPotPlayerShader(std::string source) {
             edits.push_back({token, semantic.size(), texcoord ? "TEXCOORD0" : "SV_TARGET"});
         }
     }
+    // D3D11 links the vertex and pixel shaders by register, not by name, and
+    // QuadDeck's vertex shader writes SV_POSITION first and the video
+    // coordinate after it, as TEXCOORD0 and again as TEXCOORD1-3. A D3D9
+    // main() usually takes no position, so its TEXCOORD0 packed into the
+    // position's register and every pane came out one colour. main()
+    // therefore takes the position first unless its first input is one
+    // already: a parameter, or the first member of a struct parameter, with
+    // SV_POSITION, VPOS or D3D9's POSITION, which packs into register 0
+    // itself. A position further on stays where it is: the compiler makes
+    // one input of an SV_POSITION and the one inserted, and a VPOS or
+    // POSITION then follows the coordinate. A single TEXCOORDn is read as
+    // TEXCOORD0: it holds the same coordinate, and so matches the vertex
+    // shader's name in that register too. VPOS and a struct's members are
+    // left as they are; the renderer refuses a file whose inputs the vertex
+    // shader still does not feed (unfedShaderInput). A position this lookup
+    // does not see, in a typedef'd or nested struct or behind a macro, is
+    // pushed a register on by the one inserted; the renderer then compiles
+    // the file without it (MainPosition::AsWritten) and takes that when the
+    // vertex shader feeds it so.
+    // The code is not preprocessed, so every definition of main is adapted:
+    // one inside #if 0 is not compiled, whatever it is given. A main() with a
+    // parameter of a built-in type but no semantic cannot be the entry point,
+    // which is another overload; it is left as written. A struct is looked
+    // up by its first definition in the code, so one in #if 0 can say that
+    // main() has its position where the struct compiled does not begin with
+    // one; the renderer then compiles the file with the position before the
+    // struct as well (MainPosition::BeforeStructs).
+    const std::regex entry(R"(\bmain\s*\()");
+    const std::regex parameterSemantic(R"(:\s*([A-Za-z_]\w*))");
+    const std::regex texcoordIndex(R"(TEXCOORD(\d*))", std::regex::icase);
+    const std::regex positionSemantic(R"((SV_POSITION|VPOS|POSITION)\d*)", std::regex::icase);
+    const std::regex identifier(R"([A-Za-z_]\w*)");
+    const std::regex builtInType(
+        R"((?:float|half|double|int|uint|dword|bool|min16float|min10float|min16int|min12int|min16uint)(?:[1-4](?:x[1-4])?)?)");
+    // The semantic of the declaration in code[begin, finish) and where its
+    // name starts, or an empty name.
+    struct Semantic {
+        std::string name;
+        std::size_t position = 0;
+    };
+    const auto semanticIn = [&](std::size_t begin, std::size_t finish) {
+        const auto from = code.begin() + static_cast<std::ptrdiff_t>(begin);
+        const auto to = code.begin() + static_cast<std::ptrdiff_t>(finish);
+        for (std::sregex_iterator s(from, to, parameterSemantic), stop; s != stop; ++s) {
+            if (declarationColon[begin + static_cast<std::size_t>(s->position())]) {
+                return Semantic{(*s)[1].str(), begin + static_cast<std::size_t>(s->position(1))};
+            }
+        }
+        return Semantic{};
+    };
+    // Whether the struct named begins with the position: its first member.
+    const auto structPositioned = [&](const std::string& type) {
+        if (type.empty()) return false;
+        const std::regex definition("\\bstruct\\s+" + type + "\\s*\\{");
+        std::smatch found;
+        if (!std::regex_search(code, found, definition)) return false;
+        const auto open = static_cast<std::size_t>(found.position() + found.length() - 1);
+        const std::size_t member = code.find_first_of(";}", open + 1);
+        return member != std::string::npos &&
+               std::regex_match(semanticIn(open + 1, member).name, positionSemantic);
+    };
+    // A parameter's type, its first word that is not a modifier, and
+    // whether it is a constant (uniform) or an output (out) rather than an
+    // input the vertex shader feeds.
+    struct Parameter {
+        std::string type;
+        bool constant = false;
+        bool output = false;
+    };
+    const auto parameterOf = [&](const std::string& text) {
+        static const char* const modifiers[] = {"in", "inout", "const", "centroid", "linear",
+                                                "noperspective", "nointerpolation", "sample", "precise"};
+        Parameter parameter;
+        for (std::sregex_iterator w(text.begin(), text.end(), identifier), stop; w != stop; ++w) {
+            const std::string word = w->str();
+            if (word == "uniform") {
+                parameter.constant = true;
+            } else if (word == "out") {
+                parameter.output = true;
+            } else if (std::none_of(std::begin(modifiers), std::end(modifiers),
+                                    [&](const char* modifier) { return word == modifier; })) {
+                parameter.type = word;
+                break;
+            }
+        }
+        return parameter;
+    };
+    for (std::sregex_iterator it(code.begin(), code.end(), entry), end;
+         mainPosition != MainPosition::AsWritten && it != end; ++it) {
+        const auto open = static_cast<std::size_t>(it->position() + it->length() - 1);
+        std::vector<std::size_t> commas;
+        std::size_t close = 0;
+        if (!callArguments(code, open, commas, close)) continue;
+        // The definition: its parameters, perhaps its semantic, its body.
+        std::size_t next = code.find_first_not_of(" \t\r\n", close + 1);
+        if (next != std::string::npos && code[next] == ':') {
+            next = code.find_first_not_of(" \t\r\n", next + 1);
+            while (next < code.size() && (std::isalnum(static_cast<unsigned char>(code[next])) || code[next] == '_')) {
+                ++next;
+            }
+            next = code.find_first_not_of(" \t\r\n", next);
+        }
+        if (next == std::string::npos || code[next] != '{') continue;
+        std::vector<std::pair<std::size_t, std::size_t>> parameters;
+        std::size_t first = open + 1;
+        for (const std::size_t comma : commas) {
+            parameters.push_back({first, comma});
+            first = comma + 1;
+        }
+        parameters.push_back({first, close});
+        bool entryPoint = true;
+        bool positioned = false;
+        bool leading = true;   // the next input is main's first
+        bool unnamed = false;  // an input without a semantic: a struct
+        std::size_t texcoords = 0;
+        std::size_t texcoordToken = 0;
+        std::size_t texcoordLength = 0;
+        bool texcoordZero = true;
+        bool empty = true;
+        for (const auto& [begin, finish] : parameters) {
+            const std::string text = code.substr(begin, finish - begin);
+            const std::size_t word = text.find_first_not_of(" \t\r\n");
+            if (word == std::string::npos) continue;
+            const std::size_t last = text.find_last_not_of(" \t\r\n");
+            if (parameters.size() == 1 && text.substr(word, last + 1 - word) == "void") continue;
+            empty = false;
+            const Parameter parameter = parameterOf(text);
+            if (parameter.constant) continue;
+            const Semantic semantic = semanticIn(begin, finish);
+            if (semantic.name.empty() && std::regex_match(parameter.type, builtInType)) {
+                entryPoint = false;
+                break;
+            }
+            if (parameter.output) continue;
+            std::smatch index;
+            if (semantic.name.empty()) {
+                unnamed = true;
+                if (leading) positioned = mainPosition == MainPosition::Given && structPositioned(parameter.type);
+            } else if (std::regex_match(semantic.name, positionSemantic)) {
+                if (leading) positioned = true;
+            } else if (std::regex_match(semantic.name, index, texcoordIndex)) {
+                ++texcoords;
+                texcoordToken = semantic.position;
+                texcoordLength = semantic.name.size();
+                texcoordZero = index[1].str().find_first_not_of('0') == std::string::npos;
+            }
+            leading = false;
+        }
+        if (!entryPoint) continue;
+        if (!positioned) {
+            if (empty) {
+                // main() or main(void): the position is its one parameter.
+                edits.push_back({open + 1, close - open - 1, "float4 qdPosition : SV_POSITION"});
+            } else {
+                edits.push_back({open + 1, 0, "float4 qdPosition : SV_POSITION, "});
+            }
+        }
+        if (!unnamed && texcoords == 1 && !texcoordZero) {
+            edits.push_back({texcoordToken, texcoordLength, "TEXCOORD0"});
+        }
+    }
     bool level = false, bias = false, project = false;
     const std::regex samples(R"(\b(tex2D(?:lod|bias|proj)?)\s*\()", std::regex::icase);
     const std::regex sampler(R"(\s*([A-Za-z_]\w*)\s*)");
@@ -213,6 +394,126 @@ inline std::string adaptPotPlayerShader(std::string source) {
     if (bias) prefix += "float4 qdSampleBias(float4 p) { return qdTexture.SampleBias(qdSampler, p.xy, p.w); }\n";
     if (project) prefix += "float4 qdSampleProject(float4 p) { return qdTexture.Sample(qdSampler, p.xy / p.w); }\n";
     return prefix + source;
+}
+
+// One element of a compiled shader's input or output signature, as
+// D3DReflect reports it.
+struct ShaderSignatureValue {
+    std::string semantic;     // as declared: TEXCOORD, SV_Position, VPOS...
+    unsigned index = 0;
+    unsigned registerIndex = 0;
+    unsigned mask = 0;        // the components it occupies, bit 0 for x
+    unsigned read = 0;        // an input's components the shader reads
+    bool position = false;    // the system value SV_POSITION
+    bool distance = false;    // SV_ClipDistance or SV_CullDistance
+    bool system = false;      // any other system value, SV_IsFrontFace...
+    bool floating = true;     // 32-bit float components
+};
+
+// Why the vertex shader's outputs do not feed a pixel shader's inputs, or
+// empty when they do. D3D11 links the two stages by register and component,
+// not by name: an input reads whatever the vertex shader wrote in its
+// register's components. QuadDeck's vertex shader writes SV_POSITION in
+// register 0 and the same video coordinate as every TEXCOORD after it, a
+// float2 in each .xy and .zw. An input the shader reads is therefore fed
+// when it is a float and either
+// - D3D9's VPOS or POSITION, a semantic of the author's in ps_4_0, where
+//   the vertex shader writes SV_POSITION. It loads there as it always did,
+//   though the drivers give it zeros (NVIDIA) or the clip position (Intel,
+//   WARP), not the pixel position: that matters only to a file whose
+//   picture depends on it, and the advice is SV_POSITION; or
+// - any other input, a TEXCOORD of any index or another name, where the
+//   vertex shader writes TEXCOORDs, reading only components they write: a
+//   single float reads the coordinate's u or v, and a wider input starts
+//   where a TEXCOORD starts, so that it reads u then v.
+// Interpolation modifiers, arrays, wider TEXCOORDs, gaps in the indices,
+// the coordinate as two floats and names of the author's own all link so.
+// An input never read is not checked, and nor is a system value but
+// SV_ClipDistance and SV_CullDistance. The pipeline gives the pixel shader
+// SV_POSITION, the pixel centre, SV_IsFrontFace and SV_PrimitiveID itself,
+// in whatever register they are. SV_RenderTargetArrayIndex and
+// SV_ViewportArrayIndex are written by the stage before it, as the
+// distances are, and QuadDeck's vertex shader writes neither, but they are
+// skipped all the same: the NVIDIA card and the Intel Arc give 0, the index
+// of the one target and viewport there are, and only WARP gives what the
+// vertex shader writes in that register (TEXCOORD2.x's bits), so a file
+// reading them draws the picture on a card, as it did before. A clip or
+// cull distance is the vertex shader's to write, so one that is read is
+// fed only where the vertex shader writes one; QuadDeck's writes neither.
+inline std::string unfedShaderInput(const std::vector<ShaderSignatureValue>& outputs,
+                                    const std::vector<ShaderSignatureValue>& inputs) {
+    const auto upper = [](std::string text) {
+        for (char& c : text) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return text;
+    };
+    const auto lowest = [](unsigned mask) {
+        unsigned component = 0;
+        while (component < 4 && !(mask & (1u << component))) ++component;
+        return component;
+    };
+    const std::string order =
+        " QuadDeck's vertex shader gives the position in input register 0 and the video coordinate after it, "
+        "so main() takes the position first, as a float4, then its TEXCOORD inputs: "
+        "float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET "
+        "(in a PotPlayer shader too: float4 pos : SV_POSITION, the pixel centre; "
+        "D3D9's VPOS is not given the position).";
+    for (const auto& input : inputs) {
+        if (input.system || input.position || input.read == 0) continue;
+        std::string components;
+        for (unsigned c = 0; c < 4; ++c) {
+            if (input.mask & (1u << c)) components += "xyzw"[c];
+        }
+        const std::string reads = "The pixel shader's main() reads " + input.semantic +
+                                  std::to_string(input.index) + " in input register " +
+                                  std::to_string(input.registerIndex) + "." + components;
+        if (input.distance) {
+            unsigned given = 0;
+            for (const auto& output : outputs) {
+                if (output.distance && output.registerIndex == input.registerIndex) given |= output.mask;
+            }
+            if ((input.read & ~given) == 0) continue;
+            return reads + ", a clip or cull distance, which only the vertex shader gives, and QuadDeck's "
+                           "gives none.";
+        }
+        const std::string name = upper(input.semantic);
+        bool position = false;
+        bool positionAligned = false;
+        bool written = false;
+        bool aligned = false;
+        unsigned covered = 0;
+        for (const auto& output : outputs) {
+            if (output.registerIndex != input.registerIndex) continue;
+            written = true;
+            if (output.position) {
+                position = true;
+                positionAligned = lowest(output.mask) == lowest(input.mask) && (input.read & ~output.mask) == 0;
+            } else {
+                covered |= output.mask;
+                aligned = aligned || lowest(output.mask) == lowest(input.mask);
+            }
+        }
+        if (!input.floating) {
+            return reads + ", which is not a float; QuadDeck's vertex shader gives float values only.";
+        }
+        if (name == "VPOS" || name == "POSITION") {
+            if (positionAligned) continue;
+            return reads + (position ? ", behind another input in the position's register."
+                            : written ? ", where the vertex shader gives the video coordinate, not the position."
+                                      : ", where the vertex shader gives nothing.") +
+                   order;
+        }
+        if (position) return reads + ", where the vertex shader gives the position." + order;
+        if (!written || covered == 0) {
+            return reads + ", past the video coordinate's registers: the vertex shader gives TEXCOORD0-3 as "
+                           "float2 values in .xy and .zw of input registers 1 and 2.";
+        }
+        const bool single = (input.mask & (input.mask - 1)) == 0;
+        if ((!aligned && !single) || (input.read & ~covered) != 0) {
+            return reads + ", across the vertex shader's float2 coordinates in .xy and .zw, so its first "
+                           "component is not the coordinate's u.";
+        }
+    }
+    return {};
 }
 
 }  // namespace quaddeck

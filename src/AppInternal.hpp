@@ -25,6 +25,10 @@ inline constexpr UINT_PTR kSettingsSaveTimer = 2;
 inline constexpr UINT kSettingsSaveDelayMs = 300;
 inline constexpr UINT kSettingsSaveRetryDelayMs = 1200;
 inline constexpr unsigned kMaximumSettingsSaveRetries = 1;
+// The clipboard's text, no more than a text box can hold, and text put on
+// it, for the text boxes (AppTextFields.cpp) and a spin box's number.
+std::wstring clipboardText(HWND owner);
+void setClipboardText(HWND owner, const std::wstring& text);
 // A moving pointer this close to the bottom edge reveals the transport bar,
 // and this close to the top edge the window caption.
 inline constexpr int kControlRevealZone = 22;
@@ -65,6 +69,51 @@ inline int embyTileImageWidth(float tileWidth, bool posters, float scale) {
 // How far inside its control a sheet slider's rail starts, in DIPs; the
 // drag (AppChrome.cpp) and the hit test (AppPanel.cpp) must agree.
 inline constexpr float kPanelRailInset = 8.0F;
+// A hot control shows its name after resting on it this long, in the
+// player's window and the settings window alike.
+inline constexpr ULONGLONG kTooltipDelayMs = 600;
+
+// Per-monitor DPI without a minimum SDK: both calls exist since Windows 10
+// 1607, and a build without them reports 96, which keeps the 1x layout.
+inline unsigned windowDpi(HWND window) {
+    const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
+    using GetDpiForSystemFn = UINT(WINAPI*)();
+    if (user32 && window) {
+        if (const auto fn = reinterpret_cast<GetDpiForWindowFn>(
+                GetProcAddress(user32, "GetDpiForWindow"))) {
+            if (const UINT dpi = fn(window)) return dpi;
+        }
+    }
+    if (user32) {
+        if (const auto fn = reinterpret_cast<GetDpiForSystemFn>(
+                GetProcAddress(user32, "GetDpiForSystem"))) {
+            if (const UINT dpi = fn()) return dpi;
+        }
+    }
+    HDC screen = GetDC(nullptr);
+    const int dpi = screen ? GetDeviceCaps(screen, LOGPIXELSX) : 96;
+    if (screen) ReleaseDC(nullptr, screen);
+    return dpi > 0 ? static_cast<unsigned>(dpi) : 96U;
+}
+
+// The resize border Windows gives a window at this DPI, the band at the top
+// of a captionless client that resizes it, and what a maximized window
+// hangs off the monitor.
+inline int resizeFrameThickness(unsigned dpi) {
+    using GetSystemMetricsForDpiFn = int(WINAPI*)(int, UINT);
+    static const auto forDpi = [] {
+        const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        return user32 ? reinterpret_cast<GetSystemMetricsForDpiFn>(
+                            GetProcAddress(user32, "GetSystemMetricsForDpi"))
+                      : nullptr;
+    }();
+    if (forDpi && dpi > 0) {
+        return forDpi(SM_CYSIZEFRAME, dpi) + forDpi(SM_CXPADDEDBORDER, dpi);
+    }
+    return GetSystemMetrics(SM_CYSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+}
+
 enum ContextCommand : unsigned {
     CmdOpenPane = 2000, CmdClosePane, CmdSelectAudio, CmdTogglePanePause, CmdToggleSolo,
     CmdPreviousFile, CmdNextFile,
@@ -89,8 +138,31 @@ enum ContextCommand : unsigned {
     // browser item a right-click was on.
     CmdEmbyFavorite,
     // O's Open dialog, from the menu away from any pane.
-    CmdOpenFiles
+    CmdOpenFiles,
+    // The sound (AppAudio.cpp): the output -- Windows' default first, then
+    // each listed, the last place the chosen one when it is not connected --
+    // and its speakers; the effects; a pane's timing; the Audio tab.
+    CmdAudioOutputFirst, CmdAudioOutputLast = CmdAudioOutputFirst + 31,
+    CmdAudioSpeakersStereo, CmdAudioSpeakersDevice,
+    CmdAudioEqualizer,
+    CmdEqualizerPresetFirst, CmdEqualizerPresetLast = CmdEqualizerPresetFirst + static_cast<unsigned>(kEqualizerPresets.size()) - 1,
+    CmdAudioNormalize,
+    CmdAudioNightFirst, CmdAudioNightLast = CmdAudioNightFirst + kAudioStrengthCount - 1,
+    CmdAudioStereoFirst, CmdAudioStereoLast = CmdAudioStereoFirst + kAudioStereoModeCount - 1,
+    CmdAudioVoiceEmphasis, CmdAudioCrossfeed,
+    CmdAudioWideningFirst, CmdAudioWideningLast = CmdAudioWideningFirst + kAudioStrengthCount - 1,
+    CmdAudioPitch,
+    CmdAudioSettings,
+    CmdAudioEarlier, CmdAudioLater, CmdAudioDelayReset,
+    // The picture's way to the screen (AppVideo.cpp): the renderer, the
+    // deinterlacing, the scaler, the colour controls' reset; the Video tab.
+    CmdVideoRendererFirst, CmdVideoRendererLast = CmdVideoRendererFirst + kVideoRendererCount - 1,
+    CmdVideoDeinterlace,
+    CmdVideoScalingFirst, CmdVideoScalingLast = CmdVideoScalingFirst + kVideoScalingCount - 1,
+    CmdVideoColorReset,
+    CmdVideoSettings
 };
+inline constexpr std::size_t kAudioOutputMenuLimit = CmdAudioOutputLast - CmdAudioOutputFirst + 1;
 
 // The arrangement's name as the sheet, the menu and the notice show it,
 // in LayoutMode's order, which is also CmdLayoutGrid..CmdLayoutLandscape's.
@@ -142,6 +214,21 @@ inline std::wstring audioTrackLabel(const AudioTrackInfo& track) {
     }
     if (!detail.empty()) label += L"  (" + detail + L")";
     return label;
+}
+
+// A level as the settings show it, up to 200%: the master volume may be
+// raised past 100%.
+inline std::wstring percent(float value) {
+    return std::to_wstring(static_cast<int>(std::lround(std::clamp(value, 0.0F, 2.0F) * 100.0F))) + L"%";
+}
+
+// A sound delay as the Audio tab and the notices show it: "+150 ms",
+// "−50 ms", "±0 ms".
+inline std::wstring audioDelayText(double seconds) {
+    const long long ms = std::llround(seconds * 1000.0);
+    std::wostringstream text;
+    text << (ms > 0 ? L"+" : ms < 0 ? L"\x2212" : L"\x00B1") << std::llabs(ms) << L" ms";
+    return text.str();
 }
 
 inline std::wstring formatTime(double seconds) {
