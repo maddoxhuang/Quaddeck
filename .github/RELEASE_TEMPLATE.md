@@ -39,9 +39,9 @@ Requires **Windows 10/11 x64** and the [Microsoft Visual C++ v14 x64 runtime](ht
 
 ## Compatibility
 
-Back up `%LOCALAPPDATA%\QuadDeck\settings.qconfig`, saved sessions and visual presets before switching builds. Copies running under the same Windows account share the settings file.
+Back up `%LOCALAPPDATA%\QuadDeck\settings.qconfig`, `videosets.qsets` beside it and visual presets before switching builds. Copies running under the same Windows account share these files.
 
-- {{COMPATIBILITY_WITH_PREVIOUS_VERSIONS}}. Formats: `QCONFIG {{QCONFIG_VERSION}}`, `QDECK {{QDECK_VERSION}}` and `QSTYLE {{QSTYLE_VERSION}}`.
+- {{COMPATIBILITY_WITH_PREVIOUS_VERSIONS}}. Formats: `QCONFIG {{QCONFIG_VERSION}}`, `QSETS {{QSETS_VERSION}}` and `QSTYLE {{QSTYLE_VERSION}}`.
 - {{VERSION_SPECIFIC_REQUIREMENTS_OR_LIMITATIONS}}.
 <!-- Remove the second bullet if this version has no additional requirements or limitations. -->
 
