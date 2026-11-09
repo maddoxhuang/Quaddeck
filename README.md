@@ -277,7 +277,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
 .\dist\QuadDeck\QuadDeck.exe
 ```
 
-The script sets up or reuses `%USERPROFILE%\vcpkg`, builds the application and creates `dist\QuadDeck-win-x64.zip`.
+The script sets up or reuses `%USERPROFILE%\vcpkg`, builds the application and creates `dist\QuadDeck-<version>-win-x64.zip`.
 
 Keep the `build` directory when updating the source to reuse installed dependencies. If you need a clean build, run:
 

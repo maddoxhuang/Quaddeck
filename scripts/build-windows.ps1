@@ -81,11 +81,18 @@ if ($Clean) {
 # vcpkg.json pins every port to builtin-baseline. A shallow clone holds only
 # the commit it cloned, and vcpkg refuses a baseline it cannot read, so the
 # baseline commit is fetched when it is missing; a fresh clone checks it out.
-$VcpkgBaseline = (Get-Content -Raw -LiteralPath (Join-Path $ProjectRoot "vcpkg.json") |
-    ConvertFrom-Json).'builtin-baseline'
+$Manifest = Get-Content -Raw -LiteralPath (Join-Path $ProjectRoot "vcpkg.json") | ConvertFrom-Json
+$VcpkgBaseline = $Manifest.'builtin-baseline'
 if ($VcpkgBaseline -notmatch '^[0-9a-f]{40}$') {
     throw "vcpkg.json has no builtin-baseline commit."
 }
+# The package is named after the version, which CMake checks against
+# CMakeLists.txt.
+$Version = $Manifest.'version-semver'
+if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$') {
+    throw "vcpkg.json has no version-semver."
+}
+$ZipName = "QuadDeck-$Version-win-x64.zip"
 $FreshVcpkg = -not (Test-Path (Join-Path $VcpkgRoot ".git"))
 if ($FreshVcpkg) {
     git clone --depth 1 https://github.com/microsoft/vcpkg $VcpkgRoot
@@ -145,10 +152,10 @@ foreach ($Leftover in $Leftovers) {
     }
 }
 
-$ZipPath = Join-Path $DistRoot "QuadDeck-win-x64.zip"
+$ZipPath = Join-Path $DistRoot $ZipName
 $StagingRoot = Join-Path $DistRoot (".staging-" + [guid]::NewGuid().ToString("N"))
 $StagingApp = Join-Path $StagingRoot "QuadDeck"
-$StagingZip = Join-Path $StagingRoot "QuadDeck-win-x64.zip"
+$StagingZip = Join-Path $StagingRoot $ZipName
 Assert-ChildPath $DistRoot $StagingRoot
 Assert-ChildPath $DistRoot $ZipPath
 

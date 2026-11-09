@@ -36,11 +36,13 @@ jobs:
             if (Test-Path $c -PathType Leaf) { Copy-Item $c "dist/QuadDeck/licenses/$($_.Name).txt" }
           }
           Protect-QuadDeckRelease -StagingDirectory dist/QuadDeck
-          Compress-Archive dist/QuadDeck dist/QuadDeck-win-x64.zip
-          Assert-QuadDeckReleasePrivacy -Archive dist/QuadDeck-win-x64.zip
+          $Version = (Get-Content -Raw vcpkg.json | ConvertFrom-Json).'version-semver'
+          $Zip = "dist/QuadDeck-$Version-win-x64.zip"
+          Compress-Archive dist/QuadDeck $Zip
+          Assert-QuadDeckReleasePrivacy -Archive $Zip
 
       - uses: actions/upload-artifact@v4
         with:
           name: QuadDeck-win-x64
-          path: dist/QuadDeck-win-x64.zip
+          path: dist/QuadDeck-*-win-x64.zip
           if-no-files-found: error

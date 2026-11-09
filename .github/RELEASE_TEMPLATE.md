@@ -31,7 +31,7 @@ QuadDeck {{VERSION}} {{ONE_SENTENCE_RELEASE_SUMMARY}}.
 
 ## Download and run
 
-1. Download [**QuadDeck-win-x64.zip**](https://github.com/maddoxhuang/Quaddeck/releases/download/v{{VERSION}}/QuadDeck-win-x64.zip) and [**SHA256SUMS.txt**](https://github.com/maddoxhuang/Quaddeck/releases/download/v{{VERSION}}/SHA256SUMS.txt).
+1. Download [**QuadDeck-{{VERSION}}-win-x64.zip**](https://github.com/maddoxhuang/Quaddeck/releases/download/v{{VERSION}}/QuadDeck-{{VERSION}}-win-x64.zip) and [**SHA256SUMS.txt**](https://github.com/maddoxhuang/Quaddeck/releases/download/v{{VERSION}}/SHA256SUMS.txt).
 2. Verify the ZIP against the checksum, then close any running copy of QuadDeck.
 3. Extract the complete archive into a new folder and run `QuadDeck\QuadDeck.exe`. Keep the EXE, DLLs, shaders and licenses together.
 
