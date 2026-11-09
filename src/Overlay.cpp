@@ -30,6 +30,7 @@ constexpr wchar_t kGlyphNext = L'\xE893';
 constexpr wchar_t kGlyphSubtitles = L'\xED1E';
 constexpr wchar_t kGlyphLayout = L'\xE8A9';   // ViewAll
 constexpr wchar_t kGlyphAllVideos = L'\xE80A';  // a grid, unlike the arrangement's four squares
+constexpr wchar_t kGlyphVideoSets = L'\xE8FD';  // BulletedList
 constexpr wchar_t kGlyphLink = L'\xE71B';
 constexpr wchar_t kGlyphChromeMinimize = L'\xE921';
 constexpr wchar_t kGlyphChromeMaximize = L'\xE922';
@@ -537,6 +538,13 @@ void Overlay::primaryButton(const OverlayRect& box, bool hot, bool pressed, floa
                         : hot   ? blend(own, rgba(255, 255, 255, 1.0F), 0.18F) : own, alpha));
 }
 
+void Overlay::dangerButton(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale) {
+    if (!box.visible()) return;
+    fillRound(box, controlRadius(box, scale),
+              withAlpha(pressed ? blend(kCloseRed, rgba(0, 0, 0, 1.0F), 0.25F)
+                        : hot   ? blend(kCloseRed, rgba(255, 255, 255, 1.0F), 0.14F) : kCloseRed, alpha));
+}
+
 void Overlay::chosenFace(const OverlayRect& box, bool hot, float alpha, float scale, int video) {
     if (!box.visible()) return;
     const float radius = controlRadius(box, scale);
@@ -632,7 +640,7 @@ void Overlay::rail(const OverlayRect& band, float inset, float thickness, float 
 }
 
 void Overlay::verticalRail(const OverlayRect& band, float inset, float thickness, float position01,
-                           float thumbRadius, float alpha) {
+                           float thumbRadius, float alpha, int video) {
     if (!band.visible()) return;
     const float top = band.y + inset;
     const float bottom = band.bottom() - inset;
@@ -641,7 +649,7 @@ void Overlay::verticalRail(const OverlayRect& band, float inset, float thickness
     const float half = thickness * 0.5F;
     fillRound({centerX - half, top, thickness, bottom - top}, half, withAlpha(rgba(255, 255, 255, kRailTrack), alpha));
     const float level = bottom - (bottom - top) * std::clamp(position01, 0.0F, 1.0F);
-    fillRound({centerX - half, level, thickness, bottom - level}, half, withAlpha(kAccent, alpha));
+    fillRound({centerX - half, level, thickness, bottom - level}, half, withAlpha(paneColor(video), alpha));
     if (thumbRadius > 0.0F) {
         brush_->SetColor(withAlpha(kText, alpha));
         context_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(centerX, level), thumbRadius, thumbRadius),
@@ -701,6 +709,83 @@ void Overlay::drawMenuWindow(IDXGISurface* surface, const OverlayScene& scene, b
     if (border) {
         strokeRound({0.0F, 0.0F, scene.width, scene.height}, 0.0F, kCardEdge, std::max(1.0F, scene.scale));
     }
+    endFrame();
+}
+
+void Overlay::measureDeleteDialog(const DeleteDialogContent& content, float width, float scale,
+                                  DeleteDialogMeasures& measures) {
+    measures = {};
+    if (!std::isfinite(width) || !std::isfinite(scale) || width <= 0.0F || scale <= 0.0F || !ensureFormats(scale)) {
+        return;
+    }
+    const DeleteDialogMetrics metrics{};
+    // How tall `value` wraps at `wrapWidth`, `line` a line, as mediaText
+    // draws it; 0 where it cannot be laid out.
+    const auto wrapped = [&](const std::wstring& value, OverlayTextStyle style, float wrapWidth, float line) {
+        IDWriteTextLayout* layout = mediaTextLayout(value, style, wrapWidth, 1000000.0F, line * scale);
+        DWRITE_TEXT_METRICS measured{};
+        if (!layout || FAILED(layout->GetMetrics(&measured)) || !std::isfinite(measured.height)) return 0.0F;
+        return std::ceil(measured.height);
+    };
+    const float inner = deleteDialogInnerWidth(width, scale, metrics);
+    measures.titleWidth = measureText(content.title, OverlayTextStyle::BodyBold, scale);
+    measures.titleHeight = wrapped(content.title, OverlayTextStyle::BodyBold, inner, metrics.titleLine);
+    measures.typeWidth = measureText(content.type, OverlayTextStyle::Small, scale);
+    const float fileWidth = deleteDialogFileWidth(width, scale, metrics);
+    measures.fileHeights.reserve(content.files.size());
+    for (const auto& file : content.files) {
+        measures.fileHeights.push_back(wrapped(file, OverlayTextStyle::Small, fileWidth, metrics.smallLine));
+    }
+    measures.warningHeight = wrapped(content.warning, OverlayTextStyle::Small, inner, metrics.smallLine);
+    measures.cancelWidth = measureText(content.cancel, OverlayTextStyle::Body, scale);
+    measures.confirmWidth = measureText(content.confirm, OverlayTextStyle::Body, scale);
+}
+
+void Overlay::drawDeleteDialog(IDXGISurface* surface, const OverlayDeleteDialogScene& scene) {
+    if (!context_ || !surface || !scene.content || !scene.layout || !ensureFormats(scene.scale) ||
+        !beginFrame(surface, false)) {
+        return;
+    }
+    const DeleteDialogContent& content = *scene.content;
+    const DeleteDialogLayout& layout = *scene.layout;
+    const DeleteDialogMetrics metrics{};
+    const float s = scene.scale;
+    // The settings window's ground and caption strip: its question small at
+    // the left, the square close turning red.
+    context_->Clear(kSheetGround);
+    text(content.caption, OverlayTextStyle::Small, layout.captionTitle, kText, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    captionButton(layout.close, kGlyphChromeClose, L"X", true, scene.hot == DeleteDialogHit::Close,
+                  scene.pressed == DeleteDialogHit::Close, 1.0F);
+    // The title in a list's bold, its type dim after it; where it plays
+    // under them.
+    if (layout.titleWrapped) mediaText(content.title, OverlayTextStyle::BodyBold, layout.title, metrics.titleLine * s, kText);
+    else text(content.title, OverlayTextStyle::BodyBold, layout.title, kText, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    text(content.type, OverlayTextStyle::Small, layout.type, kTextMuted, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    text(content.playing, OverlayTextStyle::Small, layout.playing, kTextDim, DWRITE_TEXT_ALIGNMENT_LEADING, true);
+    // The files on a raised card's ground, scrolled inside its padding.
+    if (layout.list.visible()) {
+        fillRound(layout.list, metrics.listRadius * s, kCardGround);
+        if (layout.listView.visible()) {
+            context_->PushAxisAlignedClip(toRect(layout.listView), D2D1_ANTIALIAS_MODE_ALIASED);
+            for (std::size_t i = 0; i < layout.files.size() && i < content.files.size(); ++i) {
+                const OverlayRect& box = layout.files[i];
+                if (box.bottom() <= layout.listView.y || box.y >= layout.listView.bottom()) continue;
+                mediaText(content.files[i], OverlayTextStyle::Small, box, metrics.smallLine * s, kTextDim);
+            }
+            context_->PopAxisAlignedClip();
+        }
+        if (const OverlayRect thumb = deleteDialogThumb(layout, s, metrics); thumb.visible()) {
+            scrollThumb(layout.scrollbar.right(), thumb.y, thumb.height,
+                        scene.thumbDragging || scene.hot == DeleteDialogHit::Scrollbar, 1.0F, s);
+        }
+    }
+    mediaText(content.warning, OverlayTextStyle::Small, layout.warning, metrics.smallLine * s, kAlert);
+    // Cancel a plain button; Delete in a close button's red.
+    quietButton(layout.cancel, scene.hot == DeleteDialogHit::Cancel, scene.pressed == DeleteDialogHit::Cancel, 1.0F, s);
+    text(content.cancel, OverlayTextStyle::Body, layout.cancel, kText);
+    dangerButton(layout.confirm, scene.hot == DeleteDialogHit::Confirm, scene.pressed == DeleteDialogHit::Confirm,
+                 1.0F, s);
+    text(content.confirm, OverlayTextStyle::Body, layout.confirm, rgba(255, 255, 255, 1.0F));
     endFrame();
 }
 
@@ -879,50 +964,18 @@ void Overlay::drawPanes(const OverlayScene& scene) {
         const float stripAlpha = std::clamp(pane.timelineAlpha, 0.0F, 1.0F);
         if (std::max(alpha, stripAlpha) <= 0.0F) continue;
         const auto& chrome = pane.chrome;
-        // With no scrim -- the row alone, a Linked video's on the bar's rail
-        // or a short pane's -- its two ends are capsules as the bar's "All"
-        // is: the tag, pause and time at the left, the buttons and the
-        // volume at the right; its buttons need no discs of their own.
+        // With no scrim -- the row alone, a Linked video's on the bar's rail,
+        // a short pane's or the only video's -- the row is one capsule as
+        // the bar's "All" is (`PaneChromeLayout::capsule`): the tag, pause
+        // and time, then the buttons, which need no discs of their own.
         const bool floating = !chrome.band.visible();
         if (stripAlpha > 0.0F) {
             // A scrim as the bar's: clear at its top, darkest at the edge.
             if (!floating) fillScrim(chrome.band, chrome.band.y, chrome.band.bottom(), stripAlpha);
-            else {
-                const auto take = [](OverlayRect& group, const OverlayRect& box) {
-                    if (!box.visible()) return;
-                    if (!group.visible()) {
-                        group = box;
-                        return;
-                    }
-                    const float left = std::min(group.x, box.x);
-                    const float top = std::min(group.y, box.y);
-                    group = {left, top, std::max(group.right(), box.right()) - left,
-                             std::max(group.bottom(), box.bottom()) - top};
-                };
-                OverlayRect start{};
-                take(start, chrome.pill);
-                take(start, chrome[PaneChip::Pause]);
-                if (chrome.time.visible()) {
-                    const float width = std::min(chrome.time.width,
-                        measureText(pane.timeText, OverlayTextStyle::Small, s) + 6.0F * s);
-                    take(start, {chrome.time.x, chrome.time.y, width, chrome.time.height});
-                }
-                OverlayRect end{};
-                for (const PaneChip chip : {PaneChip::Audio, PaneChip::Subtitles, PaneChip::Repeat,
-                                            PaneChip::Solo, PaneChip::Close}) {
-                    take(end, chrome[chip]);
-                }
-                take(end, chrome.volume);
-                // The tag alone needs no capsule round it.
-                const bool tagAlone = !chrome[PaneChip::Pause].visible() && !chrome.time.visible();
-                for (const OverlayRect* group : {&start, &end}) {
-                    if (!group->visible() || (group == &start && tagAlone)) continue;
-                    const OverlayRect capsule{group->x - 5.0F * s, group->y - 4.0F * s,
-                                              group->width + 10.0F * s, group->height + 8.0F * s};
-                    const float radius = capsule.height * 0.5F;
-                    fillRound(capsule, radius, withAlpha(kCapsuleFill, stripAlpha));
-                    strokeRound(capsule, radius, withAlpha(kCapsuleEdge, stripAlpha), std::max(1.0F, s));
-                }
+            else if (chrome.capsule.visible()) {
+                const float radius = chrome.capsule.height * 0.5F;
+                fillRound(chrome.capsule, radius, withAlpha(kCapsuleFill, stripAlpha));
+                strokeRound(chrome.capsule, radius, withAlpha(kCapsuleEdge, stripAlpha), std::max(1.0F, s));
             }
             if (chrome.timeline.visible() && pane.seekable) {
                 const bool emphasised = pane.railHot || pane.railDragging;
@@ -958,8 +1011,17 @@ void Overlay::drawPanes(const OverlayScene& scene) {
             }
             if (chrome.volume.visible()) {
                 const bool emphasised = pane.volumeHot || pane.volumeDragging;
-                rail(chrome.volume, 12.0F * s, (emphasised ? 5.0F : 4.0F) * s, pane.volume01, 0.0F,
-                     true, 6.0F * s, stripAlpha, pane.position);
+                if (chrome.volumeUpright) {
+                    // Standing on the speaker, as the bar's popup: a pill
+                    // with the rail standing in it.
+                    const OverlayRect pill = uprightVolumePill(chrome);
+                    fillRound(pill, pill.width * 0.5F, withAlpha(kPillFill, stripAlpha));
+                    verticalRail(pill, 12.0F * s, (emphasised ? 5.0F : 4.0F) * s, pane.volume01, 6.0F * s,
+                                 stripAlpha, pane.position);
+                } else {
+                    rail(chrome.volume, 12.0F * s, (emphasised ? 5.0F : 4.0F) * s, pane.volume01, 0.0F,
+                         true, 6.0F * s, stripAlpha, pane.position);
+                }
             }
         }
         if (chrome.pill.visible()) {
@@ -1111,6 +1173,10 @@ void Overlay::drawBar(const OverlayScene& scene) {
     if (bar[BarItem::Layout].visible()) {
         button(bar[BarItem::Layout], kGlyphLayout, L"Grid", hot(BarItem::Layout),
                pressed(BarItem::Layout), false, alpha, s);
+    }
+    if (bar[BarItem::Sets].visible()) {
+        button(bar[BarItem::Sets], kGlyphVideoSets, L"Sets", hot(BarItem::Sets), pressed(BarItem::Sets),
+               scene.videoSetPlaying, alpha, s);
     }
     button(bar[BarItem::Fullscreen], scene.fullscreen ? kGlyphWindowed : kGlyphFullscreen,
            scene.fullscreen ? L"Exit" : L"Full", hot(BarItem::Fullscreen),

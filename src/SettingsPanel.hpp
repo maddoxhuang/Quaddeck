@@ -8,8 +8,8 @@
 // settings are split over tabs (SettingsTab): a column down the window's
 // left, one tab a line under its title, beside the chosen tab's rows. A
 // page's leading rows can stay put while the rest scroll (PanelRow::pinned):
-// the browsers' title, way around and view. The sheet itself has one face
-// (SheetFace), the Emby browser.
+// the browsers' title, way around and view. The sheet's header carries a
+// switch (SheetFace) between its faces: the Emby browser and the video sets.
 
 #include "OverlayLayout.hpp"
 #include "TextField.hpp"
@@ -69,16 +69,18 @@ inline wchar_t settingsTabGlyph(SettingsTab tab) {
     return L'\0';
 }
 
-// The sheet's face: the Emby browser, or the F6 folder list in its place.
-// The settings are not one: they were the sheet's other face before 1.4.0,
-// and now they are a window of their own, which F5 and the menu bring up.
-// A header switch would be captioned with the face it leads to and stand
-// beside the close glyph.
-enum class SheetFace { Emby };
+// The sheet's faces: the Emby browser (or the F6 folder list in its place)
+// and the video sets, which the bar's Sets button and Ctrl+O bring up. The
+// settings are not one: they were the sheet's other face before 1.4.0, and
+// now they are a window of their own, which F5 and the menu bring up. A
+// switch is captioned with what it leads to and stands beside the close
+// glyph.
+enum class SheetFace { Emby, VideoSets };
 
 inline const wchar_t* sheetFaceCaption(SheetFace face) {
     switch (face) {
     case SheetFace::Emby: return L"Emby \x203A";
+    case SheetFace::VideoSets: return L"Video sets \x203A";
     }
     return L"";
 }
@@ -123,7 +125,7 @@ enum class SettingId {
     LocalReplaceCancel,
     FileTypes,
     Style,
-    Session,
+    VideoSets,
     SubtitleShow,
     SubtitleLanguage,
     SubtitleSize,
@@ -136,6 +138,8 @@ enum class SettingId {
     EmbyLibraryDetails,
     EmbyReplaceChoice,
     EmbyReplaceCancel,
+    // F5 > General's switch for deleting from the Emby server.
+    EmbyDeleteAllowed,
     // The browser's search box; its clear button is the row's Trailing hit.
     EmbySearch,
     // Under it, on a search opened in a folder: part 0 searches that
@@ -190,6 +194,12 @@ enum class SettingId {
     VideoLevels,
     VideoColor,
     VideoColorReset,
+    // The video sets' face (AppVideoSets.cpp): the row over the list -- add
+    // what plays, import, export, and what follows a set's end -- each set's
+    // Play and its menu (`param` the set), and the box one is renamed in.
+    VideoSetsToolbar,
+    VideoSetEntry,
+    VideoSetName,
 };
 
 // One movie/series information surface. Text stays separate from cached
@@ -678,6 +688,30 @@ inline float panelScrollCentring(const PanelLayout& layout, std::size_t row) {
     return std::clamp(middle - layout.content.height * 0.5F, 0.0F, layout.maxScroll);
 }
 
+// Whether the row `row` is in view: its middle within the content, where the
+// list scrolls. A pinned row always is; one not laid out never.
+inline bool panelRowInView(const PanelLayout& layout, std::size_t row) {
+    if (row >= layout.rows.size()) return false;
+    if (row < layout.pinnedRows) return true;
+    const OverlayRect& box = layout.rows[row].row;
+    const float middle = box.y + box.height * 0.5F;
+    return middle >= layout.content.y && middle <= layout.content.bottom();
+}
+
+// The scroll that follows a video to the middle of the list: of the rows
+// showing it, `rows`, the one nearest where the list is, as far as the
+// list's ends let it. None where no row of them scrolls -- none laid out,
+// or only pinned ones, which show it already.
+inline std::optional<float> panelFollowScroll(const PanelLayout& layout, const std::vector<std::size_t>& rows) {
+    std::optional<float> best;
+    for (const std::size_t row : rows) {
+        if (row < layout.pinnedRows || row >= layout.rows.size()) continue;
+        const float scroll = panelScrollCentring(layout, row);
+        if (!best || std::abs(scroll - layout.scroll) < std::abs(*best - layout.scroll)) best = scroll;
+    }
+    return best;
+}
+
 // Where the scrollbar marks the row `row`: the thumb's middle once that row
 // is scrolled to the middle of the content, so a press on the mark, which
 // brings the thumb's middle under the pointer, shows the row. Negative for
@@ -875,10 +909,11 @@ inline float panelTextWidthEstimate(const std::wstring& text, float em = 14.0F) 
 // side, no less than the minimum; a Buttons row's value stands just left of
 // its buttons. Beside the label they end at the row's right, one line at the
 // row's own height. Under it, with the value at the label line's right end,
-// they run from its left on one line when they fit there; else they are a
-// grid of cells all as wide as the widest, as many columns as fit and then
-// as few as that many lines allow, so every line but the last is full. A
-// Choice row's segments, on one line or in a grid, share one track.
+// they are one line when they fit there; else they are a grid of cells all
+// as wide as the widest, as many columns as fit and then as few as that many
+// lines allow, so every line but the last is full. The line or the grid ends
+// at the row's right too, and starts at its left only when wider than the
+// row. A Choice row's segments, on one line or in a grid, share one track.
 inline float panelCompactRow(const PanelRow& row, float x, float y, float innerWidth, float s,
                              const PanelMetrics& m, PanelRowGeometry* geometry = nullptr) {
     const bool choice = row.kind == PanelRowKind::Choice;
@@ -940,6 +975,9 @@ inline float panelCompactRow(const PanelRow& row, float x, float y, float innerW
     } else {
         top = label > 0.0F || value > 0.0F ? m.labelLine * s : 6.0F * s;
         height = top + block + 8.0F * s;
+        const float span = oneLine ? controls
+            : 2.0F * inset + static_cast<float>(columns) * widest + static_cast<float>(columns - 1) * gap;
+        left = x + std::max(0.0F, innerWidth - span);
     }
     if (!geometry) return height;
 
@@ -1504,6 +1542,23 @@ struct PanelHit {
     int part{-1};
     float fraction{};
 };
+
+// The greyed row under a point in the pinned band or the content; -1 for
+// none, or for a row that is not greyed. The hit test answers a greyed row
+// as the sheet, but a pointer resting on one still shows its hint, which
+// can say why it is greyed (until 2026-11-07 it was never shown).
+inline int panelGreyedRowAt(float px, float py, const PanelLayout& layout, const std::vector<PanelRow>& rows) {
+    const bool pinned = layout.pinned.contains(px, py);
+    if (!pinned && !layout.content.contains(px, py)) return -1;
+    const std::size_t first = pinned ? 0 : panelFirstRowReaching(layout, py);
+    const std::size_t last = pinned ? std::min(layout.pinnedRows, layout.rows.size()) : layout.rows.size();
+    for (std::size_t i = first; i < last && i < rows.size(); ++i) {
+        const auto& row = layout.rows[i].row;
+        if (!pinned && row.y > py) break;
+        if (row.contains(px, py)) return rows[i].enabled ? -1 : static_cast<int>(i);
+    }
+    return -1;
+}
 
 // Rows are only live inside the content clip; a disabled row swallows the
 // click as "Sheet" so nothing beneath it reacts.

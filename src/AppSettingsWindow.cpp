@@ -301,6 +301,10 @@ LRESULT App::handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lPa
     case WM_LBUTTONUP:
         settingsWindowRelease(local());
         return 0;
+    case WM_RBUTTONUP:
+        // A spin box's number has Windows' edit-box menu.
+        settingsWindowRightClick(local());
+        return 0;
     case WM_TIMER:
         if (wParam == kSpinTimer) settingsSpinStep();
         return 0;
@@ -369,7 +373,8 @@ LRESULT App::handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lPa
         // Play, pause and the tracks act on the player, as from its window.
         return handleMessage(message, wParam, lParam);
     case WM_CHAR:
-        if (settingsWindow_.spinEdit) spinEditCharacter(static_cast<wchar_t>(wParam));
+        // Not under the number's open menu, which has the keys.
+        if (settingsWindow_.spinEdit && !settingsWindow_.dropDown) spinEditCharacter(static_cast<wchar_t>(wParam));
         return 0;
     case WM_SETCURSOR:
         // An I-beam over a spin box's number, which is typed into.
@@ -502,11 +507,12 @@ void App::buildSettingsWindowScene(const RECT& client) {
     panel.scrollbarHot = settings.hotKind == PanelHitKind::Scrollbar;
     panel.scrollbarDragging = settings.drag == SettingsWindow::Drag::Scrollbar;
     panel.scrollMarks.clear();
-    // A drop-down's box is lit as pressed while its list is open; the list
-    // is painted in its own window (renderSettingsList).
+    // A drop-down's box is lit as pressed while its list is open (not a spin
+    // box under its menu); the list is painted in its own window
+    // (renderSettingsList).
     scene.panelMenu.items.clear();
     scene.panelMenu.submenus.clear();
-    if (settings.dropDown) {
+    if (settings.dropDown && !settings.dropDown->editMenu) {
         panel.pressedKind = PanelHitKind::DropDown;
         panel.pressedRow = settings.dropDown->row;
         panel.pressedPart = -1;
@@ -602,7 +608,12 @@ void App::settingsWindowHover() {
         settings.tooltipAnchor = {};
         return;
     }
-    const PanelHit hit = settings.pointerInside ? settingsWindowHitAt(settings.pointer) : PanelHit{};
+    PanelHit hit = settings.pointerInside ? settingsWindowHitAt(settings.pointer) : PanelHit{};
+    // A greyed row is the sheet's, lit by nothing, but its hint is shown.
+    if (hit.kind == PanelHitKind::Sheet && hit.row < 0) {
+        hit.row = panelGreyedRowAt(static_cast<float>(settings.pointer.x), static_cast<float>(settings.pointer.y),
+                                   settings.layout, settings.rows);
+    }
     const bool over = hit.kind != PanelHitKind::None && hit.kind != PanelHitKind::Outside;
     // A drag keeps its own control lit wherever the pointer goes.
     PanelHitKind kind = over ? hit.kind : PanelHitKind::None;
@@ -782,7 +793,6 @@ void App::spinEditKey(WPARAM key, bool ctrl, bool shift) {
     if (!settings.spinEdit) return;
     TextFieldState& field = settings.spinEdit->field;
     textFieldClamp(field);
-    const auto paste = [&] { textFieldInsert(field, spinBoxDigits(clipboardText(settings.window)), kSpinBoxDigits); };
     switch (key) {
     // The digits are one word: Ctrl takes the arrows and the erasers to an end.
     case VK_LEFT: textFieldStep(field, -1, ctrl, shift); break;
@@ -792,27 +802,27 @@ void App::spinEditKey(WPARAM key, bool ctrl, bool shift) {
     case VK_BACK: textFieldErase(field, -1, ctrl); break;
     case VK_DELETE:
         // Shift+Delete cuts, as in Windows' edit box.
-        if (shift && !ctrl && textFieldHasSelection(field)) setClipboardText(settings.window, textFieldSelected(field));
+        if (shift && !ctrl && textFieldHasSelection(field)) {
+            spinEditApply(TextFieldEdit::Cut);
+            break;
+        }
         textFieldErase(field, 1, ctrl);
         break;
     case VK_INSERT:
-        if (ctrl && !shift) setClipboardText(settings.window, textFieldSelected(field));
-        else if (shift && !ctrl) paste();
+        if (ctrl && !shift) spinEditApply(TextFieldEdit::Copy);
+        else if (shift && !ctrl) spinEditApply(TextFieldEdit::Paste);
         break;
     case 'A':
-        if (ctrl) textFieldSelectAll(field);
+        if (ctrl) spinEditApply(TextFieldEdit::SelectAll);
         break;
     case 'C':
-        if (ctrl) setClipboardText(settings.window, textFieldSelected(field));
+        if (ctrl) spinEditApply(TextFieldEdit::Copy);
         break;
     case 'X':
-        if (ctrl && textFieldHasSelection(field)) {
-            setClipboardText(settings.window, textFieldSelected(field));
-            textFieldErase(field, -1, false);
-        }
+        if (ctrl) spinEditApply(TextFieldEdit::Cut);
         break;
     case 'V':
-        if (ctrl) paste();
+        if (ctrl) spinEditApply(TextFieldEdit::Paste);
         break;
     case VK_UP:
     case VK_DOWN: {
@@ -849,6 +859,51 @@ void App::spinEditCharacter(wchar_t character) {
     if (digit.empty()) return;
     textFieldInsert(settings.spinEdit->field, digit, kSpinBoxDigits);
     settings.spinEdit->caretTick = GetTickCount64();
+}
+
+bool App::spinEditApply(TextFieldEdit edit) {
+    auto& settings = settingsWindow_;
+    if (!settings.spinEdit) return false;
+    // A paste takes the clipboard's digits alone, as typing does; with
+    // none it does nothing. The clipboard is read for a paste only.
+    const std::wstring pasted =
+        edit == TextFieldEdit::Paste ? spinBoxDigits(fieldClipboard(settings.window)) : std::wstring();
+    std::wstring copied;
+    const bool edited = textFieldApplyEdit(settings.spinEdit->field, edit, false, pasted, copied, kSpinBoxDigits);
+    fieldSetClipboard(copied, settings.window);
+    settings.spinEdit->caretTick = GetTickCount64();
+    return edited;
+}
+
+void App::settingsWindowRightClick(POINT local) {
+    auto& settings = settingsWindow_;
+    // An open list or menu only closes, as under a left press.
+    if (settings.dropDown) {
+        closeSettingsDropDown();
+        settingsWindowHover();
+        return;
+    }
+    // Only a spin box's number has a menu; elsewhere a right-click is nothing.
+    const PanelHit hit = settingsWindowHitAt(local);
+    if (hit.kind != PanelHitKind::Field || hit.row < 0 || hit.row >= static_cast<int>(settings.rows.size())) return;
+    const PanelRow& row = settings.rows[static_cast<std::size_t>(hit.row)];
+    // Not typed into yet, it takes the typing as under a left press, all of
+    // it chosen; typed into, its caret and selection stay, for the menu.
+    if (!settings.spinEdit || settings.spinEdit->id != row.id || settings.spinEdit->param != row.param) {
+        beginSpinEdit(hit.row, static_cast<float>(local.x));
+    }
+    if (!settings.spinEdit) return;
+    SettingsWindow::DropDown open;
+    open.editMenu = true;
+    open.at = local;
+    open.id = row.id;
+    open.param = row.param;
+    open.items = fieldEditMenu(settings.spinEdit->field, false, spinBoxDigits(fieldClipboard(settings.window)),
+                               kSpinBoxDigits).items;
+    if (settings.window && renderer_.device()) createSettingsListWindow();
+    settings.dropDown = std::move(open);
+    layoutSettingsDropDown();
+    settingsWindowHover();
 }
 
 void App::endSpinEdit(bool apply) {
@@ -1082,45 +1137,56 @@ void App::layoutSettingsDropDown() {
     if (!settings.dropDown) return;
     auto& open = *settings.dropDown;
     const auto& layout = settings.layout;
+    // Its row: a drop-down Choice for a list, the spin box being typed for
+    // its menu, which goes with the typing.
     open.row = -1;
     for (std::size_t i = 0; i < settings.rows.size() && i < layout.rows.size(); ++i) {
         const auto& row = settings.rows[i];
-        if (row.id == open.id && row.param == open.param && row.kind == PanelRowKind::Choice && row.dropDown) {
+        if (row.id != open.id || row.param != open.param) continue;
+        if (open.editMenu ? row.spinBox : row.kind == PanelRowKind::Choice && row.dropDown) {
             open.row = static_cast<int>(i);
             break;
         }
     }
-    if (open.row < 0 || !settings.rows[static_cast<std::size_t>(open.row)].enabled) {
+    const bool typed = settings.spinEdit && settings.spinEdit->id == open.id && settings.spinEdit->param == open.param;
+    if (open.row < 0 || !settings.rows[static_cast<std::size_t>(open.row)].enabled || (open.editMenu && !typed)) {
         closeSettingsDropDown();
         return;
     }
     const auto index = static_cast<std::size_t>(open.row);
-    const OverlayRect anchor = layout.rows[index].control;
     const OverlayRect& band = index < layout.pinnedRows ? layout.pinned : layout.content;
-    if (!anchor.visible() || anchor.bottom() <= band.y || anchor.y >= band.bottom()) {
+    const OverlayRect& shown = open.editMenu ? layout.rows[index].value : layout.rows[index].control;
+    if (!shown.visible() || shown.bottom() <= band.y || shown.y >= band.bottom()) {
         closeSettingsDropDown();
         return;
     }
-    // Its lines from the row as it stands, the chosen one ticked: an output
-    // plugged in while it is open joins it.
-    const auto& row = settings.rows[index];
-    PanelMenu menu;
-    for (std::size_t i = 0; i < row.options.size(); ++i) {
-        menu.option(static_cast<unsigned>(i + 1), row.options[i], row.selected == static_cast<int>(i));
+    // A list hangs from its box; a menu from the pointer that opened it.
+    const OverlayRect anchor = open.editMenu
+        ? OverlayRect{static_cast<float>(open.at.x), static_cast<float>(open.at.y), 0.0F, 0.0F}
+        : layout.rows[index].control;
+    if (!open.editMenu) {
+        // Its lines from the row as it stands, the chosen one ticked: an
+        // output plugged in while it is open joins it. A menu keeps the
+        // lines it opened with: the number cannot change under it.
+        const auto& row = settings.rows[index];
+        PanelMenu menu;
+        for (std::size_t i = 0; i < row.options.size(); ++i) {
+            menu.option(static_cast<unsigned>(i + 1), row.options[i], row.selected == static_cast<int>(i));
+        }
+        open.items = std::move(menu.items);
     }
-    open.items = std::move(menu.items);
     if (open.highlighted >= static_cast<int>(open.items.size())) open.highlighted = -1;
     if (open.pressed >= static_cast<int>(open.items.size())) open.pressed = -1;
     std::vector<float> labelWidths;
     std::vector<float> shortcutWidths;
     settings.overlay.measurePanelMenu(open.items, settings.scale, labelWidths, shortcutWidths);
-    // As wide as its box, or its widest line where that is wider -- with no
-    // least width of a menu's, so not a little wider than a narrow box --
-    // and as tall as its lines; then hung from the box's bottom-left on the
-    // screen, within the work area of the box's monitor. With no window the
-    // client stands for the screen.
+    // A list as wide as its box, or its widest line where that is wider --
+    // with no least width of a menu's, so not a little wider than a narrow
+    // box -- a menu as wide as menus are; as tall as its lines; then hung
+    // from the box's bottom-left on the screen, within the work area of the
+    // box's monitor. With no window the client stands for the screen.
     PanelMenuMetrics fitted;
-    fitted.minWidth = 0.0F;
+    if (!open.editMenu) fitted.minWidth = 0.0F;
     const PanelMenuLayout natural = panelMenuLayout(open.items, labelWidths, shortcutWidths,
                                                     {0.0F, 0.0F, anchor.width, anchor.height}, {}, settings.scale,
                                                     0.0F, PanelMenuPlacement::Below, fitted);
@@ -1240,6 +1306,15 @@ LRESULT App::handleSettingsListMessage(UINT message, WPARAM wParam, LPARAM lPara
         if (pressed >= 0 && pressed == lineAt()) chooseSettingsDropDown(pressed);
         return 0;
     }
+    case WM_RBUTTONUP:
+        // On a spin box's menu the right button chooses as the left does, as
+        // on the main window's menus (panelMenuRightClick); until 2026-11-07
+        // it did nothing there. A list's lines take the left button alone.
+        if (settings.dropDown && settings.dropDown->editMenu) {
+            const int line = lineAt();
+            if (line >= 0) chooseSettingsDropDown(line);
+        }
+        return 0;
     case WM_CAPTURECHANGED:
         if (settings.dropDown && reinterpret_cast<HWND>(lParam) != list) settings.dropDown->pressed = -1;
         return 0;
@@ -1273,11 +1348,18 @@ void App::chooseSettingsDropDown(int index) {
     auto& settings = settingsWindow_;
     if (!settings.dropDown) return;
     const int row = settings.dropDown->row;
+    const bool editMenu = settings.dropDown->editMenu;
     const bool chosen = index >= 0 && index < static_cast<int>(settings.dropDown->items.size()) &&
                         panelMenuSelectable(settings.dropDown->items[static_cast<std::size_t>(index)]);
+    const unsigned command = chosen ? settings.dropDown->items[static_cast<std::size_t>(index)].command : 0;
     // Closed first: what the choice does builds the rows again.
     closeSettingsDropDown();
-    if (chosen) activateSettingsHit({PanelHitKind::Segment, row, index});
+    if (!chosen) return;
+    if (editMenu) {
+        if (const auto edit = fieldMenuEdit(command)) spinEditApply(*edit);
+        return;
+    }
+    activateSettingsHit({PanelHitKind::Segment, row, index});
 }
 
 void App::settingsDropDownKey(WPARAM key) {
@@ -1313,6 +1395,10 @@ void App::settingsDropDownKey(WPARAM key) {
         break;
     case VK_PRIOR:
     case VK_NEXT: {
+        // A spin box's menu has no pages, as the main window's menus have
+        // none (panelMenuKey): a page's jump landed on its greyed lines and
+        // separator, and Enter there only closed it.
+        if (open.editMenu) return;
         // A page's worth of lines, stopping at the first or the last.
         const int count = static_cast<int>(open.items.size());
         line = std::clamp((line < 0 ? 0 : line) + (key == VK_PRIOR ? -page : page), 0, std::max(0, count - 1));

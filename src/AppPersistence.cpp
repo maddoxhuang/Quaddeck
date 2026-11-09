@@ -70,57 +70,6 @@ SessionState App::captureSession() const {
     return state;
 }
 
-bool App::saveSession(const std::wstring& path) {
-    const SessionState state = captureSession();
-    if (!writeUtf8FileAtomically(
-            std::filesystem::path(path),
-            [&](std::wostream& output) { return writeSession(output, state); })) {
-        return false;
-    }
-    sessionPath_ = path;
-    return true;
-}
-
-bool App::loadSession(const std::wstring& path) {
-    std::wstring text;
-    if (!readUtf8File(std::filesystem::path(path), text)) return false;
-    std::wistringstream input(text);
-    input.imbue(std::locale::classic());
-    SessionState state;
-    if (!readSession(input, state)) return false;
-    applySession(state);
-    sessionPath_ = path;
-    return true;
-}
-
-void App::saveSessionDialog() {
-    wchar_t path[MAX_PATH]{};
-    if (!sessionPath_.empty()) wcsncpy_s(path, sessionPath_.c_str(), _TRUNCATE);
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"QuadDeck session (*.qdeck)\0*.qdeck\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrDefExt = L"qdeck";
-    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    if (GetSaveFileNameW(&dialog) && !saveSession(path)) {
-        MessageBoxW(window_, L"Could not save the QuadDeck session.", L"Session error", MB_ICONERROR);
-    }
-}
-
-void App::loadSessionDialog() {
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"QuadDeck session (*.qdeck)\0*.qdeck\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&dialog) && !loadSession(path)) {
-        MessageBoxW(window_, L"This file is not a valid QuadDeck session.", L"Session error", MB_ICONERROR);
-    }
-}
-
 StyleState App::captureStyle() const {
     StyleState state;
     state.layout = layoutMode_;
@@ -194,6 +143,7 @@ AppSettings App::captureAppSettings() const {
     state.rtxVideo = rtxVideo_;
     state.embyBrowser = embyBrowser_;
     state.embyLibraries = embyLibraries_;
+    state.embyDelete = embyDeleteEnabled_;
     state.playOrder = playOrder_;
     state.keyframeSeek = keyframeSeek_;
     state.subtitles = subtitleSettings_;
@@ -335,6 +285,7 @@ bool App::loadAppSettings() {
     applyVideoOutput();
     embyBrowser_ = clampEmbyBrowserPrefs(state.embyBrowser);
     embyLibraries_ = state.embyLibraries;
+    embyDeleteEnabled_ = state.embyDelete;
     playOrder_ = state.playOrder;
     keyframeSeek_ = state.keyframeSeek;
     subtitleSettings_ = clampSubtitleSettings(state.subtitles);
@@ -452,7 +403,11 @@ void App::applySession(const SessionState& state) {
     ShaderPreset loadedPreset = state.shader;
     std::wstring loadedShaderPath = state.customShaderPath;
     const bool deferShader = deviceRecoveryPending_ || renderer_.deviceLost();
-    const bool shaderReady = deferShader || (loadedShaderPath.empty()
+    // A video set brings the look it found with it (playVideoSet): the
+    // shader running is not compiled or read again, nor a file that could
+    // not be read retried at every set.
+    const bool shaderKept = loadedPreset == shaderPreset_ && loadedShaderPath == customShaderPath_;
+    const bool shaderReady = deferShader || shaderKept || (loadedShaderPath.empty()
         ? renderer_.setShaderPreset(loadedPreset)
         : renderer_.loadPixelShader(loadedShaderPath));
     if (!shaderReady) {
@@ -479,7 +434,7 @@ void App::applySession(const SessionState& state) {
     masterLoopA_ = state.masterLoopA;
     masterLoopB_ = state.masterLoopB;
     customShaderPath_ = std::move(loadedShaderPath);
-    customShaderUnloaded_ = false;
+    if (!shaderKept) customShaderUnloaded_ = false;
     for (std::size_t pane = 0; pane < state.panes.size(); ++pane) {
         const auto& source = state.panes[pane];
         paths_[pane] = source.path;

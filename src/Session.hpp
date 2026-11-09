@@ -71,6 +71,8 @@ struct AppSettings {
     VideoEnhancementSettings rtxVideo;
     EmbyBrowserPrefs embyBrowser;
     EmbyLibraryPrefs embyLibraries;
+    // Whether a right-click offers to delete a video from the Emby server.
+    bool embyDelete{};
     PlayOrder playOrder{PlayOrder::InOrder};
     bool keyframeSeek{true};
     SubtitleSettings subtitles;
@@ -169,7 +171,9 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
 // 21 is 20 with the Solo keys (each video alone, all videos) among the
 // actions, for the reason 17 was 16 with the arrangements'.
 // 22 adds the browser's favorites filter to the `embybrowser` line.
-inline constexpr int kAppSettingsVersion = 22;
+// 23 adds the `embydelete` line: whether videos may be deleted from the
+// Emby server.
+inline constexpr int kAppSettingsVersion = 23;
 
 // The keys of the actions whose keys differ from their defaults, as
 // keyBindingsFrom takes them; nothing for keys that are not a table.
@@ -263,6 +267,7 @@ inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
            << static_cast<int>(video.scaling) << L' ' << video.limitedRange << L'\n';
     output << L"videocolor " << video.color.brightness << L' ' << video.color.contrast << L' '
            << video.color.saturation << L' ' << video.color.hue << L' ' << video.color.gamma << L'\n';
+    output << L"embydelete " << state.embyDelete << L'\n';
     return writeStyle(output, state.style);
 }
 
@@ -279,6 +284,7 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
     state.rtxVideo = VideoEnhancementSettings{};
     state.embyBrowser = EmbyBrowserPrefs{};
     state.embyLibraries = EmbyLibraryPrefs{};
+    state.embyDelete = false;
     state.playOrder = PlayOrder::InOrder;
     state.keyframeSeek = true;
     state.audio = AudioSettings{};
@@ -460,6 +466,10 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
               video.color.hue >> video.color.gamma))
             return false;
         state.video = clampVideoOutputSettings(video);
+    }
+    // Older files predate deleting from the server, which stays off.
+    if (version >= 23) {
+        if (!(input >> key) || key != L"embydelete" || !(input >> state.embyDelete)) return false;
     }
     if (!readStyle(input, state.style) || !std::isfinite(state.volume)) return false;
     state.decode = static_cast<DecodeMode>(std::clamp(decode, 0, 2));

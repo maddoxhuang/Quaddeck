@@ -113,13 +113,21 @@ inline void textFieldSelectAll(TextFieldState& field) {
     field.caret = field.text.size();
 }
 
-// `value` in place of the selection, or at the caret: line breaks and tabs
-// become one space each, other control characters go, and what would pass
-// `limit` is left off. True when the text changed.
-inline bool textFieldInsert(TextFieldState& field, std::wstring_view value, std::size_t limit = kTextFieldLimit) {
-    textFieldClamp(field);
+// How many units `limit` leaves for what takes the selection's place, both
+// ends within the text.
+inline std::size_t textFieldRoom(const TextFieldState& field, std::size_t limit) {
+    const std::size_t start = std::min(textFieldSelectionStart(field), field.text.size());
+    const std::size_t end = std::min(textFieldSelectionEnd(field), field.text.size());
+    const std::size_t kept = field.text.size() - (end - start);
+    return limit > kept ? limit - kept : 0;
+}
+
+// What of `value` goes into a box with `room` units left: line breaks and
+// tabs one space each, other control characters gone, and what would pass
+// `room` left off, never half a surrogate pair.
+inline std::wstring textFieldKept(std::wstring_view value, std::size_t room) {
     std::wstring clean;
-    clean.reserve(value.size());
+    clean.reserve(std::min(value.size(), room));
     for (std::size_t i = 0; i < value.size(); ++i) {
         const wchar_t c = value[i];
         if (c == L'\r' || c == L'\n' || c == L'\t') {
@@ -131,18 +139,98 @@ inline bool textFieldInsert(TextFieldState& field, std::wstring_view value, std:
         if (c < 0x20 || c == 0x7F) continue;
         clean += c;
     }
-    const std::size_t start = textFieldSelectionStart(field);
-    const std::size_t end = textFieldSelectionEnd(field);
-    const std::size_t kept = field.text.size() - (end - start);
-    const std::size_t room = limit > kept ? limit - kept : 0;
     if (clean.size() > room) {
         clean.resize(room);
         if (!clean.empty() && textFieldHighSurrogate(clean.back())) clean.pop_back();
     }
-    if (clean.empty() && start == end) return false;
+    return clean;
+}
+
+// `value` in place of the selection, or at the caret, as textFieldKept
+// takes it under `limit`. True when the text changed. An empty `value`
+// takes the selection out (Cut, Delete); one of which nothing is kept --
+// an emoji with one unit of room -- changes nothing, the selection
+// staying, where until 2026-11-07 it was taken out for nothing.
+inline bool textFieldInsert(TextFieldState& field, std::wstring_view value, std::size_t limit = kTextFieldLimit) {
+    textFieldClamp(field);
+    const std::wstring clean = textFieldKept(value, textFieldRoom(field, limit));
+    const std::size_t start = textFieldSelectionStart(field);
+    const std::size_t end = textFieldSelectionEnd(field);
+    if (clean.empty() && (start == end || !value.empty())) return false;
     field.text.replace(start, end - start, clean);
     field.caret = field.anchor = start + clean.size();
     return true;
+}
+
+// What a paste puts in: the copied text without the line breaks at its
+// ends, which a copied line or a triple-clicked paragraph brings along.
+// Typed as a space each, as breaks within the text still are, they were a
+// password's last character, and the sign-in with it failed.
+inline std::wstring textFieldPasted(std::wstring_view text) {
+    const auto lineBreak = [](wchar_t c) { return c == L'\r' || c == L'\n'; };
+    while (!text.empty() && lineBreak(text.front())) text.remove_prefix(1);
+    while (!text.empty() && lineBreak(text.back())) text.remove_suffix(1);
+    return std::wstring(text);
+}
+
+// The edits of a box's right-click menu, and of their keys (Ctrl+X, Ctrl+C,
+// Ctrl+V, Delete, Ctrl+A), as Windows' edit box has them.
+enum class TextFieldEdit { Cut, Copy, Paste, Delete, SelectAll };
+
+// Whether `edit` would do anything now, which the menu greys the line of
+// when not: Cut and Copy want a selection and not a password's, Delete a
+// selection, and Paste something of `pasted` -- the clipboard's text as the
+// box takes it (textFieldPasted, or a spin box's digits) -- that goes in
+// under `limit` (textFieldKept): not with nothing it keeps, nor in a full
+// box with nothing selected, nor where the room left splits the pair of a
+// character such as an emoji. A paste of nothing does nothing; until
+// 2026-11-07 it erased the selection. Windows' edit box leaves Paste lit in
+// a full box, where it does nothing; here it is greyed. Select all wants an
+// end to move: the whole text selected backwards, as Shift+Home leaves it,
+// still brings the caret to the end, as Ctrl+A always did; selected
+// forwards it is greyed.
+inline bool textFieldCanEdit(const TextFieldState& field, TextFieldEdit edit, bool masked, std::wstring_view pasted,
+                             std::size_t limit = kTextFieldLimit) {
+    switch (edit) {
+    case TextFieldEdit::Cut:
+    case TextFieldEdit::Copy:
+        return !masked && textFieldHasSelection(field);
+    case TextFieldEdit::Paste:
+        return !textFieldKept(pasted, textFieldRoom(field, limit)).empty();
+    case TextFieldEdit::Delete:
+        return textFieldHasSelection(field);
+    case TextFieldEdit::SelectAll:
+        // No text has its caret at 0, its end: nothing to select.
+        return field.anchor != 0 || field.caret != field.text.size();
+    }
+    return false;
+}
+
+// Does `edit` where it can (textFieldCanEdit); what it copies is left in
+// `copied`, for the clipboard, and is empty otherwise. True when the text
+// changed. Cut and Delete only run with a selection, which an empty insert
+// takes out.
+inline bool textFieldApplyEdit(TextFieldState& field, TextFieldEdit edit, bool masked, std::wstring_view pasted,
+                               std::wstring& copied, std::size_t limit = kTextFieldLimit) {
+    textFieldClamp(field);
+    copied.clear();
+    if (!textFieldCanEdit(field, edit, masked, pasted, limit)) return false;
+    switch (edit) {
+    case TextFieldEdit::Cut:
+        copied = textFieldSelected(field);
+        return textFieldInsert(field, {});
+    case TextFieldEdit::Copy:
+        copied = textFieldSelected(field);
+        return false;
+    case TextFieldEdit::Paste:
+        return textFieldInsert(field, pasted, limit);
+    case TextFieldEdit::Delete:
+        return textFieldInsert(field, {});
+    case TextFieldEdit::SelectAll:
+        textFieldSelectAll(field);
+        return false;
+    }
+    return false;
 }
 
 // Backspace (-1) or Delete (+1), a word with Ctrl; the selection alone

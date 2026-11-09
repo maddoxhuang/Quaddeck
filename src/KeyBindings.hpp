@@ -71,7 +71,7 @@ enum class KeyAction : std::uint8_t {
     SwapChannels, VoiceRemoval, VoiceEmphasis, AudioOutputNext,
     OpenFiles, PreviousFile, NextFile, List, Emby, EmbySearch,
     SortName, SortSize, SortDate, SortLength, SortRandom, SortReleased, SortPlayed, SortUpdated,
-    OpenSession, SaveSession,
+    VideoSets, AddVideoSet,
     SubtitlesToggle, SubtitleNext, SubtitleLoad, SubtitleEarlier, SubtitleLater, SubtitleTimingReset,
     SubtitleBigger, SubtitleSmaller, SubtitleRaise, SubtitleLower, SubtitlePlaceReset,
     // In LayoutMode's order, as the Arrangement menu lists them.
@@ -186,8 +186,10 @@ inline constexpr std::array<KeyActionInfo, kKeyActionCount> kActions{{
     {KeyAction::SortReleased, "sort-released", L"Sort by release date", KeyGroup::Files, false, {ctrl('1')}},
     {KeyAction::SortPlayed, "sort-played", L"Sort by last played", KeyGroup::Files, false, {ctrl('2')}},
     {KeyAction::SortUpdated, "sort-updated", L"Sort by last updated", KeyGroup::Files, false, {ctrl('3')}},
-    {KeyAction::OpenSession, "open-session", L"Open session", KeyGroup::Files, false, {ctrl('O')}},
-    {KeyAction::SaveSession, "save-session", L"Save session", KeyGroup::Files, false, {ctrl('S')}},
+    // The ids are those of the session keys these replaced, so keys the
+    // viewer chose for those stay theirs.
+    {KeyAction::VideoSets, "open-session", L"Video sets", KeyGroup::Files, false, {ctrl('O')}},
+    {KeyAction::AddVideoSet, "save-session", L"Add to video sets", KeyGroup::Files, false, {ctrl('S')}},
     // PotPlayer's subtitle keys: Alt with H, L, O, the size and the place;
     // . shows the lines earlier, , later, / as their file says.
     {KeyAction::SubtitlesToggle, "subtitles", L"Subtitles on / off", KeyGroup::Subtitles, false, {alt('H')}},

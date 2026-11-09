@@ -66,7 +66,7 @@ inline AssociationPlan fileAssociationPlan(const std::wstring& executable) {
     };
     progId(kVideoProgId, L"Video");
     progId(kSubtitleProgId, L"Subtitles");
-    progId(kSessionProgId, L"QuadDeck session");
+    progId(kSessionProgId, L"QuadDeck video sets");
 
     const std::wstring application = classes + L"Applications\\QuadDeck.exe";
     plan.values.push_back({application, L"FriendlyAppName", kRegisteredAppName});

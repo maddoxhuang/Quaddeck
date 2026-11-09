@@ -2,6 +2,135 @@
 
 Public releases start at 1.0.0. See [README.md](README.md) for current usage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation and file-format details.
 
+## 1.5.0 (2026-11-10)
+
+This release replaces saved sessions with a list of video sets, can delete a
+video from the Emby server once you turn that on, loads Emby lists in full,
+keeps the list beside the picture on the video you step to, and joins each
+video's Linked controls into one capsule. Settings are now `QCONFIG 23`,
+which 1.4.0 and earlier cannot read, so back up `settings.qconfig` before
+trying this version. Styles remain `QSTYLE 3`; sessions saved by earlier
+versions can no longer be opened.
+
+### Video sets
+
+- Replace saving and opening sessions with a list of video sets kept inside
+  QuadDeck. `Ctrl+S` adds the videos playing together to the list without a
+  dialog. `Ctrl+O`, the new video sets button left of full screen on the
+  bar, or **Video sets** in the right-click menu opens the list on the
+  right, and a set's **Play** plays the whole set.
+- Keep only the videos and how they are shown: one to five local files and
+  Emby items, mixed as you like, by their places, with the arrangement and
+  the enlarged pane. Positions, offsets, speed and repeat are not kept; each
+  video starts from its beginning and other settings stay as they are.
+- While a set from the list plays, `Page Up` / `Page Down`, the media
+  previous / next track keys and the bar's buttons step to the previous or
+  next set as a whole, for example from four videos straight to the next
+  set's three. Replacing a video by hand or adding one to an empty pane
+  returns to stepping files.
+- Choose what follows a set's end from the drop-down above the list: **Stop
+  at its end**, **Repeat the set**, **Next, then stop** (the default),
+  **Repeat the list** or **Shuffle**. Each set's **⋯** menu moves it up or
+  down, renames or deletes it.
+- Save the list automatically as `videosets.qsets` beside `settings.qconfig`.
+  **Export…** writes it to a `.qdeck` file; **Import…**, double-clicking or
+  dropping a `.qdeck` file adds its sets, skipping those already listed.
+  Explorer calls `.qdeck` files **QuadDeck video sets** once **Register…**
+  has been used again. A session saved by an earlier version is refused
+  with a notice.
+- Check every video when the list opens and say, in orange-red, when a local
+  file is missing, Emby is signed out or signed in to another server, or the
+  server no longer has the item or does not answer. An Emby item no longer
+  found under its id is searched for by name, and a single match is kept
+  under its new id.
+- Skip a set whole when one of its videos cannot play, rather than playing
+  it with a pane missing, and say which set and video were skipped and why.
+  Previous skips backwards, every set is tried at most once, and when none
+  can play a set chosen by hand leaves the picture as it was.
+
+### Emby
+
+- Delete a movie, episode or video from the Emby server after turning on
+  **Delete videos from the Emby server** at the bottom of `F5 → General`;
+  it is off by default. **Delete from server…** then follows the favorites
+  item when you right-click a list row, poster, thumbnail or information
+  page, and **Delete from Emby server...** follows it in a playing Emby
+  video's menu. Series, seasons, folders, collections, playlists and
+  libraries cannot be deleted, since that would take everything in them.
+- Never delete a favorite. The server is asked again before the
+  confirmation and again before deleting; an episode is kept when its series
+  or season is a favorite, or when the server does not say.
+- Confirm in a small window of its own, centred on the player, with the
+  title and type, the video that will close, every file the server says it
+  will delete and a warning that this cannot be undone. Only clicking
+  **Delete** deletes, never a key; `Esc`, the close button, `Alt+F4` and
+  **Cancel** cancel. Videos keep playing while it is open. Once the server
+  confirms, the item leaves the lists, **Continue watching**, the information
+  page and every video's queue.
+- Load the rest of a library, folder, series or favorites page in the
+  background after its first 300 items, 1,000 at a time and up to 20,000
+  (2,000 for a person's titles), without scrolling to the end. **Shuffle**,
+  **Play in order** and **Repeat the list** now reach the whole list instead
+  of the items loaded so far. Random order no longer repeats items after a
+  manual **Refresh**. Opening a library of several thousand videos now takes
+  a few dozen requests.
+- Leave **Posters** out of home video and photo libraries, their folders and
+  searches in them; where Posters was chosen they show **Thumbnails**.
+
+### Lists and the playing video
+
+- Mark the folders a playing video is in, at every level, in that video's
+  colour, with a scrollbar mark that scrolls to the folder. In Emby the
+  video's folder, season and series are marked at once and the folders and
+  library above them once the server has said; collections and playlists
+  are not marked. With several videos in one folder it takes the colour of
+  the first.
+- Keep a docked F6 list or Emby browser on the video you step to with
+  `Page Up` / `Page Down`, the bar's or media previous / next buttons or the
+  right-click menu: its row, or the row of its folder, season or series,
+  scrolls to the middle of the list. A step to the next video at the end of
+  one follows only while the row that was playing is in view, and scrolling
+  or clicking the list stops the following.
+
+### Controls and windows
+
+- Join each video's buttons into one capsule from the left in Linked mode:
+  tag, pause and time, then sound, subtitles, repeat, Solo and close. The
+  time keeps its width so the buttons do not move while it counts. The
+  volume slider stands upright above the sound button in the video's colour
+  and stays within its picture. The row to the right of the capsule is
+  picture: click, double-click and drag work there. The same single capsule
+  is used in Independent mode when a pane is too short for its seek bar.
+- Double-click the picture of the only video to pause or resume it, as
+  `Space` does. With two or more videos a double-click still enters and
+  leaves Solo.
+- Stop a drag on a single picture from moving the window; drag the title
+  strip instead. In a window the title strip now stays while the pointer
+  rests on it, with the pointer shown. Buttons covered by another window no
+  longer light, keep the bars visible or show their tips.
+- Move **Decoder** from the Playback tab to `F5 → Video`, under **Graphics
+  card**. It is dimmed, and every video decodes in software, on the WARP
+  renderer or when QuadDeck falls back to WARP, where choosing Hardware used
+  to stop videos opening.
+- Show the explanation of a dimmed settings row when the pointer rests on
+  it, and set choices that wrap below their label at the right of the row.
+
+### Text boxes
+
+- Right-click the Emby search box, the sign-in boxes, a video set's name
+  box or a number box in the settings window for **Cut**, **Copy**,
+  **Paste**, **Delete** and **Select all**, as in Windows' own boxes. The
+  password box never offers Cut or Copy.
+- Drop the line breaks at either end of pasted text: a password copied with
+  a trailing line break used to fail to sign in. Pasting with nothing to
+  paste no longer clears the selection, and a character such as an emoji is
+  pasted whole or not at all.
+
+Deleting from the Emby server has been tried by hand on a test server. The
+other new controls have been built and packaged but not yet exercised by
+hand in the running player; live Emby lists, input methods and real media
+remain unverified.
+
 ## 1.4.0 (2026-10-28)
 
 This release moves settings into a window of their own, lets you choose

@@ -1,6 +1,6 @@
 {
   "name": "quaddeck",
-  "version-semver": "1.4.0",
+  "version-semver": "1.5.0",
   "description": "A synchronized multi-video FFmpeg + Direct3D 11 player for Windows",
   "builtin-baseline": "aae277acf4e7de287ddb5e208b5316614de6aad7",
   "dependencies": [

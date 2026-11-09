@@ -271,6 +271,9 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
     if (!found) return;
     const std::size_t target = *found;
     if (!response.ok) {
+        // An item of the set playing that the server does not know is
+        // looked for, rather than given up.
+        if (videoSetItemGone(target, response.status)) return;
         embyResolveFailed(target, L"Emby: " + wide(response.error));
         if (response.status == 401) embySessionExpired();
         return;
@@ -282,14 +285,18 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
     }
     auto& state = *embyPanes_[target];
     state.title = wide(emby::displayTitle(*item));
+    state.refind = {item->name, item->seriesName, item->type, item->path, item->parentIndexNumber,
+                    item->indexNumber, item->productionYear};
     state.imageKey = emby::imageKey(*item, 400);
     state.runTimeTicks = item->runTimeTicks;
     if (state.seriesId.empty()) state.seriesId = item->seriesId;
     state.seasonId = item->seasonId;
     if (state.parentId.empty()) state.parentId = item->parentId;
     state.photo = state.photo || emby::isPhoto(*item);
-    // The mark the pane menu offers to change, as the server holds it now.
+    // The mark the pane menu offers to change, as the server holds it now,
+    // and the type that decides whether it offers to delete it.
     state.favorite = item->favorite;
+    state.itemType = item->type;
     // Where to resume is what the server says now, not what the list said
     // when it was fetched: the video may have been watched further since,
     // here or in another client, or marked as not started. Played may
@@ -322,7 +329,8 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
 void App::embyResolveFailed(std::size_t pane, const std::wstring& reason) {
     if (pane < embyPanes_.size() && embyPanes_[pane]) embyPanes_[pane]->resolving = false;
     appendDiagnostic(narrow(reason));
-    showNotice(reason);
+    // A video set's skips the set, whose notice says why.
+    if (!videoSetPaneFailed(pane, reason)) showNotice(reason);
     closePane(pane);
     updateTitle();
 }

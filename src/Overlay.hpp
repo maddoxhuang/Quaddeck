@@ -13,6 +13,7 @@
 
 #include "AssSubtitles.hpp"
 #include "Core.hpp"
+#include "DeleteDialog.hpp"
 #include "OverlayLayout.hpp"
 #include "PanelMenu.hpp"
 #include "SettingsPanel.hpp"
@@ -234,6 +235,9 @@ struct OverlayScene {
     PaneArray<float> seekEnds{-1.0F, -1.0F, -1.0F, -1.0F, -1.0F};
     // The Sync key: lit while the videos share one timeline.
     bool syncLinked{};
+    // The video sets' key: lit while a set plays, and Previous and Next go
+    // from set to set.
+    bool videoSetPlaying{};
     // The place of the video shown alone, whose button on the bar is lit;
     // -1 while every video shows, and All videos is lit.
     int soloPosition{-1};
@@ -296,6 +300,19 @@ struct OverlayScene {
     OverlaySyncPanelScene syncPanel;
 };
 
+// The window that asks to confirm deleting from the Emby server: what it
+// says and where (DeleteDialog.hpp), owned by App, and the pointer's state.
+struct OverlayDeleteDialogScene {
+    float width{};
+    float height{};
+    float scale{1.0F};
+    const DeleteDialogContent* content{};
+    const DeleteDialogLayout* layout{};
+    DeleteDialogHit hot{DeleteDialogHit::None};
+    DeleteDialogHit pressed{DeleteDialogHit::None};
+    bool thumbDragging{};
+};
+
 enum class OverlayTextStyle { Body, BodyBold, Small, Title, Icon, MediaTitle, MediaTitleCompact, CaptionIcon };
 
 class Overlay {
@@ -338,6 +355,12 @@ public:
     void measurePanelMenu(const std::vector<PanelMenuItem>& items, float scale,
                           std::vector<float>& labelWidths, std::vector<float>& shortcutWidths);
 
+    // The window confirming a deletion, `width` pixels wide: its text in
+    // the styles it is drawn in, for deleteDialogLayout; left at 0 where no
+    // font is ready.
+    void measureDeleteDialog(const DeleteDialogContent& content, float width, float scale,
+                             DeleteDialogMeasures& measures);
+
     // Paints the scene onto the swap chain's current back buffer. Called by
     // the renderer inside its device lock, between the last pane and Present.
     // With transparentLayer the surface is not the back buffer but an empty
@@ -354,6 +377,10 @@ public:
     // are Windows' -- with a hairline round it where Windows draws no frame
     // (`border`). Called with the device lock held, as draw is.
     void drawMenuWindow(IDXGISurface* surface, const OverlayScene& scene, bool border);
+    // Paints the window confirming a deletion over the whole of a surface
+    // of its own, on the sheet's ground. Called with the device lock held,
+    // as draw is.
+    void drawDeleteDialog(IDXGISurface* surface, const OverlayDeleteDialogScene& scene);
 
 private:
     // Points the context at `surface` and begins drawing; false when the
@@ -423,6 +450,8 @@ private:
     // A form's own button, the one its Enter presses: in the accent, or in
     // the colour of the video at place `video` it acts for.
     void primaryButton(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale, int video = -1);
+    // A button that destroys something: in a close button's red.
+    void dangerButton(const OverlayRect& box, bool hot, bool pressed, float alpha, float scale);
     // What is chosen -- a segment, a filter that is on, a key being set --
     // in the video's colour (the accent for none); its words in its ink.
     void chosenFace(const OverlayRect& box, bool hot, float alpha, float scale, int video = -1);
@@ -452,9 +481,10 @@ private:
     // Filled to the playhead in the accent, or in the video's colour.
     void rail(const OverlayRect& band, float inset, float thickness, float position01,
               float buffered01, bool showThumb, float thumbRadius, float alpha, int video = -1);
-    // A rail standing up: 0 at the bottom, 1 at the top. The volume popup.
+    // A rail standing up: 0 at the bottom, 1 at the top. The volume popup,
+    // filled in the accent or in the video's colour.
     void verticalRail(const OverlayRect& band, float inset, float thickness, float position01,
-                      float thumbRadius, float alpha);
+                      float thumbRadius, float alpha, int video = -1);
     // Subtitle text at the bottom of a pane or at its top, sized to the
     // pane, outlined in black so it reads over any picture, on a dark box
     // where `background` asks for one. `margin` is the distance from that

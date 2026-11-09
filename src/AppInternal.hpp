@@ -13,8 +13,10 @@
 #include <cmath>
 #include <cwchar>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 namespace quaddeck::app_internal {
 
@@ -72,6 +74,10 @@ inline constexpr float kPanelRailInset = 8.0F;
 // A hot control shows its name after resting on it this long, in the
 // player's window and the settings window alike.
 inline constexpr ULONGLONG kTooltipDelayMs = 600;
+// A step the list beside the video follows (App::followStepInList) waits
+// this long for the video to change and for the list to show the new one --
+// a folder being read, the server's reply -- and is then given up.
+inline constexpr ULONGLONG kListFollowWaitMs = 5000;
 
 // Per-monitor DPI without a minimum SDK: both calls exist since Windows 10
 // 1607, and a build without them reports 96, which keeps the 1x layout.
@@ -126,7 +132,7 @@ enum ContextCommand : unsigned {
     CmdPlayPause, CmdStop, CmdMute,
     CmdLayoutGrid, CmdLayoutSide, CmdLayoutRow, CmdLayoutColumn,
     CmdLayoutPortrait, CmdLayoutLandscape, CmdSeekLinked, CmdSeekIndependent,
-    CmdSessionOpen, CmdSessionSave,
+    CmdVideoSets, CmdAddVideoSet,
     CmdFullscreen, CmdSettings,
     CmdOpenEmby, CmdSubtitleOff,
     CmdSubtitleCycle, CmdSubtitleLoad,
@@ -160,9 +166,43 @@ enum ContextCommand : unsigned {
     CmdVideoDeinterlace,
     CmdVideoScalingFirst, CmdVideoScalingLast = CmdVideoScalingFirst + kVideoScalingCount - 1,
     CmdVideoColorReset,
-    CmdVideoSettings
+    CmdVideoSettings,
+    // The browser item a right-click was on, or a pane's video, deleted
+    // from the server.
+    CmdEmbyDelete,
+    // A text box's right-click menu (AppTextFields.cpp), and a spin box's
+    // in the settings window.
+    CmdFieldCut, CmdFieldCopy, CmdFieldPaste, CmdFieldDelete, CmdFieldSelectAll
 };
 inline constexpr std::size_t kAudioOutputMenuLimit = CmdAudioOutputLast - CmdAudioOutputFirst + 1;
+
+// A text box's right-click menu, Windows' edit box's, its lines greyed
+// where they would do nothing (textFieldCanEdit). `pasted` is the
+// clipboard's text as the box takes it, `limit` how much the box holds.
+inline PanelMenu fieldEditMenu(const TextFieldState& field, bool masked, std::wstring_view pasted,
+                               std::size_t limit = kTextFieldLimit) {
+    const auto can = [&](TextFieldEdit edit) { return textFieldCanEdit(field, edit, masked, pasted, limit); };
+    PanelMenu menu;
+    menu.option(CmdFieldCut, L"Cut", false, L"Ctrl+X", can(TextFieldEdit::Cut));
+    menu.option(CmdFieldCopy, L"Copy", false, L"Ctrl+C", can(TextFieldEdit::Copy));
+    menu.option(CmdFieldPaste, L"Paste", false, L"Ctrl+V", can(TextFieldEdit::Paste));
+    menu.option(CmdFieldDelete, L"Delete", false, {}, can(TextFieldEdit::Delete));
+    menu.separator();
+    menu.option(CmdFieldSelectAll, L"Select all", false, L"Ctrl+A", can(TextFieldEdit::SelectAll));
+    return menu;
+}
+
+// The edit a line of that menu is.
+inline std::optional<TextFieldEdit> fieldMenuEdit(unsigned command) {
+    switch (command) {
+    case CmdFieldCut: return TextFieldEdit::Cut;
+    case CmdFieldCopy: return TextFieldEdit::Copy;
+    case CmdFieldPaste: return TextFieldEdit::Paste;
+    case CmdFieldDelete: return TextFieldEdit::Delete;
+    case CmdFieldSelectAll: return TextFieldEdit::SelectAll;
+    default: return std::nullopt;
+    }
+}
 
 // The arrangement's name as the sheet, the menu and the notice show it,
 // in LayoutMode's order, which is also CmdLayoutGrid..CmdLayoutLandscape's.

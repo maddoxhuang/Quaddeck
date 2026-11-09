@@ -100,6 +100,9 @@ struct Item {
     int height{};
     std::string dateCreated, premiereDate, primaryImageTag;
     std::int64_t size{};  // bytes, with Fields=Size; 0 for a folder
+    // The file's path on the server, with Fields=Path: what finds a video
+    // set's item again once a rescan has given it another id.
+    std::string path;
     // An entry of a playlist: its place in it, which tells two entries of
     // the same video apart. Empty anywhere else.
     std::string playlistItemId;
@@ -454,6 +457,13 @@ inline const char* libraryItemType(const ListPage& page) {
     return "";
 }
 
+// Whether a library's items have posters. Nothing is looked up for home
+// videos and photos: their pictures are frames and the photos themselves,
+// which a portrait tile only letterboxes.
+inline bool libraryHasPosters(std::string_view collectionType) {
+    return collectionType != "homevideos" && collectionType != "photos";
+}
+
 // Whether the page can be shown without its folders. A library of series
 // or movies already is; a library of box sets or of playlists lists those,
 // and a box set or a playlist its own entries. Series and seasons keep
@@ -536,6 +546,28 @@ inline ItemsQuery listQuery(const ListPage& page, const ListArrangement& arrange
     return query;
 }
 
+// How many a further page of a list asks for: `pageLimit`, or in the
+// server's random order as many as the list was drawn with (`drawnWith`, the
+// length its first page or its refresh asked for). A 4.x server draws a new
+// random order for each request from the start and remembers it by the
+// query's length, not its start: a further page of the same length goes on
+// through that draw, one of another length through another, repeating
+// titles shown and passing over others.
+inline int furtherPageLimit(int pageLimit, int drawnWith, bool serverRandom) {
+    return serverRandom && drawnWith > 0 ? drawnWith : pageLimit;
+}
+
+// Leaves in `fresh` only the entries `shown` does not hold, in the order
+// they came. An entry is the item and its place in a playlist, which may
+// hold a video twice.
+inline void keepUnlisted(std::vector<Item>& fresh, const std::vector<Item>& shown) {
+    std::unordered_set<std::string> listed;
+    listed.reserve(shown.size());
+    const auto key = [](const Item& item) { return item.id + '\n' + item.playlistItemId; };
+    for (const auto& item : shown) listed.insert(key(item));
+    std::erase_if(fresh, [&](const Item& item) { return listed.contains(key(item)); });
+}
+
 // What a search finds: the titles a word of which starts with `term`, at
 // any depth under `parentId` -- a library, or the library, folder, show or
 // season the search was opened in. The browser orders them itself.
@@ -600,10 +632,103 @@ inline std::string resumePath(const std::string& userId, int limit,
     return path;
 }
 
-// ParentId, which the neighbour walk needs, only comes when asked for.
+// ParentId, which the neighbour walk needs, only comes when asked for; so
+// does Path, which a video set keeps of the item it plays.
 inline std::string itemPath(const std::string& userId, const std::string& itemId) {
     return "/Users/" + urlEncode(userId) + "/Items/" + urlEncode(itemId) +
-           "?Fields=" + urlEncode(kBrowserItemFields);
+           "?Fields=" + urlEncode(std::string(kBrowserItemFields) + ",Path");
+}
+
+// --- a video set's items ---------------------------------------------------------
+
+// Which of these items the server still has: those it lists back. An id it
+// does not list is gone, or another account's.
+inline std::string itemsByIdPath(const std::string& userId, const std::vector<std::string>& ids) {
+    std::string list;
+    for (const auto& id : ids) list += (list.empty() ? "" : ",") + id;
+    return "/Users/" + urlEncode(userId) + "/Items?Ids=" + urlEncode(list) +
+           "&Fields=Path&EnableImages=false&EnableUserData=false&Limit=" +
+           std::to_string(std::max<std::size_t>(1, ids.size()));
+}
+
+// What a video set remembers of an Emby item, to find it again when the
+// server has given it another id.
+struct RefindKey {
+    std::string name, seriesName, type, path;
+    int season{-1};
+    int episode{-1};
+    int year{};
+};
+
+namespace detail {
+
+inline std::string lowerAscii(std::string text) {
+    for (auto& character : text) {
+        if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
+    }
+    return text;
+}
+
+// A server path as compared: either slash, any case.
+inline std::string comparablePath(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return lowerAscii(std::move(path));
+}
+
+// The file's name without its folders or its extension.
+inline std::string pathStem(const std::string& path) {
+    const auto slash = path.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    const auto dot = name.find_last_of('.');
+    if (dot != std::string::npos && dot > 0) name.resize(dot);
+    return name;
+}
+
+}  // namespace detail
+
+// The search that may list it again: by its name (by its file's name when
+// it had none), of its type, anywhere in the libraries. Empty when there is
+// nothing to search by.
+inline std::string refindPath(const std::string& userId, const RefindKey& key) {
+    ItemsQuery query;
+    query.searchTerm = !key.name.empty() ? key.name : detail::pathStem(key.path);
+    if (query.searchTerm.empty()) return {};
+    query.includeTypes = key.type;
+    query.recursive = true;
+    query.fields = "Path";
+    query.sortBy = "SortName";
+    query.limit = 100;
+    return itemsPath(userId, query);
+}
+
+// The one of `candidates` that is the item it remembers: the one at the
+// same path on the server; else the only one of its type and name -- for an
+// episode of the same series, season and number, for anything else of the
+// same year when both say -- and none when that is several.
+inline std::optional<Item> refindMatch(const std::vector<Item>& candidates, const RefindKey& key) {
+    if (!key.path.empty()) {
+        const auto wanted = detail::comparablePath(key.path);
+        for (const auto& item : candidates) {
+            if (!item.path.empty() && detail::comparablePath(item.path) == wanted) return item;
+        }
+    }
+    if (key.name.empty()) return std::nullopt;
+    const auto name = detail::lowerAscii(key.name);
+    const auto series = detail::lowerAscii(key.seriesName);
+    std::optional<Item> found;
+    for (const auto& item : candidates) {
+        if (item.isFolder || (!key.type.empty() && item.type != key.type) ||
+            detail::lowerAscii(item.name) != name) continue;
+        if (key.type == "Episode") {
+            if (detail::lowerAscii(item.seriesName) != series || item.parentIndexNumber != key.season ||
+                item.indexNumber != key.episode) continue;
+        } else if (key.year > 0 && item.productionYear > 0 && item.productionYear != key.year) {
+            continue;
+        }
+        if (found) return std::nullopt;
+        found = item;
+    }
+    return found;
 }
 
 // --- which videos of a list have subtitles -------------------------------------
@@ -711,6 +836,73 @@ inline std::string favoritePath(const std::string& userId, const std::string& it
     std::string path = "/Users/" + urlEncode(userId) + "/FavoriteItems/" + urlEncode(itemId);
     if (!favorite) path += "/Delete";
     return path;
+}
+
+// --- deleting from the server ------------------------------------------------
+
+// What may be deleted from the server: the file a movie, an episode or a
+// plain video stands for. Never a folder, a series, a season, a box set, a
+// playlist or a library, whose deletion takes everything under it.
+inline bool deletableType(const Item& item) {
+    return !item.isFolder && (item.type == "Movie" || item.type == "Episode" || item.type == "Video");
+}
+
+// An id the server's delete takes as one item: letters, digits and dashes
+// (a 4.x id is a number, a 3.x one a hex GUID). The request names its items
+// as a comma-separated list, so anything else could name more than one.
+inline bool singleItemId(std::string_view id) {
+    return !id.empty() && id.size() <= 64 && std::all_of(id.begin(), id.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-';
+    });
+}
+
+// The items whose favorite mark keeps an item from being deleted besides
+// its own: an episode's series and its season.
+inline std::vector<std::string> deleteGuardIds(const Item& item) {
+    std::vector<std::string> ids;
+    if (item.type != "Episode") return ids;
+    for (const std::string* id : {&item.seriesId, &item.seasonId}) {
+        if (!id->empty() && std::find(ids.begin(), ids.end(), *id) == ids.end()) ids.push_back(*id);
+    }
+    return ids;
+}
+
+// Those items as the account sees them, its marks with them.
+inline std::string deleteGuardsPath(const std::string& userId, const std::vector<std::string>& ids) {
+    std::string list;
+    for (const auto& id : ids) list += (list.empty() ? "" : ",") + id;
+    return "/Users/" + urlEncode(userId) + "/Items?Ids=" + urlEncode(list) +
+           "&EnableImages=false&Limit=" + std::to_string(std::max<std::size_t>(1, ids.size()));
+}
+
+enum class DeleteRefusal { None, Type, Favorite, SeriesFavorite, SeasonFavorite, Unconfirmed };
+
+// Why `item`, as the server has it now, may not be deleted. `guards` are
+// the items deleteGuardIds names, as the server has them; one it did not
+// send leaves the marks unconfirmed, which refuses too.
+inline DeleteRefusal deleteRefusal(const Item& item, const std::vector<Item>& guards) {
+    if (!deletableType(item) || !singleItemId(item.id)) return DeleteRefusal::Type;
+    if (item.favorite) return DeleteRefusal::Favorite;
+    for (const auto& id : deleteGuardIds(item)) {
+        const auto guard = std::find_if(guards.begin(), guards.end(), [&](const Item& entry) { return entry.id == id; });
+        if (guard == guards.end()) return DeleteRefusal::Unconfirmed;
+        if (!guard->favorite) continue;
+        return id == item.seriesId ? DeleteRefusal::SeriesFavorite : DeleteRefusal::SeasonFavorite;
+    }
+    return DeleteRefusal::None;
+}
+
+// The files the server deletes with an item, which its web client lists
+// before it asks: {"Paths":[...]}.
+inline std::string deleteInfoPath(const std::string& itemId) {
+    return "/Items/" + urlEncode(itemId) + "/DeleteInfo";
+}
+
+// Deletes one item and its files, by the POST Emby Web 4.11 sends; empty
+// for an id that could name more than one item.
+inline std::string deleteItemPath(const std::string& itemId) {
+    if (!singleItemId(itemId)) return {};
+    return "/Items/Delete?Ids=" + itemId;
 }
 
 inline std::string ancestorsPath(const std::string& itemId, const std::string& userId) {
@@ -1182,6 +1374,7 @@ inline Item itemFromJson(const json& j) {
         item.size = size->get<std::int64_t>();
     }
     item.playlistItemId = str(j, "PlaylistItemId");
+    item.path = str(j, "Path");
     item.childCount = static_cast<int>(integer(j, "ChildCount", -1));
     if (const auto tags = j.find("ImageTags"); tags != j.end() && tags->is_object()) {
         item.primaryImageTag = str(*tags, "Primary");
@@ -1293,6 +1486,20 @@ inline std::optional<bool> parseFavoriteReply(const std::string& text) {
     const auto favorite = j->find("IsFavorite");
     if (favorite == j->end() || !favorite->is_boolean()) return std::nullopt;
     return favorite->get<bool>();
+}
+
+// The paths a DeleteInfo reply names; nothing for a reply without them.
+inline std::optional<std::vector<std::string>> parseDeleteInfo(const std::string& text) {
+    if (text.size() > kMaximumItemReplyBytes) return std::nullopt;
+    const auto j = detail::parseJson(text);
+    if (!j || !j->is_object()) return std::nullopt;
+    const auto paths = j->find("Paths");
+    if (paths == j->end() || !paths->is_array()) return std::nullopt;
+    std::vector<std::string> list;
+    for (const auto& path : *paths) {
+        if (path.is_string()) list.push_back(path.get<std::string>());
+    }
+    return list;
 }
 
 inline std::optional<std::vector<Item>> parseAncestorsArray(const std::string& text) {

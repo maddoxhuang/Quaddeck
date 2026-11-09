@@ -902,7 +902,7 @@ void App::openExternalDeck() {
     for (; batch.next < batch.files.size(); ++batch.next) {
         const auto& requested = batch.files[batch.next];
         if (isSessionFile(requested)) {
-            showNotice(L"Sessions cannot be added as videos. Use Ctrl+O to load a session.");
+            importVideoSets(requested);
             continue;
         }
         std::wstring path, error;
@@ -989,7 +989,7 @@ void App::processExternalFiles() {
             continue;
         }
         if (isSessionFile(requested)) {
-            showNotice(L"Sessions cannot be added as videos. Use Ctrl+O to load a session.");
+            importVideoSets(requested);
             ++batch.next;
             continue;
         }
@@ -1199,18 +1199,19 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
         return name;
     };
     // Every local file being played is marked, including the same file
-    // independently opened in more than one pane: in the colour of the
-    // first of them on the screen.
-    const auto playingPosition = [&](int param) {
+    // independently opened in more than one pane, and so is the folder of
+    // the list it is in further down: in the colour of the first of them on
+    // the screen.
+    const auto markedPosition = [&](const PaneArray<int>& rows, int param) {
         int position = -1;
-        for (std::size_t pane = 0; pane < kMaxPanes && param >= 0; ++pane) {
+        for (std::size_t pane = 0; pane < kMaxPanes && param != -1; ++pane) {
             const int place = marks.localPositions[pane];
-            if (marks.localPlaying[pane] == param && place >= 0 && (position < 0 || place < position)) {
-                position = place;
-            }
+            if (rows[pane] == param && place >= 0 && (position < 0 || place < position)) position = place;
         }
         return position;
     };
+    const auto playingPosition = [&](int param) { return markedPosition(marks.localPlaying, param); };
+    const auto holdingPosition = [&](int param) { return markedPosition(marks.localHolding, param); };
     const auto length = [](const LocalEntry& entry) {
         return entry.duration > 0.0 ? formatTime(entry.duration) : std::wstring();
     };
@@ -1222,6 +1223,8 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
     if (row.kind == PanelRowKind::Item) {
         // A folder opens, as an Emby folder's row does.
         if (const std::wstring* folder = folderAt(row.param)) {
+            row.playingPosition = holdingPosition(row.param);
+            row.current = row.playingPosition >= 0;
             row.label = localFileName(*folder);
             row.value = L"\x203A";
             return;
@@ -1266,7 +1269,8 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
             row.tileProgress.push_back(0.0F);
             row.tileTags.emplace_back();
             row.tileAddAvailable.push_back(false);
-            row.tilePlaying.push_back(-1);
+            row.tilePlaying.push_back(holdingPosition(row.tileParams[part]));
+            if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
             continue;
         }
         const LocalEntry* entry = entryAt(row.tileParams[part]);

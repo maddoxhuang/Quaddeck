@@ -67,10 +67,15 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
         const bool loaded = paneLogicallyLoaded(index);
         menu.option(CmdOpenPane, loaded ? L"Replace video..." : L"Open video...");
         menu.option(CmdOpenEmby, L"Open from Emby...", false, shortcut(KeyAction::Emby));
-        menu.option(CmdPreviousFile, L"Previous file in folder", false, shortcut(KeyAction::PreviousFile), loaded);
-        menu.option(CmdNextFile, L"Next file in folder", false, shortcut(KeyAction::NextFile), loaded);
+        // While a video set plays, they step from set to set.
+        const bool sets = videoSetPlaying() >= 0;
+        menu.option(CmdPreviousFile, sets ? L"Previous video set" : L"Previous file in folder", false,
+                    shortcut(KeyAction::PreviousFile), loaded);
+        menu.option(CmdNextFile, sets ? L"Next video set" : L"Next file in folder", false,
+                    shortcut(KeyAction::NextFile), loaded);
         menu.option(CmdClosePane, L"Close video", false, {}, loaded);
         appendEmbyFavoriteMenu(menu, index);
+        appendEmbyDeleteMenu(menu, index);
         menu.check(CmdSelectAudio, L"Output this audio", audioPaneEnabled(index),
                    shortcut(audioKeyAction(positionForPane(index))), loaded);
         menu.check(CmdPaneMute, L"Mute this video", audio_.paneMuted(index), {}, loaded);
@@ -184,8 +189,8 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
         menu.option(CmdOpenFiles, L"Open file...", false, shortcut(KeyAction::OpenFiles));
         menu.option(CmdOpenEmby, L"Open from Emby...", false, shortcut(KeyAction::Emby));
     }
-    menu.option(CmdSessionOpen, L"Open session...", false, shortcut(KeyAction::OpenSession));
-    menu.option(CmdSessionSave, L"Save session...", false, shortcut(KeyAction::SaveSession));
+    menu.option(CmdVideoSets, L"Video sets", false, shortcut(KeyAction::VideoSets));
+    menu.option(CmdAddVideoSet, L"Add to video sets", false, shortcut(KeyAction::AddVideoSet), anyPaneLoaded());
     menu.separator();
     menu.check(CmdFullscreen, L"Fullscreen", fullscreen_, shortcut(KeyAction::Fullscreen));
     menu.option(CmdSettings, L"Settings...", false, shortcut(KeyAction::Settings));
@@ -200,7 +205,7 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
 App::PaneMenuSnapshot App::takePaneMenuSnapshot() {
     PaneMenuSnapshot snapshot{std::move(subtitleMenuOptions_), subtitleMenuPane_, subtitleMenuSerial_,
                               std::move(audioMenuTracks_), audioMenuPane_, audioMenuSerial_,
-                              std::move(embyFavoriteMenuOffer_)};
+                              std::move(embyFavoriteMenuOffer_), std::move(embyDeleteMenuOffer_)};
     clearPaneMenuSnapshot();
     return snapshot;
 }
@@ -213,6 +218,7 @@ void App::clearPaneMenuSnapshot() {
     audioMenuPane_ = -1;
     audioMenuSerial_ = 0;
     embyFavoriteMenuOffer_.reset();
+    embyDeleteMenuOffer_.reset();
 }
 
 void App::runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command, int pane) {
@@ -223,6 +229,7 @@ void App::runPaneMenuCommand(const PaneMenuSnapshot& snapshot, unsigned command,
     audioMenuPane_ = snapshot.audioPane;
     audioMenuSerial_ = snapshot.audioSerial;
     embyFavoriteMenuOffer_ = snapshot.favorite;
+    embyDeleteMenuOffer_ = snapshot.deletion;
     handleContextCommand(command, pane);
     clearPaneMenuSnapshot();
 }
@@ -297,6 +304,15 @@ void App::handleContextCommand(unsigned command, int pane) {
             embyFavoriteMenuOffer_->account == embyAccountSerial_) {
             const auto offer = *embyFavoriteMenuOffer_;
             embySetFavorite(offer.itemId, offer.title, offer.wanted);
+        }
+    }
+    else if (command == CmdEmbyDelete && validPane) {
+        // As the favorite entry: the video the menu offered, under the
+        // account it was offered under.
+        if (embyDeleteMenuOffer_ && embyDeleteMenuOffer_->pane == pane &&
+            embyDeleteMenuOffer_->account == embyAccountSerial_) {
+            const auto offer = *embyDeleteMenuOffer_;
+            embyAskDelete(offer.item);
         }
     }
     else if (validPane && (command == CmdSubtitleOff || (command >= CmdSubtitleFirst && command <= CmdSubtitleLast) ||
@@ -458,8 +474,8 @@ void App::handleContextCommand(unsigned command, int pane) {
     }
     else if (command == CmdSeekLinked) chooseSeekMode(SeekMode::Linked);
     else if (command == CmdSeekIndependent) chooseSeekMode(SeekMode::Independent);
-    else if (command == CmdSessionOpen) loadSessionDialog();
-    else if (command == CmdSessionSave) saveSessionDialog();
+    else if (command == CmdVideoSets) toggleVideoSets();
+    else if (command == CmdAddVideoSet) addVideoSet();
     else if (command == CmdFullscreen) toggleFullscreen();
     else if (command == CmdPreviousFile) openAdjacentFile(-1, pane);
     else if (command == CmdNextFile) openAdjacentFile(1, pane);
@@ -627,6 +643,12 @@ int App::commandPane() const {
 }
 
 void App::openAdjacentFile(int step, int pane) {
+    // While a video set plays, a step goes to the set before or after it,
+    // whichever video it was asked of.
+    if (videoSetPlaying() >= 0) {
+        stepVideoSet(step);
+        return;
+    }
     // A key names no pane. The only video is the one it steps, as the
     // bar's buttons do, though the pointer has not been on it: a media
     // key is pressed away from the mouse.
@@ -635,6 +657,7 @@ void App::openAdjacentFile(int step, int pane) {
     if (pane < 0 || pane >= static_cast<int>(kMaxPanes)) return;
     const auto index = static_cast<std::size_t>(pane);
     if (paths_[index].empty()) return;
+    followStepInList(index, true);
     if (emby::isLocator(paths_[index])) {
         embyOpenAdjacent(index, step);
         return;
@@ -983,8 +1006,9 @@ void App::pausePlaybackAtEnd() {
 void App::finishMasterTimeline(bool sourceOpening, bool hasRepeatingSource) {
     // The only video paused on its own is held where it was while the clock
     // runs on: the clock passing its length is no end of it, and resuming
-    // it carries on from the held frame.
-    if (perPaneTimelines() || heldOnlyPane() >= 0) return;
+    // it carries on from the held frame. A video set's end is the list's to
+    // follow (finishVideoSet), not Restart all's.
+    if (perPaneTimelines() || heldOnlyPane() >= 0 || videoSetPlaying() >= 0) return;
     const auto endAction = masterTimelineEndAction(
         clock_.position(), duration_, clock_.isPlaying(), sourceOpening,
         masterLoopEnabled_ && loopArmed(masterLoopA_, masterLoopB_, duration_),
@@ -1058,6 +1082,8 @@ void App::embyFinishPane(std::size_t pane) {
     embyReport(pane, "stopped");
     if (linkedBrowserSeekBars() && repeatsWithLinkedVideos(pane)) {
         // It waits here for the others: finishLinkedBrowserSet.
+    } else if (videoSetPane(pane)) {
+        // A video set's waits for the set's end: finishVideoSet.
     } else if (playOrder_ == PlayOrder::RepeatOne) {
         sourcePaused_[pane] = false;
         seekPaneTo(pane, 0.0);
@@ -1128,6 +1154,7 @@ void App::finishLinkedBrowserSet() {
 
 void App::advanceAtEnd(std::size_t pane) {
     if (pane >= sources_.size() || paths_[pane].empty()) return;
+    followStepInList(pane, false);
     const auto random = static_cast<unsigned>(shuffleRandom_());
     if (emby::isLocator(paths_[pane])) {
         if (!embyPanes_[pane] || !embyPaneAccountMatches(pane)) return;

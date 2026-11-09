@@ -38,6 +38,7 @@ void App::openSheet() {
     if (settingsOpen_) return;
     // The face is chosen by the caller, which sets it right after.
     embyBrowserOpen_ = false;
+    videoSetsOpen_ = false;
     settingsOpen_ = true;
     controlsLastInteraction_ = GetTickCount64();
     setControlsVisible(true);
@@ -70,6 +71,7 @@ float App::videoAreaWidth(float clientWidth) const {
 }
 
 float& App::sheetScrollSlot() {
+    if (!embyBrowserOpen_ && videoSetsOpen_) return videoSetsScroll_;
     if (browserSource_ == BrowserSource::Emby && embyDetails_) return embyDetails_->scroll;
     return browserSource_ == BrowserSource::Local ? localListScroll_ : embyListScroll_;
 }
@@ -78,10 +80,14 @@ void App::rememberSheetScroll() { sheetScrollSlot() = settingsScroll_; }
 
 void App::restoreSheetScroll() { settingsScroll_ = sheetScrollSlot(); }
 
-// The sheet has one face, the browser or the folder list, so its header has
-// no switch; the settings are a window of their own, which F5 and the menu
-// bring up.
-std::vector<SheetFace> App::sheetSwitches() const { return {}; }
+// The video sets' header leads to the Emby browser; the browser and the
+// folder list have no switch, since the bar's Sets button and Ctrl+O bring
+// the sets up. The settings are a window of their own, which F5 and the
+// menu bring up.
+std::vector<SheetFace> App::sheetSwitches() const {
+    if (embyBrowserOpen_) return {};
+    return {SheetFace::Emby};
+}
 
 void App::switchSheet(int part) {
     if (!settingsOpen_) return;
@@ -94,6 +100,7 @@ void App::switchSheet(int part) {
 void App::showSheetFace(SheetFace face) {
     controlsLastInteraction_ = GetTickCount64();
     if (face == SheetFace::Emby) embyOpenBrowser();
+    else if (face == SheetFace::VideoSets) showVideoSets();
 }
 
 void App::selectSettingsTab(SettingsTab tab) {
@@ -111,6 +118,7 @@ void App::closeSettingsPanel() {
     if (panelMenu_ && panelMenu_->inSheet) closePanelMenu();
     rememberSheetScroll();
     settingsOpen_ = false;
+    listFollow_.reset();
     if (controlDrag_ == ControlDrag::PanelSlider) endControlDrag(true);
     if (controlDrag_ == ControlDrag::PanelScroll || controlDrag_ == ControlDrag::PanelScrollbar) endControlDrag(false);
     panelPressArmed_ = false;
@@ -128,6 +136,7 @@ std::vector<PanelRow> App::buildSettingsRows(float clientWidth, std::vector<Pane
         return browserSource_ == BrowserSource::Local ? buildLocalRows(clientWidth, runs)
                                                       : buildEmbyRows(clientWidth, runs);
     }
+    if (videoSetsOpen_) return buildVideoSetRows();
     return buildSettingsTabRows();
 }
 
@@ -211,9 +220,7 @@ std::vector<PanelRow> App::buildSettingsTabRows() const {
         rows.back().hint = perPaneTimelines()
             ? L"Linked aligns source times. Independent uses each video's lower edge. Queues remain separate."
             : L"Linked moves the shared timeline. Independent uses each video's lower edge.";
-        choice(SettingId::Decoder, L"Decoder", {L"Automatic", L"Hardware", L"Software"},
-               static_cast<int>(decodeMode_));
-        note(L"Changing the decoder reopens every video at the same time.");
+        // The decoder is on the Video tab, beside the card that decodes.
         toggle(SettingId::RepeatAll, -1, L"Restart all when the set finishes", repeatAll_);
         rows.back().enabled = !perPaneTimelines();
         toggle(SettingId::KeyframeSeek, -1, L"Fast seeking for one video",
@@ -360,8 +367,8 @@ std::vector<PanelRow> App::buildSettingsTabRows() const {
         toggle(SettingId::SuperResolution, -1, L"NVIDIA RTX Video Super Resolution", rtxVideo_.superResolution);
         toggle(SettingId::RtxHdr, -1, L"NVIDIA RTX Video HDR  (SDR video shown as HDR)", rtxVideo_.rtxHdr);
         note(videoEnhancementNote(rtxVideo_, renderer_.enhancementStatus()));
-        note(L"The renderer, the graphics card, deinterlacing, scaling and the colour controls are on the "
-             L"Video tab.");
+        note(L"The renderer, the graphics card, the decoder, deinterlacing, scaling and the colour controls are "
+             L"on the Video tab.");
         break;
     }
 
@@ -397,9 +404,13 @@ std::vector<PanelRow> App::buildSettingsTabRows() const {
         note(associationNote(fileTypes_));
         buttons(SettingId::Style, -1, L"Visual preset  (layout, view, shader; no videos)",
                 {L"Load…", L"Save…"});
-        buttons(SettingId::Session, -1, L"Session  (videos, positions, everything)",
-                {captionWithKey(L"Open…", KeyAction::OpenSession),
-                 captionWithKey(L"Save…", KeyAction::SaveSession)});
+        buttons(SettingId::VideoSets, -1, L"Video sets  (videos played together, in their layout)",
+                {captionWithKey(L"Show", KeyAction::VideoSets),
+                 captionWithKey(L"Add what plays", KeyAction::AddVideoSet)});
+        toggle(SettingId::EmbyDeleteAllowed, -1, L"Delete videos from the Emby server  (right-click one)",
+               embyDeleteEnabled_);
+        note(L"Emby deletes the files from its disk. A favorite, and an episode of a favorite series or "
+             L"season, is never deleted.");
         break;
     }
 
@@ -413,20 +424,36 @@ std::vector<PanelRow> App::buildSettingsTabRows() const {
 App::ListRowMarks App::listRowMarks() const {
     ListRowMarks marks;
     for (std::size_t pane = 0; pane < embyPanes_.size(); ++pane) {
-        if (embyPaneAccountMatches(pane) && !embyPanes_[pane]->itemId.empty()) {
-            const int position = static_cast<int>(positionForPane(pane));
-            const auto [playing, added] = marks.embyPlaying.try_emplace(embyPanes_[pane]->itemId, position);
-            if (!added) playing->second = std::min(playing->second, position);
+        if (!embyPaneAccountMatches(pane) || embyPanes_[pane]->itemId.empty()) continue;
+        const auto& state = *embyPanes_[pane];
+        const int position = static_cast<int>(positionForPane(pane));
+        const auto mark = [position](std::map<std::string, int>& marked, const std::string& id) {
+            if (id.empty()) return;
+            const auto [entry, added] = marked.try_emplace(id, position);
+            if (!added) entry->second = std::min(entry->second, position);
+        };
+        mark(marks.embyPlaying, state.itemId);
+        // Its folders: those the list and the item's reply named at once,
+        // then every one above it once the server has said.
+        for (const auto* id : {&state.parentId, &state.seasonId, &state.seriesId}) mark(marks.embyHolding, *id);
+        if (const auto known = embyPlayingAncestors_.find(state.itemId); known != embyPlayingAncestors_.end()) {
+            for (const auto& id : known->second) mark(marks.embyHolding, id);
         }
     }
     marks.localPlaying.fill(-1);
+    marks.localHolding.fill(-1);
     marks.localPositions.fill(-1);
     if (browserSource_ == BrowserSource::Local) {
         for (std::size_t pane = 0; pane < paths_.size(); ++pane) {
             const auto& path = paths_[pane];
-            if (!localListCovers(path)) continue;
-            marks.localPlaying[pane] = localEntryIndex(localList_, path);
-            if (marks.localPlaying[pane] >= 0) marks.localPositions[pane] = static_cast<int>(positionForPane(pane));
+            if (localListCovers(path)) {
+                marks.localPlaying[pane] = localEntryIndex(localList_, path);
+            } else if (const int folder = localFolderHolding(localFolders_, path); folder >= 0) {
+                marks.localHolding[pane] = kLocalFolderParam - folder;
+            }
+            if (marks.localPlaying[pane] >= 0 || marks.localHolding[pane] != -1) {
+                marks.localPositions[pane] = static_cast<int>(positionForPane(pane));
+            }
         }
     }
     // All libraries must finish before an item's provenance or final
@@ -523,10 +550,11 @@ void App::fillListWindow(const ListRowMarks& marks) {
 }
 
 // The videos being played, marked on the scrollbar where the list shows
-// them, near the screen or not: found by the entries the list's runs name,
-// so no row is filled for it. One mark per entry, in the colour its row or
-// tile is marked in -- a file in two panes the first one's -- in the rows'
-// order and then the videos' places on the screen.
+// them or a folder they are in, near the screen or not: found by the
+// entries the list's runs name, so no row is filled for it. One mark per
+// entry, in the colour its row or tile is marked in -- a file in two panes
+// the first one's -- in the rows' order and then the videos' places on the
+// screen.
 void App::placePanelScrollMarks(const ListRowMarks& marks) {
     panelScrollMarks_.clear();
     if (!panelLayout_.scrollbar.visible()) return;
@@ -541,17 +569,18 @@ void App::placePanelScrollMarks(const ListRowMarks& marks) {
     };
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
         if (marks.localPlaying[pane] >= 0) mark(SettingId::LocalItem, marks.localPlaying[pane], marks.localPositions[pane]);
+        if (marks.localHolding[pane] != -1) mark(SettingId::LocalItem, marks.localHolding[pane], marks.localPositions[pane]);
     }
     const bool embyListed = std::any_of(panelRuns_.begin(), panelRuns_.end(),
                                         [](const PanelListRun& run) { return run.id == SettingId::EmbyItem; });
     if (embyListed && !marks.embyPlaying.empty()) {
-        // Wherever the item appears: Continue watching and the list below it.
+        // Wherever the item or a folder holding it appears: Continue
+        // watching and the list below it.
         const auto look = [&](const std::vector<emby::Item>& items, bool resume) {
             for (std::size_t index = 0; index < items.size(); ++index) {
-                const auto playing = marks.embyPlaying.find(items[index].id);
-                if (playing == marks.embyPlaying.end()) continue;
-                mark(SettingId::EmbyItem, resume ? -static_cast<int>(index) - 1 : static_cast<int>(index),
-                     playing->second);
+                const int place = marks.embyPlace(items[index].id);
+                if (place < 0) continue;
+                mark(SettingId::EmbyItem, resume ? -static_cast<int>(index) - 1 : static_cast<int>(index), place);
             }
         };
         look(embyResume_, true);
@@ -573,6 +602,75 @@ void App::placePanelScrollMarks(const ListRowMarks& marks) {
         const float y = panelScrollMarkY(panelLayout_, entry.row, uiScale_);
         if (y >= 0.0F) panelScrollMarks_.push_back({y, entry.position, panelScrollCentring(panelLayout_, entry.row)});
     }
+}
+
+std::vector<std::size_t> App::listRowsShowing(std::size_t pane) const {
+    if (pane >= kMaxPanes || panelRuns_.empty()) return {};
+    std::vector<std::size_t> playing;
+    std::vector<std::size_t> holding;
+    const auto add = [&](std::vector<std::size_t>& rows, SettingId id, int param) {
+        if (const auto row = panelListRowOf(panelRuns_, id, param)) rows.push_back(*row);
+    };
+    const auto& path = paths_[pane];
+    if (browserSource_ == BrowserSource::Local) {
+        if (localListCovers(path)) {
+            if (const int index = localEntryIndex(localList_, path); index >= 0) add(playing, SettingId::LocalItem, index);
+        } else if (const int folder = localFolderHolding(localFolders_, path); folder >= 0) {
+            add(holding, SettingId::LocalItem, kLocalFolderParam - folder);
+        }
+    } else if (embyPaneAccountMatches(pane) && !embyPanes_[pane]->itemId.empty()) {
+        // As listRowMarks marks it: the item, then the folders the list and
+        // the item's reply named, and those the server has said are above.
+        const auto& state = *embyPanes_[pane];
+        std::vector<std::string> folders{state.parentId, state.seasonId, state.seriesId};
+        if (const auto known = embyPlayingAncestors_.find(state.itemId); known != embyPlayingAncestors_.end()) {
+            folders.insert(folders.end(), known->second.begin(), known->second.end());
+        }
+        const auto look = [&](const std::vector<emby::Item>& items, bool resume) {
+            for (std::size_t index = 0; index < items.size(); ++index) {
+                const auto& id = items[index].id;
+                if (id.empty()) continue;
+                const int param = resume ? -static_cast<int>(index) - 1 : static_cast<int>(index);
+                if (id == state.itemId) add(playing, SettingId::EmbyItem, param);
+                else if (std::find(folders.begin(), folders.end(), id) != folders.end()) add(holding, SettingId::EmbyItem, param);
+            }
+        };
+        look(embyResume_, true);
+        look(embyItems_, false);
+    }
+    return playing.empty() ? holding : playing;
+}
+
+void App::followStepInList(std::size_t pane, bool asked) {
+    if (pane >= kMaxPanes || !settingsOpen_ || !embyBrowserOpen_) return;
+    if (!asked) {
+        // The viewer has the list in hand, or is looking elsewhere in it.
+        if (panelPressArmed_ || controlDrag_ == ControlDrag::PanelScroll ||
+            controlDrag_ == ControlDrag::PanelScrollbar) return;
+        const auto rows = listRowsShowing(pane);
+        if (std::none_of(rows.begin(), rows.end(), [&](std::size_t row) { return panelRowInView(panelLayout_, row); })) {
+            return;
+        }
+    }
+    listFollow_ = ListFollow{pane, paths_[pane], GetTickCount64() + kListFollowWaitMs};
+}
+
+// Run with the sheet laid out: the new video's row is looked for in what the
+// list shows now, so a folder read for it, or a page come, finds it as soon
+// as it is there. A step that changed nothing (the end of the list, a queue
+// of one) lapses.
+void App::applyListFollow() {
+    if (!listFollow_) return;
+    const auto& follow = *listFollow_;
+    if (!settingsOpen_ || !embyBrowserOpen_ || GetTickCount64() > follow.until || paths_[follow.pane].empty()) {
+        listFollow_.reset();
+        return;
+    }
+    if (paths_[follow.pane] == follow.from) return;
+    const auto scroll = panelFollowScroll(panelLayout_, listRowsShowing(follow.pane));
+    if (!scroll) return;
+    settingsScroll_ = *scroll;
+    listFollow_.reset();
 }
 
 void App::refreshPanelGeometry(const RECT& client) {
@@ -606,8 +704,13 @@ void App::refreshPanelGeometry(const RECT& client) {
         fillListWindow(marks);
         placePanelScrollMarks(marks);
     }
+    // The next frame lays the list out where a followed step took it.
+    applyListFollow();
     if (embyBrowserOpen_ && settingsOpen_) embyRequestVisibleImages();
-    if (embyBrowserOpen_ && settingsOpen_ && browserSource_ == BrowserSource::Emby) embyLoadMoreNearEnd();
+    if (embyBrowserOpen_ && settingsOpen_ && browserSource_ == BrowserSource::Emby) {
+        embyLoadMoreNearEnd();
+        embyAskPlayingAncestors();
+    }
     layoutPanelMenu();
 }
 
@@ -620,6 +723,7 @@ PanelHit App::panelHitAt(POINT local) const {
 }
 
 void App::scrollSettingsPanel(int wheelDelta) {
+    listFollow_.reset();
     settingsScroll_ = std::clamp(
         settingsScroll_ - static_cast<float>(wheelDelta) / WHEEL_DELTA * 56.0F * uiScale_,
         0.0F, panelLayout_.maxScroll);
@@ -680,14 +784,19 @@ void App::applyPanelSlider(const PanelRow& row, float fraction, int part) {
     }
 }
 
-void App::takePointerAndKeysForPanelMenu() {
+void App::takePointerAndKeysForPanelMenu(bool keepTyping) {
     // A Windows menu took the capture, which ended whatever the left button
     // was doing (a right-click can open one mid-drag), and its loop took the
-    // keys from the box typed into. The drawn one does both itself.
+    // keys from the box typed into. The drawn one does both itself. A box's
+    // own menu leaves it the typing, for the menu to act on, and what was
+    // being composed goes into it, finished: the menu has the keys while it
+    // is up, and the input method is off meanwhile (fieldSyncIme). Until
+    // 2026-11-07 the composition was dropped.
     if (videoWindow_ && GetCapture() == videoWindow_) ReleaseCapture();
     pressedPanelId_ = SettingId::None;
     pressedPanelParam_ = -1;
-    blurField();
+    if (keepTyping) fieldCompleteComposition();
+    else blurField();
     // One card over the picture at a time.
     closeSyncPanel();
 }
@@ -709,10 +818,10 @@ void App::openPanelMenu(PanelMenu menu, SettingId id, int part, int param, std::
     layoutPanelMenu();
 }
 
-void App::openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose) {
+void App::openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose, bool keepTyping) {
     closePanelMenu();
     if (menu.items.empty() || !choose) return;
-    takePointerAndKeysForPanelMenu();
+    takePointerAndKeysForPanelMenu(keepTyping);
     OpenPanelMenu open;
     open.menu = std::move(menu);
     open.anchor = {static_cast<float>(local.x), static_cast<float>(local.y), 0.0F, 0.0F};
@@ -721,6 +830,7 @@ void App::openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsign
     open.pointer = local;
     panelMenu_ = std::move(open);
     layoutPanelMenu();
+    fieldSyncIme();
 }
 
 void App::openWindowMenu(PanelMenu menu, WindowMenuAnchor anchor, std::function<void(unsigned)> choose, int pane) {
@@ -756,6 +866,8 @@ void App::openWindowMenu(PanelMenu menu, WindowMenuAnchor anchor, std::function<
 
 void App::closePanelMenu() {
     panelMenu_.reset();
+    // Back on for a box's menu closed over the box still typed into.
+    fieldSyncIme();
 }
 
 OverlayRect App::windowMenuBounds() const {
@@ -1205,13 +1317,6 @@ void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::option
     case SettingId::SeekMode:
         if (hit.part >= 0 && hit.part <= 1) chooseSeekMode(static_cast<SeekMode>(hit.part));
         break;
-    case SettingId::Decoder:
-        if (hit.part >= 0 && hit.part <= 2) {
-            changeDecodeMode(static_cast<DecodeMode>(hit.part));
-            constexpr std::array<const wchar_t*, 3> names{L"Automatic", L"Hardware", L"Software"};
-            showNotice(std::wstring(L"Decoder: ") + names[static_cast<std::size_t>(hit.part)]);
-        }
-        break;
     case SettingId::Mute:
         toggleMute();
         break;
@@ -1289,9 +1394,9 @@ void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::option
         if (hit.part == 0) loadStyleDialog();
         else saveStyleDialog();
         break;
-    case SettingId::Session:
-        if (hit.part == 0) loadSessionDialog();
-        else saveSessionDialog();
+    case SettingId::VideoSets:
+        if (hit.part == 0) showVideoSets();
+        else addVideoSet();
         break;
     case SettingId::EmbyAccount:
         embyAccountAction(hit.part);
@@ -1308,6 +1413,12 @@ void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::option
         break;
     case SettingId::EmbyReplaceCancel:
         embyCancelReplacement();
+        break;
+    case SettingId::EmbyDeleteAllowed:
+        embyDeleteEnabled_ = !embyDeleteEnabled_;
+        if (!embyDeleteEnabled_) embyCancelDelete();
+        showNotice(embyDeleteEnabled_ ? L"Deleting videos from the Emby server is on"
+                                      : L"Deleting videos from the Emby server is off");
         break;
     case SettingId::EmbyLibraryDetails:
         if (row.param >= 0 && static_cast<std::size_t>(row.param) < embyViews_.size()) {
@@ -1495,7 +1606,13 @@ void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::option
     case SettingId::VideoScaling:
     case SettingId::VideoLevels:
     case SettingId::VideoColorReset:
+    case SettingId::Decoder:
         videoPanelAction(row, hit.part);
+        break;
+    case SettingId::VideoSetsToolbar:
+    case SettingId::VideoSetEntry:
+    case SettingId::VideoSetName:
+        videoSetPanelAction(row, hit.part);
         break;
     default:
         break;

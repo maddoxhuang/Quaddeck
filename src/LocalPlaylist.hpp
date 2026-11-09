@@ -159,6 +159,17 @@ inline bool localPathUnder(const std::wstring& path, const std::wstring& directo
     return isLocalSeparator(directory.back()) || isLocalSeparator(path[directory.size()]);
 }
 
+// Which of a list's folders a file is in, at any depth: its index, or -1
+// for a file in none of them. "D:\Show\Season 1" does not hold
+// "D:\Show\Season 10"'s files. Asked of every pane each frame, so nothing
+// is allocated.
+inline int localFolderHolding(const std::vector<std::wstring>& folders, const std::wstring& path) {
+    for (std::size_t i = 0; i < folders.size(); ++i) {
+        if (localPathUnder(path, folders[i])) return static_cast<int>(i);
+    }
+    return -1;
+}
+
 // The folders between a folder and a file under it: "Season 1" for
 // "D:\Show\Season 1\E01.mkv" under "D:\Show", nothing for a file in it.
 inline std::wstring localRelativeFolder(const std::wstring& path, const std::wstring& directory) {

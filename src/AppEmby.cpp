@@ -109,6 +109,9 @@ void App::embyConfigure(const emby::Session& session) {
                          session.token != emby_.session().token;
     if (changed) {
         embyCancelReplacement();
+        // Another account's deletion, confirmed or not, is not this one's;
+        // its window goes with it.
+        embyDropDelete();
         embyDetachPlayback();
         embyCloseDetails();
         ++embyAccountSerial_;
@@ -116,6 +119,9 @@ void App::embyConfigure(const emby::Session& session) {
         embyItemLibraries_.clear();
         embyLibraryLookups_.clear();
         embyLibraryUnknown_.clear();
+        // Those out are dropped by the account serial when they come.
+        embyPlayingAncestors_.clear();
+        embyPlayingAncestorsAsking_.clear();
         // Another account's answers name other videos.
         embySubtitled_.clear();
         embySubtitleAsking_.clear();

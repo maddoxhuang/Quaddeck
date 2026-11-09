@@ -15,12 +15,20 @@
 #include "VideoDevices.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <sstream>
 
 namespace quaddeck {
 
 using namespace app_internal;
+
+namespace {
+
+// The Decoder's choices in DecodeMode's order, for its row and its notice.
+constexpr std::array<const wchar_t*, 3> kDecodeModeNames{L"Automatic", L"Hardware", L"Software"};
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // The settings
@@ -65,6 +73,24 @@ void App::reclaimVideoAdapter() {
     appendDiagnostic("Renderer: the chosen graphics card is connected again");
     renderer_.requestRebuild();
     nextDeviceRecovery_ = {};
+}
+
+bool App::decoderChoiceApplies() const {
+    // WARP has no D3D11VA: Hardware would open nothing there. Chosen, or the
+    // device built on it with no card to use, every video is decoded in
+    // software, and the Decoder row is greyed: one rule for both, so the row
+    // is greyed exactly while choosing on it would change nothing. A WARP
+    // chosen that would not build, the device on a card instead, decodes in
+    // software all the same. Until 2026-11-07 the row was greyed for WARP
+    // chosen only, and a change on it under a fallback to WARP reopened
+    // every video for nothing.
+    if (videoOutput_.renderer == VideoRenderer::Warp) return false;
+    const auto status = renderer_.rendererStatus();
+    return !(status.built && status.renderer == VideoRenderer::Warp);
+}
+
+DecodeMode App::sourceDecodeMode() const {
+    return decoderChoiceApplies() ? decodeMode_ : DecodeMode::Software;
 }
 
 void App::noticeWarpFallback() {
@@ -286,6 +312,14 @@ void App::videoPanelAction(const PanelRow& row, int part) {
     case SettingId::VideoColorReset:
         resetVideoColor();
         break;
+    case SettingId::Decoder:
+        // The one chosen chosen again does nothing and says nothing, as the
+        // tab's other choices.
+        if (part < static_cast<int>(kDecodeModeNames.size()) && static_cast<DecodeMode>(part) != decodeMode_) {
+            changeDecodeMode(static_cast<DecodeMode>(part));
+            showNotice(std::wstring(L"Decoder: ") + kDecodeModeNames[static_cast<std::size_t>(part)]);
+        }
+        break;
     default:
         break;
     }
@@ -352,7 +386,15 @@ void App::appendVideoSettingsRows(std::vector<PanelRow>& rows) const {
         rows.back().hint = L"The card that decodes and draws every video. On a laptop with two, the faster one "
                            L"may need choosing here as well as in Windows' graphics settings.";
     }
-    note(L"Changing the renderer or the graphics card reopens every video at the same time.");
+    // Until 2026-11-07 on the Playback tab; it is the card's work, and WARP
+    // has none to do it.
+    choice(SettingId::Decoder, L"Decoder",
+           std::vector<std::wstring>(kDecodeModeNames.begin(), kDecodeModeNames.end()), static_cast<int>(decodeMode_));
+    rows.back().enabled = decoderChoiceApplies();
+    rows.back().hint = L"Hardware decodes on the graphics card (D3D11VA), Software on the CPU; Automatic uses the "
+                       L"card where it can. On WARP, chosen or used with no card, every video is decoded in "
+                       L"software and this is greyed.";
+    note(L"Changing the renderer, the graphics card or the decoder reopens every video at the same time.");
     note(videoRendererNote(videoOutput_, renderer_.rendererStatus()));
     {
         std::vector<std::wstring> displays{L"The window's display"};

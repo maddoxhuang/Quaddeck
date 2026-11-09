@@ -24,11 +24,13 @@ using namespace app_internal;
 
 namespace {
 
+// A list's first page, there quickly to be read.
 constexpr int kEmbyPageSize = 300;
-// A playlist is fetched whole, this many entries a request, because it is
-// a list to play through; one longer than the limit stops there.
-constexpr int kEmbyPlaylistPageSize = 1000;
-constexpr int kEmbyPlaylistLimit = 20000;
+// A list is fetched whole without a scroll, this many entries a request
+// after its first page -- a playlist's first page too -- because it is a
+// list to play through; one longer than the limit stops there.
+constexpr int kEmbyWholePageSize = 1000;
+constexpr int kEmbyWholeLimit = 20000;
 constexpr int kEmbyEpisodeAutoLimit = 20000;
 constexpr int kEmbySearchPerLibrary = 200;
 // Tiles at 96 DPI and the widths their pictures are asked for: twice the
@@ -187,11 +189,10 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
         const auto index = static_cast<std::size_t>(-(param + 1));
         return index < embyResume_.size() ? &embyResume_[index] : nullptr;
     };
-    // The item being played, marked wherever it appears, in its video's colour.
-    const auto playingPosition = [&](const emby::Item& entry) {
-        const auto playing = marks.embyPlaying.find(entry.id);
-        return playing == marks.embyPlaying.end() ? -1 : playing->second;
-    };
+    // The item being played, marked wherever it appears, in its video's
+    // colour; so is every folder it is in, so a page above shows which way
+    // it is.
+    const auto playingPosition = [&](const emby::Item& entry) { return marks.embyPlace(entry.id); };
     if (row.kind == PanelRowKind::Item) {
         const emby::Item* entry = entryAt(row.param);
         if (!entry) return;
@@ -206,7 +207,7 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
         return;
     }
     if (row.kind != PanelRowKind::Tiles) return;
-    const int imageWidth = embyTileImageWidth(row.tileWidth, embyBrowser_.view == 1, uiScale_);
+    const int imageWidth = embyTileImageWidth(row.tileWidth, row.tileAspect < 1.0F, uiScale_);
     const std::size_t count = row.tileParams.size();
     row.options.assign(count, std::wstring());
     row.tileKeys.clear();
@@ -270,7 +271,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     };
     // A list as tiles: as many per line as the sheet is wide, every line
     // one row so the sheet scrolls by lines and a hit names one tile.
-    const bool posters = embyBrowser_.view == 1;
+    const bool posters = embyShownView() == 1;
     const PanelMetrics metrics;
     const float innerWidth = std::max(0.0F, clientWidth - 2.0F * metrics.pad * uiScale_);
     // As many tiles as fit a line, then stretched or shrunk to fill it: a
@@ -374,7 +375,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     const bool flatOffered = arrange && embyPageAcceptsFlat();
     // The favorites page lists nothing else.
     const bool favoritesOffered = arrange && embyPages_.back().kind != EmbyPage::Kind::Favorites;
-    const std::wstring view = embyBrowser_.view == 0 ? L"List" : embyBrowser_.view == 1 ? L"Posters" : L"Thumbs";
+    const std::wstring view = embyBrowser_.view == 0 ? L"List" : posters ? L"Posters" : L"Thumbs";
     // View and Sort open their drop-downs. Each filter is a button of its
     // own that switches it at once, lit while it is on: Unplayed, the
     // favorites under the page, All videos where the page lists folders, a
@@ -596,6 +597,14 @@ bool App::embyPageAcceptsFilters() const {
            kind == EmbyPage::Kind::Favorites || kind == EmbyPage::Kind::Person;
 }
 
+bool App::embyListInServerRandom() const {
+    if (!embyPageAcceptsFilters()) return false;
+    const auto& page = embyPages_.back();
+    // A search merges its replies and keeps their order itself.
+    if (page.kind == EmbyPage::Kind::Search || (page.kind == EmbyPage::Kind::Playlist && page.ownOrder)) return false;
+    return emby::sortKeyFromIndex(embyBrowser_.sort) == emby::SortKey::Random;
+}
+
 std::string App::embyPageKey(const EmbyPage& page) {
     switch (page.kind) {
     case EmbyPage::Kind::Library: return "library:" + page.id;
@@ -703,9 +712,10 @@ void App::embyToolbarAction(int part) {
     if (part == 1 && !arrange) return;
     PanelMenu menu;
     if (part == 0) {
-        menu.option(1, L"List", embyBrowser_.view == 0)
-            .option(2, L"Posters", embyBrowser_.view == 1)
-            .option(3, L"Thumbnails", embyBrowser_.view == 2);
+        const int view = embyShownView();
+        menu.option(1, L"List", view == 0);
+        if (embyPageHasPosters()) menu.option(2, L"Posters", view == 1);
+        menu.option(3, L"Thumbnails", view == 2);
     } else {
         if (playlist) menu.option(1, L"Playlist order", ownOrder);
         for (int index = 0; index < emby::kSortKeyCount; ++index) {
@@ -720,8 +730,11 @@ void App::embyToolbarAction(int part) {
         if (!command || account != embyAccountSerial_ || embyDetails_ || embyPages_.empty() ||
             pageKey != embyPageKey(embyPages_.back()) || !settingsOpen_ || !embyBrowserOpen_ ||
             browserSource_ != BrowserSource::Emby) return;
-        if (part == 0 && command <= 3) embySetView(static_cast<int>(command) - 1);
-        else if (part == 1) {
+        // The thumbnails shown over the browser's Posters leave it alone when
+        // chosen, so the view already shown is no choice at all.
+        if (part == 0 && command <= 3) {
+            if (static_cast<int>(command) - 1 != embyShownView()) embySetView(static_cast<int>(command) - 1);
+        } else if (part == 1) {
             if (command == 1 && playlist) embyChooseSort(0);
             // The checked order chosen again reverses it, as its key does;
             // Random reshuffles.
@@ -738,6 +751,14 @@ void App::embySetView(int view) {
     if (view == embyBrowser_.view) return;
     embyBrowser_.view = view;
     settingsScroll_ = 0.0F;
+}
+
+bool App::embyPageHasPosters() const {
+    return emby::libraryHasPosters(embyLibraryType(embyCurrentLibraryId()));
+}
+
+int App::embyShownView() const {
+    return embyBrowser_.view == 1 && !embyPageHasPosters() ? 2 : embyBrowser_.view;
 }
 
 void App::embyChooseSort(int part) {
@@ -1147,11 +1168,7 @@ emby::ListRefreshState App::embyRefreshState(unsigned long long now) const {
     state.busy = embyLoading_ || embyLoadingMore_ || embyRefreshing_ || controlDrag_ != ControlDrag::None ||
                  pressedPanelKind_ != PanelHitKind::None || panelPressArmed_;
     if (state.shown) {
-        const auto& page = embyPages_.back();
-        const bool ownOrder = page.kind == EmbyPage::Kind::Playlist && page.ownOrder;
-        const bool random = embyPageAcceptsFilters() && !ownOrder &&
-                            emby::sortKeyFromIndex(embyBrowser_.sort) == emby::SortKey::Random;
-        state.keepsOrder = page.kind != EmbyPage::Kind::Search && !random;
+        state.keepsOrder = embyPages_.back().kind != EmbyPage::Kind::Search && !embyListInServerRandom();
     }
     state.held = static_cast<int>(embyItems_.size());
     state.now = now;
@@ -1249,12 +1266,18 @@ void App::embyRequestPage(int startIndex, bool inPlace) {
         // that is meant to stay where it is.
         embyLoading_ = !more;
     }
-    const int pageSize = page.kind == EmbyPage::Kind::Playlist ? kEmbyPlaylistPageSize : kEmbyPageSize;
+    // In the server's random order a further page asks the length that
+    // drew the list instead (below).
+    const int pageSize = page.kind == EmbyPage::Kind::Playlist || more ? kEmbyWholePageSize : kEmbyPageSize;
     // In place the whole list shown is asked for again, not its first page.
     int pageLimit = inPlace ? std::max(pageSize, static_cast<int>(embyItems_.size())) : pageSize;
     if (!inPlace && page.kind == EmbyPage::Kind::Season && startIndex < kEmbyEpisodeAutoLimit) {
         pageLimit = std::min(pageLimit, kEmbyEpisodeAutoLimit - startIndex);
     }
+    // A further page of the server's random order goes on through the draw
+    // the list came from only at the length that drew it.
+    if (more) pageLimit = emby::furtherPageLimit(pageLimit, embyListDrawnWith_, embyListInServerRandom());
+    embyListAskedWith_ = pageLimit;
     const std::uint64_t serial = ++embyRequestSerial_;
     // A search still out is overtaken: the libraries it had yet to ask,
     // queued on the one worker ahead of this page, are not asked.
@@ -1480,6 +1503,12 @@ void App::embyListParsed(std::uint64_t serial, int startIndex, const EmbyClient:
         }
         return;
     }
+    // Should the server have lost the draw a further page of its random
+    // order goes on through -- restarted, or asked the same query from
+    // elsewhere -- what that page repeats of the list shown is left out.
+    if (more && embyListInServerRandom()) emby::keepUnlisted(list->items, embyItems_);
+    // The list is now the draw this request made, at the length it asked.
+    if (!more) embyListDrawnWith_ = embyListAskedWith_;
     const bool person = !embyPages_.empty() && embyPages_.back().kind == EmbyPage::Kind::Person;
     // A person's titles are shown under their sections, films first, each
     // in the order asked for; the list plays in that shown order.
@@ -1550,18 +1579,20 @@ void App::embyListParsed(std::uint64_t serial, int startIndex, const EmbyClient:
         settingsScroll_ = embyPendingScroll_;
         embyPendingScroll_ = -1.0F;
     }
-    // A playlist or a season is a sequence to play through: fetch the rest
-    // without needing a scroll, so paging does not cut episode navigation
-    // off at the first 300. Keep the existing bounded-list policy. A
-    // person's titles come whole too, so a later page does not put films
-    // above series being read.
+    // A list is a sequence to play through: the rest is fetched without
+    // needing a scroll, the sheet up or not, so Shuffle picks among all of
+    // it, In order and Repeat the list reach its end and a season's episode
+    // navigation is not cut off at the first 300. A person's titles come
+    // whole too, so a later page does not put films above series being
+    // read. Past its limit, or after a page that failed or came back empty
+    // (embyAutoMoreBlocked_), the scroll or Show more asks for the rest.
+    // The home page and a search come in one reply.
     const int held = static_cast<int>(embyItems_.size());
-    const bool playlist = !embyPages_.empty() && embyPages_.back().kind == EmbyPage::Kind::Playlist;
-    const bool season = !embyPages_.empty() && embyPages_.back().kind == EmbyPage::Kind::Season;
-    const int sequenceLimit = season ? kEmbyEpisodeAutoLimit : person ? kEmbyPersonLimit : kEmbyPlaylistLimit;
-    if ((playlist || season || person) && !nothingNew && held < embyTotal_ && held < sequenceLimit) {
-        embyRequestPage(held);
-    }
+    const auto kind = embyPages_.empty() ? EmbyPage::Kind::Home : embyPages_.back().kind;
+    const bool paged = kind != EmbyPage::Kind::Home && kind != EmbyPage::Kind::Search;
+    const int wholeLimit = kind == EmbyPage::Kind::Season ? kEmbyEpisodeAutoLimit
+                         : person ? kEmbyPersonLimit : kEmbyWholeLimit;
+    if (paged && !nothingNew && held < embyTotal_ && held < wholeLimit) embyRequestPage(held);
 }
 
 void App::embyAskSubtitles(const std::vector<emby::Item>& items, bool again) {
@@ -1765,11 +1796,18 @@ void App::showEmbyItemMenu(POINT local) {
     PanelMenu menu;
     menu.option(CmdEmbyFavorite, item->favorite ? L"Remove from favorites" : L"Add to favorites");
     menu.items.back().enabled = !embyFavoriteAsking_.contains(item->id);
+    // A favorite is never deleted: the entry says so rather than leave.
+    if (embyDeleteEnabled_ && emby::deletableType(*item)) {
+        menu.separator();
+        menu.option(CmdEmbyDelete,
+                    item->favorite ? L"Delete from server  (a favorite)" : L"Delete from server\x2026", false, {},
+                    !item->favorite && !embyPendingDelete_);
+    }
     openPanelMenuAt(std::move(menu), local, [this, account, item = *item](unsigned command) {
         // What the menu offered, for the account it was offered under.
-        if (command == CmdEmbyFavorite && account == embyAccountSerial_) {
-            embySetFavorite(item.id, wide(emby::displayTitle(item)), !item.favorite);
-        }
+        if (account != embyAccountSerial_) return;
+        if (command == CmdEmbyFavorite) embySetFavorite(item.id, wide(emby::displayTitle(item)), !item.favorite);
+        if (command == CmdEmbyDelete) embyAskDelete(item);
     });
 }
 

@@ -71,7 +71,6 @@ void App::loadFiles(const std::vector<std::wstring>& files) {
     sourceProvisionalTargets_.fill(0.0);
     masterLoopEnabled_ = false;
     masterLoopA_ = masterLoopB_ = 0.0;
-    sessionPath_.clear();
 
     const std::size_t count = std::min<std::size_t>(kMaxPanes, files.size());
     audioMask_ &= count >= kMaxPanes ? kAllPaneMask : ((1U << count) - 1U);
@@ -210,7 +209,7 @@ void App::startSourceStream(std::size_t pane, const std::wstring& url, const Sou
     }
     sources_[pane]->open(
         url, renderer_.device(), renderer_.deviceContext(),
-        &renderer_.deviceMutex(), decodeMode_, [this, sourceIdentity](AudioChunk&& chunk) {
+        &renderer_.deviceMutex(), sourceDecodeMode(), [this, sourceIdentity](AudioChunk&& chunk) {
             return audio_.submit(sourceIdentity->audioOutputPane(), std::move(chunk));
         }, nasCacheEnabled_ ? CacheMode::Network : CacheMode::Off, sourceOptions);
     sources_[pane]->setAudioEnabled(false);

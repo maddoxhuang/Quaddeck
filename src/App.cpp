@@ -58,12 +58,11 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
     hangWatchdog_.start(GetCurrentThreadId(), [](const std::string& report) { appendDiagnostic(report); });
     loadAppSettings();
     embyLoadAuth();
+    loadVideoSets();
     if (!initialFiles.empty()) {
         if (initialFiles.size() == 1 &&
             _wcsicmp(std::filesystem::path(initialFiles[0]).extension().c_str(), L".qdeck") == 0) {
-            if (!loadSession(initialFiles[0])) {
-                MessageBoxW(window_, L"Could not open this QuadDeck session.", L"Session error", MB_ICONERROR);
-            }
+            importVideoSets(initialFiles[0]);
         } else {
             enqueueExternalFiles(initialFiles, {}, true);
         }
@@ -101,14 +100,24 @@ int App::run(HINSTANCE instance, int showCommand, const std::vector<std::wstring
             }
             // Route these application-wide gestures here so they work
             // whichever HWND has focus: the Alt key of fullscreen, unless a
-            // key box waits for it.
+            // key box waits for it or the window asking to delete holds the
+            // player.
             if (message.message == WM_SYSKEYDOWN && (message.lParam & (1LL << 29)) &&
-                !(message.lParam & (1LL << 30)) && !capturingKey() &&
+                !(message.lParam & (1LL << 30)) && !capturingKey() && !embyDeleteWindow_.open &&
                 keyActionFor(keyBindings_, keyChordOf(message.wParam, true)) == KeyAction::Fullscreen) {
                 toggleFullscreen();
                 continue;
             }
             if (message.message == WM_MOUSEWHEEL) {
+                // The window asking to delete holds the player: the wheel
+                // scrolls it while the pointer is on it, and is nothing
+                // anywhere else -- not the volume of a player it holds.
+                if (embyDeleteWindow_.open) {
+                    if (pointerOverEmbyDeleteWindow(message.pt)) {
+                        scrollEmbyDeleteWindow(GET_WHEEL_DELTA_WPARAM(message.wParam));
+                    }
+                    continue;
+                }
                 // An open drop-down holds the sheet still under it, and
                 // scrolls itself where a short window cut it.
                 if (panelMenu_) {
@@ -795,6 +804,9 @@ void App::recoverLostDevice() {
     settingsWindow_.surface.release();
     settingsWindow_.listSurface.release();
     settingsWindow_.overlay.releaseDeviceResources();
+    // And the window asking to delete, which stays up and answers meanwhile.
+    embyDeleteWindow_.surface.release();
+    embyDeleteWindow_.overlay.releaseDeviceResources();
     if (!renderer_.recover(videoWindow_)) {
         appendDiagnostic("Device recovery failed: " + renderer_.error() + "; next attempt in " +
                          std::to_string(delay.count()) + " s");
@@ -1071,6 +1083,9 @@ void App::tick() {
     finishEmbyPanes();
     finishLocalPanes();
     finishLinkedBrowserSet();
+    // A video set at its end goes on to the one its order names, whatever
+    // timelines the deck runs on; finishMasterTimeline leaves it alone.
+    finishVideoSet(sourceOpening, hasRepeatingSource);
     finishMasterTimeline(sourceOpening, hasRepeatingSource);
     // A keyframe seek landed near its target, not on it: the timeline
     // follows the picture, and the audio, re-aimed by the source, starts
@@ -1222,6 +1237,7 @@ void App::tick() {
             return;
         }
         renderSettingsWindow();
+        renderEmbyDeleteWindow();
     }
     if (completeBarrierAfterRender) completeSeekBarrier();
     reportPerformance();

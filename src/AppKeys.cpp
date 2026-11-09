@@ -118,8 +118,8 @@ void App::runKeyAction(KeyAction action) {
             if (key == action) sortListBy(static_cast<int>(sort));
         }
         break;
-    case KeyAction::OpenSession: loadSessionDialog(); break;
-    case KeyAction::SaveSession: saveSessionDialog(); break;
+    case KeyAction::VideoSets: toggleVideoSets(); break;
+    case KeyAction::AddVideoSet: addVideoSet(); break;
     case KeyAction::SubtitlesToggle: toggleSubtitles(subtitlePane()); break;
     case KeyAction::SubtitleNext:
     case KeyAction::SubtitleLoad:

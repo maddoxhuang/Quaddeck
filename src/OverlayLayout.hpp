@@ -39,16 +39,18 @@ inline OverlayRect overlayRect(const RectF& rect) {
 // ---------------------------------------------------------------------------
 // Transport bar
 
-// In the order they sit on the bar. Previous and Next are there only with
-// one video loaded: they step through its folder or its Emby list, and
+// In the order they sit on the bar. Previous and Next are there with one
+// video loaded: they step through its folder or its Emby list, and
 // Subtitles is that video's switch; among several each has its own on its
-// strip. Sync and Layout are there only with several: Sync opens the sync
-// panel (the seek bars' mode, each video's offset and repeat), Layout the
-// arrangement menu. So are the videos' buttons: All videos shows every
-// video, SoloV1 to SoloV5 one alone, a button for each video loaded, so
-// one alone gives way to another without the grid between. There is no
-// menu button: a right-click opens the menu anywhere on the picture. Nor
-// is there a settings button: F5 and the menu open the sheet.
+// strip. While a video set plays, Previous and Next are there whatever is
+// loaded, and step to the set before or after it. Sync and Layout are
+// there only with several: Sync opens the sync panel (the seek bars' mode,
+// each video's offset and repeat), Layout the arrangement menu. So are the
+// videos' buttons: All videos shows every video, SoloV1 to SoloV5 one
+// alone, a button for each video loaded, so one alone gives way to another
+// without the grid between. Sets opens the video sets in the sheet. There
+// is no menu button: a right-click opens the menu anywhere on the picture.
+// Nor is there a settings button: F5 and the menu open the sheet.
 enum class BarItem {
     Previous,
     Play,
@@ -67,9 +69,10 @@ enum class BarItem {
     SoloV5,
     Sync,
     Layout,
+    Sets,
     Fullscreen,
 };
-inline constexpr std::size_t kBarItemCount = 18;
+inline constexpr std::size_t kBarItemCount = 19;
 
 // The button that shows the video at a place on the screen alone (0 for
 // V1), and back: the place a button shows alone, or -1 for any other.
@@ -162,16 +165,20 @@ inline bool capsuleRevealWanted(const TransportBarLayout& bar, float px, float p
 // "All", centred on the bottom above the strips, which keep to their own
 // bottom edges. A line parts playback's keys from the rest. With `videos`
 // of two or more, the videos' buttons stand between two lines after
-// playback's: All videos, then one for each of V1 up to that many. Too
-// narrow, the capsule lets go of its label, the arrangement, sync, the
-// videos' buttons (all of them at once), stop, sound and fullscreen in that
-// order; play stays. It is centred on `centreX` (the middle of `width` when
+// playback's: All videos, then one for each of V1 up to that many.
+// `setSteps` puts Previous and Next on either side of play, while a video
+// set plays; `setsButton` the button of the video sets before fullscreen.
+// Too narrow, the capsule lets go of its label, the sets' button, the
+// arrangement, sync, the videos' buttons (all of them at once), Previous
+// and Next (together), stop, sound and fullscreen in that order; play
+// stays. It is centred on `centreX` (the middle of `width` when
 // negative): the window's middle, so a browser docked over the right of
 // the picture does not move it. Only where the browser would cover it is it
 // pushed left, just clear of it.
 inline TransportBarLayout capsuleBarLayout(float width, float height, float scale, bool volumeOpen,
                                            const BarMetrics& metrics = {}, float centreX = -1.0F,
-                                           std::size_t videos = 0) {
+                                           std::size_t videos = 0, bool setSteps = false,
+                                           bool setsButton = false) {
     TransportBarLayout result;
     result.capsule = true;
     const float s = std::max(0.0F, scale);
@@ -194,6 +201,8 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
                             BarItem::Fullscreen}) {
         present[index(item)] = true;
     }
+    present[index(BarItem::Previous)] = present[index(BarItem::Next)] = setSteps;
+    present[index(BarItem::Sets)] = setsButton;
     const std::size_t soloButtons = videos >= 2 ? std::min(videos, kMaxPanes) : 0;
     const auto showVideos = [&](bool shown) {
         present[index(BarItem::AllVideos)] = shown && soloButtons > 0;
@@ -231,24 +240,30 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
             x += divider;
             afterButton = false;
         };
+        put(BarItem::Previous);
         put(BarItem::Play);
+        put(BarItem::Next);
         put(BarItem::Stop);
         put(BarItem::Audio);
-        line(result.divider, {BarItem::AllVideos, BarItem::Sync, BarItem::Layout, BarItem::Fullscreen});
+        line(result.divider,
+             {BarItem::AllVideos, BarItem::Sync, BarItem::Layout, BarItem::Sets, BarItem::Fullscreen});
         put(BarItem::AllVideos);
         for (std::size_t position = 0; position < kMaxPanes; ++position) put(soloBarItem(position));
-        line(result.videosDivider, {BarItem::Sync, BarItem::Layout, BarItem::Fullscreen});
+        line(result.videosDivider, {BarItem::Sync, BarItem::Layout, BarItem::Sets, BarItem::Fullscreen});
         put(BarItem::Sync);
         put(BarItem::Layout);
+        put(BarItem::Sets);
         put(BarItem::Fullscreen);
         return x + padding - left;
     };
     const float room = width - side * 2.0F;
     if (place(0.0F, false) > room) withLabel = false;
-    for (const auto item : {BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Stop, BarItem::Audio,
-                            BarItem::Fullscreen}) {
+    // Next stands for the pair of steps, which leave together.
+    for (const auto item : {BarItem::Sets, BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Next,
+                            BarItem::Stop, BarItem::Audio, BarItem::Fullscreen}) {
         if (place(0.0F, false) <= room) break;
         if (item == BarItem::AllVideos) showVideos(false);
+        else if (item == BarItem::Next) present[index(BarItem::Previous)] = present[index(BarItem::Next)] = false;
         else present[index(item)] = false;
     }
     const float capsuleWidth = place(0.0F, false);
@@ -275,13 +290,17 @@ inline TransportBarLayout capsuleBarLayout(float width, float height, float scal
 // `severalVideos` the sync and arrangement buttons, and with them `videos`
 // of two or more the videos' buttons, All videos and one for each of V1 up
 // to that many, between the sound and sync; they leave together, after sync.
+// `setSteps` puts the step buttons on the bar however many videos there
+// are, while a video set plays; `setsButton` the video sets' button before
+// fullscreen, which leaves first.
 inline TransportBarLayout transportBarLayout(
     float width, float height, float scale, bool volumeOpen, bool singleVideo = false,
     const BarMetrics& metrics = {}, bool showTimeline = true, bool severalVideos = false,
-    float capsuleCentreX = -1.0F, std::size_t videos = 0) {
+    float capsuleCentreX = -1.0F, std::size_t videos = 0, bool setSteps = false, bool setsButton = false) {
     if (!severalVideos) videos = 0;
     if (severalVideos && !showTimeline) {
-        return capsuleBarLayout(width, height, scale, volumeOpen, metrics, capsuleCentreX, videos);
+        return capsuleBarLayout(width, height, scale, volumeOpen, metrics, capsuleCentreX, videos, setSteps,
+                                setsButton);
     }
     TransportBarLayout result;
     const float s = std::max(0.0F, scale);
@@ -306,9 +325,10 @@ inline TransportBarLayout transportBarLayout(
     std::array<bool, kBarItemCount> present{};
     present.fill(true);
     present[index(BarItem::Volume)] = false;
-    present[index(BarItem::Previous)] = singleVideo;
-    present[index(BarItem::Next)] = singleVideo;
+    present[index(BarItem::Previous)] = singleVideo || setSteps;
+    present[index(BarItem::Next)] = singleVideo || setSteps;
     present[index(BarItem::Subtitles)] = singleVideo;
+    present[index(BarItem::Sets)] = setsButton;
     present[index(BarItem::Sync)] = severalVideos;
     present[index(BarItem::Layout)] = severalVideos;
     present[index(BarItem::Time)] = showTimeline;
@@ -335,8 +355,8 @@ inline TransportBarLayout transportBarLayout(
         return side * 2.0F + total + gap * static_cast<float>(std::max(0, count - 1));
     };
     // All videos stands for all the videos' buttons, which leave together.
-    constexpr std::array<BarItem, 10> hideOrder{
-        BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Subtitles, BarItem::Stop,
+    constexpr std::array<BarItem, 11> hideOrder{
+        BarItem::Sets, BarItem::Layout, BarItem::Sync, BarItem::AllVideos, BarItem::Subtitles, BarItem::Stop,
         BarItem::Time, BarItem::Audio, BarItem::Fullscreen, BarItem::Previous, BarItem::Next};
     for (const auto item : hideOrder) {
         if (required(showTimeline ? metrics.seekPreferred * s : 0.0F) <= width) break;
@@ -546,7 +566,11 @@ inline constexpr std::array<bool, kPaneChipCount> kEveryPaneChip{true, true, tru
 // repeat, Solo and close. The tag shows on every pane while the pointer
 // moves, the rest of the strip on the pane under the pointer. While the
 // videos share one timeline the bar's rail is theirs: the strip is the row
-// alone, and the bar marks where each video ends.
+// alone, and the bar marks where each video ends. A row with no rail over
+// it -- that one, a pane too short for its rail, the only video's -- has no
+// scrim: it is one capsule from the left of the row, the tag, pause and
+// time, then sound, subtitles, repeat, Solo and close, the volume standing
+// up over the speaker as the bar's does.
 struct PaneChromeLayout {
     // The "V2" tag at the left end of the row. The only video has none.
     OverlayRect pill;
@@ -554,19 +578,24 @@ struct PaneChromeLayout {
     // for it, takes no room.
     std::array<OverlayRect, kPaneChipCount> chips{};
     // The video's volume rail, unfolded to the left of its speaker while
-    // asked for, only for a video being heard.
+    // asked for, only for a video being heard. `volumeUpright` on a row
+    // with no scrim: a popup standing on the speaker, reaching down to it.
     OverlayRect volume;
+    bool volumeUpright{};
     // Where its time reads; `timeShort` when only the current time fits.
     OverlayRect time;
     bool timeShort{};
     // The seek rail's hit band, above the row.
     OverlayRect timeline;
     // The rail and the row: a press there on none of the controls is the
-    // strip's, not the picture's. Only with a rail, or the row of a tagged
-    // video whose rail is the bar's.
+    // strip's, not the picture's. Only with a rail, or, for a tagged video
+    // whose rail is the bar's, the row as far as its capsule reaches.
     OverlayRect strip;
     // The scrim the strip is drawn on. Not a control.
     OverlayRect band;
+    // A row with no scrim: the capsule it stands on, round all it holds.
+    // None round the tag alone, nor under a scrim.
+    OverlayRect capsule;
     const OverlayRect& operator[](PaneChip chip) const {
         return chips[static_cast<std::size_t>(chip)];
     }
@@ -592,11 +621,26 @@ struct PaneChromeMetrics {
     // that the row needs, and the row and the rail with some picture.
     float minimumHeightForRow{40.0F};
     float minimumHeightForRail{96.0F};
+    // A row with no scrim: how far its capsule reaches beyond what it
+    // holds, the room after the time's measured text, and the volume
+    // standing over the speaker, as the bar's -- folded where the pane
+    // leaves it less than `volumePopupMinimum` above the speaker.
+    float capsulePaddingX{5.0F};
+    float capsulePaddingY{4.0F};
+    float timeTextTrail{2.0F};
+    float volumePopupWidth{28.0F};
+    float volumePopupHeight{120.0F};
+    float volumePopupMinimum{48.0F};
 };
 
 struct PaneChromeOptions {
     // The measured width of the tag's text.
     float pillTextWidth{};
+    // The measured widths of the time's longest text, with and without its
+    // duration. On a row with no scrim the time takes only that, so the
+    // buttons after it stand beside it; 0, not yet measured, its full room.
+    float timeTextWidth{};
+    float timeShortTextWidth{};
     bool withPill{true};
     bool withTime{true};
     bool withTimeline{true};
@@ -615,8 +659,9 @@ struct PaneChromeOptions {
 // Lay a pane's strip out. Where the row is too narrow for everything,
 // things leave it in a fixed order -- Solo, repeat, the duration, the time,
 // close, subtitles, sound, pause -- each still in the pane's menu; the tag
-// stays. The volume, unfolded, takes the time's room before it stays
-// folded.
+// stays. Under a scrim the volume, unfolded, takes the time's room before
+// it stays folded; on a row with no scrim it takes none, standing over the
+// speaker.
 inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const PaneChromeOptions& options = {},
                                          const PaneChromeMetrics& metrics = {}) {
     PaneChromeLayout result;
@@ -628,15 +673,14 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
     if (room < metrics.minimumHeightForRow * s) return result;
     const float rowHeight = metrics.chip * s;
     const float rowTop = bottom - metrics.bottomPadding * s - rowHeight;
-    if (options.withTimeline && room >= metrics.minimumHeightForRail * s) {
+    // A rail of its own puts the row under a scrim, with its two ends apart;
+    // without one the row is one capsule from the left.
+    const bool scrim = options.withTimeline && room >= metrics.minimumHeightForRail * s;
+    if (scrim) {
         result.timeline = {cell.x, rowTop - metrics.railBand * s, cell.width, metrics.railBand * s};
         result.strip = {cell.x, result.timeline.y, cell.width, bottom - result.timeline.y};
         const float bandTop = std::max(top, result.timeline.y - metrics.bandRise * s);
         result.band = {cell.x, bandTop, cell.width, bottom - bandTop};
-    } else if (!options.withTimeline && options.withPill) {
-        // One of several on the bar's rail: the row is the strip, on no
-        // scrim -- its ends are capsules of their own, as the bar's "All".
-        result.strip = {cell.x, rowTop, cell.width, bottom - rowTop};
     }
 
     // What the row would hold, left then right, and what each is worth.
@@ -661,16 +705,37 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
     widths[Pill] = std::min(std::max(std::max(0.0F, options.pillTextWidth) + metrics.pillPadding * s * 2.0F,
                                      pillHeight),
                             cell.width - margin * 2.0F);
-    widths[Time] = metrics.timeWidth * s;
+    // Under a scrim the time has its room; on a capsule, once measured, the
+    // room of its longest text, so the buttons after it do not move as it
+    // counts.
+    const auto timeWidth = [&](bool shortened) {
+        const float measured = shortened ? options.timeShortTextWidth : options.timeTextWidth;
+        if (!scrim && measured > 0.0F) return measured + metrics.timeTextTrail * s;
+        return (shortened ? metrics.timeShortWidth : metrics.timeWidth) * s;
+    };
+    widths[Time] = timeWidth(false);
     widths[Volume] = metrics.volumeWidth * s;
     constexpr std::array<Slot, 3> left{Pill, Pause, Time};
     constexpr std::array<Slot, 6> right{Volume, Audio, Subtitles, Repeat, Solo, Close};
+    // The capsule's order: the left end's, then the right end's buttons.
+    constexpr std::array<Slot, 8> capsuleOrder{Pill, Pause, Time, Audio, Subtitles, Repeat, Solo, Close};
     // The tag stands a little further from what follows it than buttons
     // from each other.
     const auto gapAfter = [&](int previous) {
         return (previous == Pill ? metrics.pillChipGap : metrics.chipGap) * s;
     };
     const auto required = [&] {
+        if (!scrim) {
+            float width = 0.0F;
+            int previous = -1;
+            for (const Slot slot : capsuleOrder) {
+                if (!present[slot]) continue;
+                if (previous >= 0) width += gapAfter(previous);
+                width += widths[slot];
+                previous = slot;
+            }
+            return margin * 2.0F + width;
+        }
         float leftWidth = 0.0F;
         int previous = -1;
         for (const Slot slot : left) {
@@ -694,7 +759,7 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
     present[Volume] = false;
     const auto shortenTime = [&] {
         result.timeShort = true;
-        widths[Time] = metrics.timeShortWidth * s;
+        widths[Time] = timeWidth(true);
     };
     constexpr std::array<Slot, 8> leaveOrder{Solo, Repeat, Time, Time, Close, Subtitles, Audio, Pause};
     for (const Slot slot : leaveOrder) {
@@ -705,11 +770,11 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
         }
         present[slot] = false;
     }
-    // The volume is fitted to what is left, so that unfolding it moves no
-    // button the pointer may be on: the time, at the other end of the row,
-    // makes room for it, shortened and then gone; where even that is not
-    // enough it stays folded.
-    if (volumeAsked && present[Audio]) {
+    // Under a scrim the volume is fitted to what is left, so that unfolding
+    // it moves no button the pointer may be on: the time, at the other end
+    // of the row, makes room for it, shortened and then gone; where even
+    // that is not enough it stays folded.
+    if (scrim && volumeAsked && present[Audio]) {
         const bool timeWas = present[Time];
         const bool shortWas = result.timeShort;
         const float widthWas = widths[Time];
@@ -725,18 +790,68 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
     }
     if (!present[Time]) result.timeShort = false;
 
-    float x = cell.x + margin;
+    const auto chipBox = [&](PaneChip chip) -> OverlayRect& { return result.chips[static_cast<std::size_t>(chip)]; };
+    const auto place = [&](Slot slot, const OverlayRect& box) {
+        switch (slot) {
+        case Pill: result.pill = {box.x, rowTop + (rowHeight - pillHeight) * 0.5F, box.width, pillHeight}; break;
+        case Pause: chipBox(PaneChip::Pause) = box; break;
+        case Time: result.time = box; break;
+        // It reaches the speaker, so the pointer on its way from one to the
+        // other never falls through a gap and folds it away.
+        case Volume: result.volume = {box.x, box.y, box.width + metrics.chipGap * s, box.height}; break;
+        case Audio: chipBox(PaneChip::Audio) = box; break;
+        case Subtitles: chipBox(PaneChip::Subtitles) = box; break;
+        case Repeat: chipBox(PaneChip::Repeat) = box; break;
+        case Solo: chipBox(PaneChip::Solo) = box; break;
+        default: chipBox(PaneChip::Close) = box; break;
+        }
+    };
+
+    const float start = cell.x + margin;
+    float x = start;
     int previous = -1;
+    if (!scrim) {
+        // One capsule from the left: everything in a line, the buttons
+        // after the time.
+        bool beyondTag = false;
+        for (const Slot slot : capsuleOrder) {
+            if (!present[slot]) continue;
+            if (previous >= 0) x += gapAfter(previous);
+            place(slot, {x, rowTop, widths[slot], rowHeight});
+            x += widths[slot];
+            previous = slot;
+            beyondTag = beyondTag || slot != Pill;
+        }
+        if (beyondTag) {
+            const float padX = metrics.capsulePaddingX * s;
+            const float padY = metrics.capsulePaddingY * s;
+            result.capsule = {start - padX, rowTop - padY, x - start + padX * 2.0F, rowHeight + padY * 2.0F};
+        }
+        // One of several on the bar's rail: its row is its strip as far as
+        // the capsule reaches. Beyond it is the picture.
+        if (!options.withTimeline && options.withPill && previous >= 0) {
+            const float from = beyondTag ? result.capsule.x : start;
+            const float to = beyondTag ? result.capsule.right() : x;
+            result.strip = {from, rowTop, to - from, bottom - rowTop};
+        }
+        // The volume stands on the speaker, as the bar's does, taking no
+        // room from the row; inside the pane, or not at all.
+        if (volumeAsked && present[Audio]) {
+            const OverlayRect& speaker = chipBox(PaneChip::Audio);
+            const float width = std::min(metrics.volumePopupWidth * s, speaker.width);
+            const float popupTop = std::max(top, speaker.y - metrics.volumePopupHeight * s);
+            if (speaker.y - popupTop >= metrics.volumePopupMinimum * s) {
+                result.volume = {speaker.x + (speaker.width - width) * 0.5F, popupTop, width, speaker.y - popupTop};
+                result.volumeUpright = true;
+            }
+        }
+        return result;
+    }
     for (const Slot slot : left) {
         if (!present[slot]) continue;
         if (previous >= 0) x += gapAfter(previous);
-        const float width = widths[slot];
-        switch (slot) {
-        case Pill: result.pill = {x, rowTop + (rowHeight - pillHeight) * 0.5F, width, pillHeight}; break;
-        case Pause: result.chips[static_cast<std::size_t>(PaneChip::Pause)] = {x, rowTop, width, rowHeight}; break;
-        default: result.time = {x, rowTop, width, rowHeight}; break;
-        }
-        x += width;
+        place(slot, {x, rowTop, widths[slot], rowHeight});
+        x += widths[slot];
         previous = slot;
     }
     float rightEdge = cell.x + cell.width - margin;
@@ -744,20 +859,20 @@ inline PaneChromeLayout paneChromeLayout(const RectF& cell, float scale, const P
         const Slot slot = *it;
         if (!present[slot]) continue;
         rightEdge -= widths[slot];
-        const OverlayRect box{rightEdge, rowTop, widths[slot], rowHeight};
-        switch (slot) {
-        // It reaches the speaker, so the pointer on its way from one to the
-        // other never falls through a gap and folds it away.
-        case Volume: result.volume = {box.x, box.y, box.width + metrics.chipGap * s, box.height}; break;
-        case Audio: result.chips[static_cast<std::size_t>(PaneChip::Audio)] = box; break;
-        case Subtitles: result.chips[static_cast<std::size_t>(PaneChip::Subtitles)] = box; break;
-        case Repeat: result.chips[static_cast<std::size_t>(PaneChip::Repeat)] = box; break;
-        case Solo: result.chips[static_cast<std::size_t>(PaneChip::Solo)] = box; break;
-        default: result.chips[static_cast<std::size_t>(PaneChip::Close)] = box; break;
-        }
+        place(slot, {rightEdge, rowTop, widths[slot], rowHeight});
         rightEdge -= metrics.chipGap * s;
     }
     return result;
+}
+
+// The upright volume as drawn and dragged: its popup down to the capsule's
+// top edge. The rest, the capsule's edge over the speaker, is there only so
+// the pointer climbing from the speaker crosses no gap.
+inline OverlayRect uprightVolumePill(const PaneChromeLayout& chrome) {
+    if (!chrome.volumeUpright || !chrome.volume.visible()) return {};
+    const float bottom = chrome.capsule.visible() ? std::min(chrome.volume.bottom(), chrome.capsule.y)
+                                                  : chrome.volume.bottom();
+    return {chrome.volume.x, chrome.volume.y, chrome.volume.width, std::max(0.0F, bottom - chrome.volume.y)};
 }
 
 // Position along a rail, 0..1, for a pointer x inside the rail's hit band.

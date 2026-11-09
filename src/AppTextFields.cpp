@@ -2,9 +2,9 @@
 // Emby browser's search and the Emby sign-in's server, user and password.
 // One at most has the typing (typingField_). This file is what a box does
 // while it has it: the keys it takes, an input method's composition and
-// where its windows go, the clipboard and the caret. What a box is for is
-// its page's: a search run after a pause (AppEmbySearch.cpp), a sign-in
-// sent on Enter (AppEmby.cpp).
+// where its windows go, the clipboard, its right-click menu and the caret.
+// What a box is for is its page's: a search run after a pause
+// (AppEmbySearch.cpp), a sign-in sent on Enter (AppEmby.cpp).
 
 #include "App.hpp"
 #include "AppInternal.hpp"
@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cwchar>
 #include <string_view>
+#include <utility>
 
 namespace quaddeck {
 
@@ -75,6 +76,7 @@ TextFieldState* App::fieldState(TextFieldId id) {
     case TextFieldId::EmbyServer: return &embySignInForm_.server;
     case TextFieldId::EmbyUser: return &embySignInForm_.user;
     case TextFieldId::EmbyPassword: return &embySignInForm_.password;
+    case TextFieldId::VideoSetName: return &videoSetNameField_;
     case TextFieldId::None: break;
     }
     return nullptr;
@@ -86,6 +88,10 @@ bool App::fieldShown(TextFieldId id) const {
     if (id == TextFieldId::EmbySearch) return embySearchShown();
     // A sign-in on its way holds the boxes as they were sent.
     if (signInField(id)) return embySignInShown() && !embyLoading_;
+    if (id == TextFieldId::VideoSetName) {
+        return settingsOpen_ && videoSetsOpen_ && !embyBrowserOpen_ && videoSetRenaming_ >= 0 &&
+               static_cast<std::size_t>(videoSetRenaming_) < videoSets_.sets.size();
+    }
     return false;
 }
 
@@ -94,6 +100,7 @@ TextFieldId App::fieldTyping() const { return fieldShown(typingField_) ? typingF
 TextFieldId App::fieldOfRow(const PanelRow& row) {
     if (row.kind != PanelRowKind::TextField) return TextFieldId::None;
     if (row.id == SettingId::EmbySearch) return TextFieldId::EmbySearch;
+    if (row.id == SettingId::VideoSetName) return TextFieldId::VideoSetName;
     if (row.id != SettingId::EmbySignInField) return TextFieldId::None;
     switch (row.param) {
     case 0: return TextFieldId::EmbyServer;
@@ -161,6 +168,8 @@ void App::blurField() {
     // What was typed and not yet searched for is searched for now, so the
     // box and the results under it agree when the page is seen again.
     if (id == TextFieldId::EmbySearch && embySearchEditedTick_ != 0) embySearchCommit();
+    // A set's new name is kept when the box is left, as by Enter.
+    if (id == TextFieldId::VideoSetName) commitVideoSetRename();
 }
 
 void App::fieldCancelComposition() {
@@ -172,6 +181,25 @@ void App::fieldCancelComposition() {
     }
     fieldComposition_.clear();
     fieldCompositionCaret_ = 0;
+}
+
+void App::fieldCompleteComposition() {
+    if (fieldComposition_.empty()) return;
+    // The input method's answer, the finished text, comes back through
+    // WM_IME_COMPOSITION (fieldImeComposition) before ImmNotifyIME returns.
+    if (window_ && keyboardFocus_) {
+        if (HIMC context = ImmGetContext(window_)) {
+            ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+            ImmReleaseContext(window_, context);
+        }
+    }
+    if (fieldComposition_.empty()) return;
+    // None came -- or there is no input method to ask: what the box shows
+    // being composed goes in as typed, and the input method drops its own.
+    const TextFieldId id = fieldTyping();
+    const std::wstring composed = fieldComposition_;
+    fieldCancelComposition();
+    if (TextFieldState* field = fieldState(id); field && textFieldInsert(*field, composed)) fieldEdited(id);
 }
 
 void App::fieldDecorate(PanelRow& row, TextFieldId id) const {
@@ -218,20 +246,25 @@ void App::fieldKey(WPARAM key, bool ctrl, bool shift) {
         edited = textFieldErase(field, -1, word);
         break;
     case VK_DELETE:
-        // Shift+Delete cuts, as in Windows' edit box.
+        // Shift+Delete cuts, as in Windows' edit box; a password's
+        // selection is only erased, below.
         if (shift && !ctrl && !masked && textFieldHasSelection(field)) {
-            setClipboardText(window_, textFieldSelected(field));
+            edited = fieldApply(id, TextFieldEdit::Cut);
+            break;
         }
         if (masked && ctrl && !textFieldHasSelection(field)) toEnd(1, true);
         edited = textFieldErase(field, 1, word);
         break;
     case VK_INSERT:
-        if (ctrl && !shift && !masked) setClipboardText(window_, textFieldSelected(field));
-        else if (shift && !ctrl) edited = textFieldInsert(field, clipboardText(window_));
+        if (ctrl && !shift) fieldApply(id, TextFieldEdit::Copy);
+        else if (shift && !ctrl) edited = fieldApply(id, TextFieldEdit::Paste);
         break;
     case VK_RETURN:
         if (id == TextFieldId::EmbySearch) {
             embySearchCommit();
+        } else if (id == TextFieldId::VideoSetName) {
+            commitVideoSetRename();
+            return;
         } else {
             // Any of the sign-in's boxes sends the form, as its button does.
             embySubmitSignIn();
@@ -249,26 +282,24 @@ void App::fieldKey(WPARAM key, bool ctrl, bool shift) {
         }
         break;
     case VK_ESCAPE:
-        blurField();
+        if (id == TextFieldId::VideoSetName) cancelVideoSetRename();
+        else blurField();
         return;
     case 'A':
-        if (ctrl) textFieldSelectAll(field);
+        if (ctrl) fieldApply(id, TextFieldEdit::SelectAll);
         break;
     case 'F':
         // Ctrl+F, which brought the search box, selects what it holds.
         if (ctrl && id == TextFieldId::EmbySearch) textFieldSelectAll(field);
         break;
     case 'C':
-        if (ctrl && !masked) setClipboardText(window_, textFieldSelected(field));
+        if (ctrl) fieldApply(id, TextFieldEdit::Copy);
         break;
     case 'X':
-        if (ctrl && !masked && textFieldHasSelection(field)) {
-            setClipboardText(window_, textFieldSelected(field));
-            edited = textFieldErase(field, -1, false);
-        }
+        if (ctrl) edited = fieldApply(id, TextFieldEdit::Cut);
         break;
     case 'V':
-        if (ctrl) edited = textFieldInsert(field, clipboardText(window_));
+        if (ctrl) edited = fieldApply(id, TextFieldEdit::Paste);
         break;
     default:
         break;
@@ -278,13 +309,71 @@ void App::fieldKey(WPARAM key, bool ctrl, bool shift) {
     fieldPlaceIme();
 }
 
+std::wstring App::fieldClipboard(HWND owner) const {
+    return clipboardText(owner ? owner : window_);
+}
+
+void App::fieldSetClipboard(const std::wstring& text, HWND owner) {
+    if (text.empty()) return;
+    setClipboardText(owner ? owner : window_, text);
+}
+
+bool App::fieldApply(TextFieldId id, TextFieldEdit edit) {
+    TextFieldState* state = fieldState(id);
+    if (!state) return false;
+    // The clipboard is read for a paste only.
+    const std::wstring pasted = edit == TextFieldEdit::Paste ? textFieldPasted(fieldClipboard()) : std::wstring();
+    std::wstring copied;
+    const bool edited = textFieldApplyEdit(*state, edit, maskedField(id), pasted, copied);
+    fieldSetClipboard(copied);
+    return edited;
+}
+
+void App::showFieldMenu(TextFieldId id, POINT local) {
+    if (!fieldShown(id)) return;
+    // Pressed with the right button, a box takes the typing as with the
+    // left, but its caret and selection stay: they are what the menu acts on.
+    if (fieldTyping() != id) focusField(id, false);
+    // What the input method was composing goes into the box first, finished,
+    // rather than being lost with the press (a left press keeps it too); the
+    // menu then has the keys, the input method off meanwhile.
+    fieldCompleteComposition();
+    PanelMenu menu = fieldEditMenu(*fieldState(id), maskedField(id), textFieldPasted(fieldClipboard()));
+    openPanelMenuAt(std::move(menu), local, [this, id](unsigned command) {
+        // The box went while the menu was up: its page, the sheet, or a
+        // sign-in sent.
+        if (fieldTyping() != id) return;
+        const auto edit = fieldMenuEdit(command);
+        if (!edit) return;
+        if (fieldApply(id, *edit)) fieldEdited(id);
+        fieldCaretTick_ = GetTickCount64();
+        fieldPlaceIme();
+    }, true);
+}
+
 void App::fieldCharacter(wchar_t character) {
+    // A character past the first 65536, such as an emoji, comes as two, the
+    // halves of its surrogate pair: the first waits for the second, and the
+    // two go in together or not at all (textFieldInsert). Until 2026-11-07
+    // each went in alone, and at the box's limit the first was left in it
+    // without the second, in place of a selected character too.
+    const wchar_t high = std::exchange(fieldHighSurrogate_, L'\0');
     const TextFieldId id = fieldTyping();
     if (id == TextFieldId::None) return;
     // Backspace, Tab, Enter, Escape and Ctrl's letters come as characters
     // too, after the keys the box has already acted on.
     if (character < 0x20 || character == 0x7F) return;
-    if (textFieldInsert(*fieldState(id), std::wstring_view(&character, 1))) fieldEdited(id);
+    if (textFieldHighSurrogate(character)) {
+        fieldHighSurrogate_ = character;
+        return;
+    }
+    const wchar_t pair[2]{high, character};
+    std::wstring_view typed(&character, 1);
+    if (textFieldLowSurrogate(character)) {
+        if (high == L'\0') return;  // half a pair, its first lost
+        typed = std::wstring_view(pair, 2);
+    }
+    if (textFieldInsert(*fieldState(id), typed)) fieldEdited(id);
     fieldCaretTick_ = GetTickCount64();
     fieldPlaceIme();
 }
@@ -378,9 +467,10 @@ void App::fieldSyncIme() {
     // native mode would take it for a composition, the key coming as
     // VK_PROCESSKEY. A password is typed key by key, never composed, as in
     // Windows' own password box.
+    // Off too while a drawn menu has the keys, as over a box's own menu.
     // Turned off only with the keyboard here; on again whenever it was off.
     const TextFieldId typing = fieldTyping();
-    const bool off = typing == TextFieldId::None || maskedField(typing);
+    const bool off = typing == TextFieldId::None || maskedField(typing) || panelMenu_.has_value();
     if (!window_ || off == fieldImeOff_ || (off && !keyboardFocus_)) return;
     ImmAssociateContextEx(window_, nullptr, off ? 0 : IACE_DEFAULT);
     fieldImeOff_ = off;

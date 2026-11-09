@@ -168,6 +168,46 @@ void App::embyLibraryLookupArrived(std::uint64_t account, const emby::Item& item
     }
 }
 
+void App::embyAskPlayingAncestors() {
+    if (!emby_.session().signedIn()) return;
+    const auto played = [this](const std::string& id) {
+        for (std::size_t pane = 0; pane < embyPanes_.size(); ++pane) {
+            if (embyPaneAccountMatches(pane) && embyPanes_[pane]->itemId == id) return true;
+        }
+        return false;
+    };
+    // What no pane plays any more goes, so the answers stay a few.
+    std::erase_if(embyPlayingAncestors_, [&](const auto& known) { return !played(known.first); });
+    for (std::size_t pane = 0; pane < embyPanes_.size(); ++pane) {
+        if (!embyPaneAccountMatches(pane)) continue;
+        const std::string& id = embyPanes_[pane]->itemId;
+        if (id.empty() || embyPlayingAncestors_.contains(id) || embyPlayingAncestorsAsking_.contains(id)) continue;
+        embyPlayingAncestorsAsking_.insert(id);
+        const auto account = embyAccountSerial_;
+        emby_.request("GET", emby::ancestorsPath(id, emby_.session().userId), "",
+                      [this, account, id](const EmbyClient::Response& response) {
+            embyPlayingAncestorsArrived(account, id, response);
+        });
+    }
+}
+
+void App::embyPlayingAncestorsArrived(std::uint64_t account, const std::string& itemId,
+                                      const EmbyClient::Response& response) {
+    if (account != embyAccountSerial_) return;
+    embyPlayingAncestorsAsking_.erase(itemId);
+    if (response.status == 401) { embySessionExpired(); return; }
+    // A failed answer is kept as none: the folders the list and the item's
+    // reply named are still marked, and it is not asked for every frame.
+    std::vector<std::string> ids;
+    if (const auto ancestors = response.ok ? emby::parseAncestorsArray(response.body) : std::nullopt) {
+        for (const auto& ancestor : *ancestors) ids.push_back(ancestor.id);
+    } else {
+        appendDiagnostic("Emby: the folders above a played item could not be read (status " +
+                         std::to_string(response.status) + ")");
+    }
+    embyPlayingAncestors_[itemId] = std::move(ids);
+}
+
 void App::embyToggleLibraryDetails(const std::string& libraryId) {
     const auto library = libraryId.empty() ? embyCurrentLibraryId() : libraryId;
     const auto type = embyLibraryType(library);

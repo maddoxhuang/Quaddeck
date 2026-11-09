@@ -32,6 +32,14 @@ constexpr float kPanelSlideMs = 200.0F;
 constexpr float kPanelMenuFadeMs = 110.0F;
 constexpr float kPanelMenuSlide = 6.0F;
 
+// The pointer is on the top row of its monitor, as far up as a pointer
+// pushed out of the way goes.
+bool pointerAtScreenTop(POINT cursor) {
+    MONITORINFO monitor{sizeof(monitor)};
+    return GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &monitor) &&
+           cursor.y <= monitor.rcMonitor.top;
+}
+
 // A control's tooltip: its name, then the first key of the action it does
 // as the viewer has the keys (App::withShortcut), then any further words.
 const wchar_t* barItemName(BarItem item) {
@@ -51,6 +59,7 @@ const wchar_t* barItemName(BarItem item) {
     case BarItem::SoloV5: return L"Solo V5 / back to grid";
     case BarItem::Sync: return L"Seek bars, offsets and repeat";
     case BarItem::Layout: return L"Arrangement of the videos";
+    case BarItem::Sets: return L"Video sets";
     case BarItem::Fullscreen: return L"Fullscreen";
     default: return L"";
     }
@@ -64,6 +73,7 @@ std::optional<KeyAction> barItemKey(BarItem item) {
     case BarItem::Audio: return KeyAction::Mute;
     case BarItem::Subtitles: return KeyAction::SubtitlesToggle;
     case BarItem::AllVideos: return KeyAction::AllVideos;
+    case BarItem::Sets: return KeyAction::VideoSets;
     case BarItem::Fullscreen: return KeyAction::Fullscreen;
     default:
         if (const int position = barItemSoloPosition(item); position >= 0) {
@@ -233,14 +243,30 @@ void App::updateAutoHideControls(POINT cursor) {
             ShowCursor(TRUE);
             cursorHidden_ = false;
         }
-    } else if ((!inside || GetForegroundWindow() != window_) && cursorHidden_) {
+    } else if ((!inside || !playerForeground()) && cursorHidden_) {
         ShowCursor(TRUE);
         cursorHidden_ = false;
     }
     const bool editing = controlDrag_ != ControlDrag::None || draggingPane_ ||
                          pressedBarItem_ >= 0 || GetCapture() != nullptr;
+    // A pointer resting on the caption's strip keeps it up in a window,
+    // beside its buttons as on them: the strip is what moves the window, the
+    // picture never does (paneDragHasTarget). Until 2026-11-07 it hid under a
+    // still pointer, and a press where it had been was the picture's. Beside
+    // the buttons only QuadDeck's own strip under the pointer holds it, not
+    // another window over it -- one QuadDeck owns neither, as a dialog or a
+    // settings list -- and not a pointer pushed against the top of the
+    // screen out of the way, as over a maximized window or one snapped to
+    // the top: that one, and fullscreen, where nothing moves the window,
+    // still let the strip and the bar go. A button lit under the pointer --
+    // lit only with QuadDeck's own window there (updateHoverControls) --
+    // holds them anywhere, the screen's top and fullscreen too, as before
+    // (hotCaptionItem_): Close in a maximized window's corner is where a
+    // pointer is flung to close it.
+    const bool onShownCaption = inside && !fullscreen_ && onCaptionStrip(local) && !pointerAtScreenTop(cursor) &&
+                                pointerOnPlayer(cursor, false);
     if (controlDrag_ != ControlDrag::None || pressedBarItem_ >= 0 || hotBarItem_ >= 0 ||
-        pressedCaptionItem_ >= 0 || hotCaptionItem_ >= 0) {
+        pressedCaptionItem_ >= 0 || hotCaptionItem_ >= 0 || onShownCaption) {
         controlsLastInteraction_ = now;
     }
     if (moved && !editing && (inInteractiveBand || inCaptionBand || onCapsuleSpot)) {
@@ -256,8 +282,17 @@ void App::updateAutoHideControls(POINT cursor) {
         setControlsVisible(false);
     }
     if (keepControls) setControlsVisible(true);
-    if (inside && GetForegroundWindow() == window_ && !cursorHidden_ && !editing &&
-        now - pointerLastMoved_ >= kPointerHideDelayMs) {
+    // The pointer holding the caption up in a window, below the screen's
+    // top, is shown with it, so what holds the controls is seen -- hidden
+    // already too, as when the strip comes up under a still pointer; until
+    // 2026-11-07 it went after its delay, nothing lit. One that holds them
+    // only by a lit button, at the screen's top or in fullscreen, still
+    // hides after its delay, the button staying lit.
+    if (onShownCaption && cursorHidden_) {
+        ShowCursor(TRUE);
+        cursorHidden_ = false;
+    } else if (inside && playerForeground() && !cursorHidden_ && !editing && !onShownCaption &&
+               now - pointerLastMoved_ >= kPointerHideDelayMs) {
         ShowCursor(FALSE);
         cursorHidden_ = true;
     }
@@ -328,14 +363,24 @@ bool App::bottomTimelineVisible() const {
                                                        : activeSeekMode() == SeekMode::Linked);
 }
 
-bool App::paneDragMovesWindow() const {
-    if (fullscreen_) return false;
+bool App::paneDragHasTarget() const {
     const auto active = activePanes();
     int visible = 0;
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
         if (active[pane] && chromeCells_[pane].width > 0.0F && chromeCells_[pane].height > 0.0F) ++visible;
     }
-    return visible <= 1;
+    return visible > 1;
+}
+
+// The widths of a pane's longest time, whole and short, at the scale drawn
+// now; the overlay keeps a string's width while it is asked for every
+// frame. Until the overlay can measure they are 0, and the layout gives the
+// time its full room.
+void App::measurePaneTime(std::size_t pane, const std::wstring& whole, const std::wstring& shortened) {
+    if (pane >= kMaxPanes) return;
+    const bool ready = overlay_.ready();
+    timeTextWidths_[pane] = ready ? overlay_.measureText(whole, OverlayTextStyle::Small, uiScale_) : 0.0F;
+    timeShortTextWidths_[pane] = ready ? overlay_.measureText(shortened, OverlayTextStyle::Small, uiScale_) : 0.0F;
 }
 
 void App::refreshChromeGeometry(const RECT& client) {
@@ -350,7 +395,7 @@ void App::refreshChromeGeometry(const RECT& client) {
                                     static_cast<float>(client.bottom), uiScale_, volumeOpen_,
                                     singleLoadedPane() >= 0, BarMetrics{}, bottomTimelineVisible(),
                                     severalPanesLoaded(), static_cast<float>(client.right) * 0.5F,
-                                    soloButtonCount());
+                                    soloButtonCount(), videoSetPlaying() >= 0, true);
     // Open file is always there; signed out there is no Open Emby beside
     // it: the hint's F6 and the menu still reach the sign-in page.
     emptyHint_ = emptyHintLayout(static_cast<float>(client.right), static_cast<float>(client.bottom), uiScale_,
@@ -377,6 +422,8 @@ void App::refreshChromeGeometry(const RECT& client) {
         }
         PaneChromeOptions options;
         options.pillTextWidth = pillWidths_[pane];
+        options.timeTextWidth = timeTextWidths_[pane];
+        options.timeShortTextWidth = timeShortTextWidths_[pane];
         // The only video wears no strip: its tag and its repeat, close and
         // Solo are the right-click menu's, its rail, time, volume, sound,
         // subtitles and pause the bar's. Sound and pause come back while
@@ -438,11 +485,17 @@ void App::updateHoverControls() {
     updateHoverControls(cursor);
 }
 
-// The window under the pointer is QuadDeck's or one it owns, such as a
-// dialog it opened.
-bool App::pointerOnPlayer(POINT cursor) const {
+// The window under the pointer is QuadDeck's -- its own or a child of it --
+// or, `owned`, one it owns too, such as a dialog it opened or a list the
+// settings window drops down.
+bool App::pointerOnPlayer(POINT cursor, bool owned) const {
     const HWND hit = WindowFromPoint(cursor);
-    return hit && GetAncestor(hit, GA_ROOTOWNER) == window_;
+    return hit && window_ && GetAncestor(hit, owned ? GA_ROOTOWNER : GA_ROOT) == window_;
+}
+
+// QuadDeck's window is the one in front, with the keys.
+bool App::playerForeground() const {
+    return window_ && GetForegroundWindow() == window_;
 }
 
 void App::updateHoverControls(POINT cursor) {
@@ -499,6 +552,19 @@ void App::updateHoverControls(POINT cursor) {
     // The sheet, when up, takes the pointer before anything under
     // it; only the caption's strip stands above its column.
     PanelHit panelHit = pointerInsidePlayer && !overCaption ? panelHitAt(local) : PanelHit{};
+    // A greyed row is the sheet's, lit by nothing, but its hint is shown.
+    if (panelHit.kind == PanelHitKind::Sheet && panelHit.row < 0) {
+        panelHit.row = panelGreyedRowAt(static_cast<float>(local.x), static_cast<float>(local.y), panelLayout_,
+                                        panelRows_);
+    }
+    // Behind another window -- another program's, a dialog QuadDeck opened,
+    // a settings list -- no row lights or shows its hint, as no bar button
+    // does; until 2026-11-07 one did. The sheet still takes the pointer
+    // there, so nothing beneath it lights either.
+    if (panelHit.kind != PanelHitKind::None && panelHit.kind != PanelHitKind::Outside &&
+        !pointerOnPlayer(cursor, false)) {
+        panelHit = PanelHit{PanelHitKind::Sheet, -1, -1};
+    }
     // An open menu holds the pointer: nothing under it lights, and the
     // button it hangs from stays lit until it closes.
     if (panelMenu_) {
@@ -558,11 +624,23 @@ void App::updateHoverControls(POINT cursor) {
     int hotPill = -1;
     int hotRail = -1;
     int hotVolume = -1;
-    const bool hotEmptyOpen = hit.kind == OverlayHitKind::EmptyOpen;
-    const bool hotEmptyEmby = hit.kind == OverlayHitKind::EmptyEmby;
+    // A bar or caption button lights from the pointer only with QuadDeck's
+    // own window under it: one behind another window -- another program's,
+    // a dialog QuadDeck opened, a settings list -- was lit there until
+    // 2026-11-07, and, lit, held the strip and the bar up for good. The
+    // button an open menu or the sync panel hangs from stays lit as before.
+    // The empty window's two buttons light the same way, which until then
+    // lit and named themselves behind another window.
+    const auto lightsFromPointer = [&] { return panelMenu_ || syncPanel_ || pointerOnPlayer(cursor, false); };
+    const bool hotEmptyOpen = hit.kind == OverlayHitKind::EmptyOpen && lightsFromPointer();
+    const bool hotEmptyEmby = hit.kind == OverlayHitKind::EmptyEmby && lightsFromPointer();
     switch (hit.kind) {
-    case OverlayHitKind::BarItem: hotBar = hit.item; break;
-    case OverlayHitKind::CaptionItem: hotCaption = hit.item; break;
+    case OverlayHitKind::BarItem:
+        if (lightsFromPointer()) hotBar = hit.item;
+        break;
+    case OverlayHitKind::CaptionItem:
+        if (lightsFromPointer()) hotCaption = hit.item;
+        break;
     case OverlayHitKind::PaneChip: hotChipPane = hit.pane; hotChip = hit.item; break;
     case OverlayHitKind::PanePill: hotPill = hit.pane; break;
     case OverlayHitKind::PaneVolume: hotVolume = hit.pane; break;
@@ -598,8 +676,9 @@ void App::updateHoverControls(POINT cursor) {
     const bool wantVolume = hotBar == static_cast<int>(BarItem::Audio) ||
                             hotBar == static_cast<int>(BarItem::Volume) ||
                             controlDrag_ == ControlDrag::Volume;
-    // A heard video's volume unfolds beside its speaker the same way. Its
-    // rail reaches the speaker, so the pointer crosses no gap between them.
+    // A heard video's volume unfolds beside its speaker the same way, or on
+    // a capsule stands on it. Its rail reaches the speaker, so the pointer
+    // crosses no gap between them.
     int wantPaneVolume = controlDrag_ == ControlDrag::PaneVolume ? dragPane_ : hotVolume;
     if (wantPaneVolume < 0 && hotChipPane >= 0 && hotChip == static_cast<int>(PaneChip::Audio) &&
         audioPaneEnabled(static_cast<std::size_t>(hotChipPane))) {
@@ -641,6 +720,9 @@ void App::updateHoverControls(POINT cursor) {
             hotBar != static_cast<int>(BarItem::Time)) {
             const auto item = static_cast<BarItem>(hotBar);
             tooltipText_ = barItemName(item);
+            if ((item == BarItem::Previous || item == BarItem::Next) && videoSetPlaying() >= 0) {
+                tooltipText_ = item == BarItem::Previous ? L"Previous video set" : L"Next video set";
+            }
             if (const auto key = barItemKey(item)) tooltipText_ = withShortcut(tooltipText_, *key);
             if (item == BarItem::Subtitles) tooltipText_ += kRightClickToChoose;
             if (singleLoadedPane() < 0 && anyPaneLoaded() &&
@@ -669,7 +751,8 @@ void App::updateHoverControls(POINT cursor) {
             tooltipAnchor_ = paneChrome_[static_cast<std::size_t>(hotChipPane)]
                 .chips[static_cast<std::size_t>(hotChip)];
         } else if (hotPill >= 0) {
-            tooltipText_ = L"Video menu  ·  drag the picture to swap panes";
+            // Alone (Solo) it has no pane beside it to swap with.
+            tooltipText_ = paneDragHasTarget() ? L"Video menu  ·  drag the picture to swap panes" : L"Video menu";
             tooltipAnchor_ = paneChrome_[static_cast<std::size_t>(hotPill)].pill;
         } else if (hotVolume >= 0) {
             tooltipText_ = L"This video's volume";
@@ -708,6 +791,7 @@ void App::buildOverlayScene() {
     scene.playing = playbackIntended();
     scene.muted = audio_.muted();
     scene.fullscreen = fullscreen_;
+    scene.videoSetPlaying = videoSetPlaying() >= 0;
     scene.seekable = duration_ > 0.0;
     scene.volume01 = std::clamp(audio_.volume() / maxMasterVolume(), 0.0F, 1.0F);
     scene.volumeOpen = volumeOpen_;
@@ -841,8 +925,13 @@ void App::buildOverlayScene() {
                     std::min(sourceDuration, shown + cache.aheadSeconds) / sourceDuration);
             }
             // The row's time, without its duration where the row is narrow.
-            out.timeText = (isActive ? L"" : L"wait  ") + formatTime(shown) +
+            const std::wstring waiting = isActive ? L"" : L"wait  ";
+            out.timeText = waiting + formatTime(shown) +
                 (paneChrome_[pane].timeShort ? L"" : L" / " + formatTime(sourceDuration));
+            // Its longest, the duration twice, for the room it takes on a
+            // capsule: the time never reads longer, so nothing after it moves.
+            const std::wstring whole = formatTime(sourceDuration);
+            measurePaneTime(pane, waiting + whole + L" / " + whole, waiting + whole);
             // Over the rail, where the pointer is on it or drags it: the time
             // there, and what a seek there reaches -- this video or all.
             const OverlayRect& rail = paneChrome_[pane].timeline;
@@ -859,6 +948,7 @@ void App::buildOverlayScene() {
             }
         } else {
             out.timeText = L"\x2014";
+            measurePaneTime(pane, out.timeText, out.timeText);
         }
         out.subtitlesOn = subtitlesSwitchedOn(static_cast<int>(pane));
         out.railHot = hotRailPane_ == static_cast<int>(pane);
@@ -1208,10 +1298,13 @@ void App::updateControlDrag(POINT local) {
     }
     case ControlDrag::PaneVolume:
         // Its volume rail goes the same way; the drag keeps its value
-        // rather than read zero.
+        // rather than read zero. On a capsule it stands on the speaker and
+        // is dragged up and down, along the rail drawn in its pill.
         if (dragPane_ >= 0 && paneChrome_[static_cast<std::size_t>(dragPane_)].volume.visible()) {
-            dragFraction_ = railFraction(
-                x, paneChrome_[static_cast<std::size_t>(dragPane_)].volume, kRailInset * uiScale_);
+            const PaneChromeLayout& chrome = paneChrome_[static_cast<std::size_t>(dragPane_)];
+            dragFraction_ = chrome.volumeUpright
+                ? verticalRailFraction(static_cast<float>(local.y), uprightVolumePill(chrome), kRailInset * uiScale_)
+                : railFraction(x, chrome.volume, kRailInset * uiScale_);
             audio_.setPaneVolume(static_cast<std::size_t>(dragPane_), dragFraction_);
         }
         break;
@@ -1304,6 +1397,7 @@ void App::activateBarItem(BarItem item) {
     case BarItem::AllVideos: showAllVideos(); break;
     case BarItem::Sync: toggleSyncPanel(); break;
     case BarItem::Layout: showLayoutMenu(); break;
+    case BarItem::Sets: toggleVideoSets(); break;
     case BarItem::Fullscreen: toggleFullscreen(); break;
     default:
         if (const int position = barItemSoloPosition(item); position >= 0) {
@@ -1598,6 +1692,8 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (sheetTakesPointer() &&
             !(embyBrowserDocked() && panelHitAt(local).kind == PanelHitKind::Outside)) {
             const PanelHit panelHit = panelHitAt(local);
+            // The viewer takes the list: a step it was following gives way.
+            listFollow_.reset();
             switch (panelHit.kind) {
             case PanelHitKind::Outside:
                 closeSettingsPanel();
@@ -1731,12 +1827,13 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             const int dx = std::abs(local.x - dragStart_.x);
             const int dy = std::abs(local.y - dragStart_.y);
             if (dx >= GetSystemMetrics(SM_CXDRAG) || dy >= GetSystemMetrics(SM_CYDRAG)) {
-                if (!draggingPane_ && paneDragMovesWindow()) {
-                    // No other pane to drop it on: as in PotPlayer, the
-                    // picture drags the window.
+                if (!draggingPane_ && !paneDragHasTarget()) {
+                    // No other pane to drop it on: the press comes to
+                    // nothing. The window moves by its caption strip, not
+                    // by the picture (until 2026-11-07 the picture moved
+                    // it here, as in PotPlayer).
                     dragSourcePane_ = -1;
                     if (GetCapture() == videoWindow_) ReleaseCapture();
-                    SendMessageW(window_, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0);
                     return 0;
                 }
                 draggingPane_ = true;
@@ -1901,10 +1998,15 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (sheetTakesPointer()) {
-            if (panelHitAt(local).kind != PanelHitKind::Outside) {
-                // On an Emby item: mark or unmark it. Anywhere else on the
-                // sheet a right-click does nothing.
-                showEmbyItemMenu(local);
+            const PanelHit panelHit = panelHitAt(local);
+            if (panelHit.kind != PanelHitKind::Outside) {
+                // On a text box: cut, copy, paste and the rest. On an Emby
+                // item: mark or unmark it. Anywhere else on the sheet a
+                // right-click does nothing.
+                const TextFieldId field =
+                    panelHit.kind == PanelHitKind::Field ? fieldAt(panelHit) : TextFieldId::None;
+                if (field != TextFieldId::None && fieldShown(field)) showFieldMenu(field, local);
+                else showEmbyItemMenu(local);
                 return 0;
             }
         }
@@ -1954,7 +2056,10 @@ LRESULT App::handleVideoMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         const OverlayHit hit = hitTestAt(local);
         if (hit.kind == OverlayHitKind::Video && hit.pane >= 0 &&
             sources_[static_cast<std::size_t>(hit.pane)]) {
-            toggleSolo(hit.pane);
+            // The only video has no others to leave: it plays and pauses,
+            // as Space does.
+            if (singleLoadedPane() == hit.pane) togglePlayback();
+            else toggleSolo(hit.pane);
         }
         return 0;
     }

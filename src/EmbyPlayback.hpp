@@ -39,6 +39,26 @@ inline int queueIndex(const PlaybackQueue& queue, const std::string& itemId) {
     return entryIndex(queue.items, itemId);
 }
 
+// An item deleted from the server leaves the queue, every entry of it. The
+// cursor stays on the entry it named; on a deleted one it goes to the entry
+// before, so Next is the one that followed.
+inline void removeFromQueue(PlaybackQueue& queue, const std::string& itemId) {
+    std::vector<Item> kept;
+    kept.reserve(queue.items.size());
+    int cursor = -1;
+    for (std::size_t i = 0; i < queue.items.size(); ++i) {
+        const bool current = queue.cursor >= 0 && i == static_cast<std::size_t>(queue.cursor);
+        if (queue.items[i].id == itemId) {
+            if (current) cursor = static_cast<int>(kept.size()) - 1;
+            continue;
+        }
+        if (current) cursor = static_cast<int>(kept.size());
+        kept.push_back(std::move(queue.items[i]));
+    }
+    queue.items = std::move(kept);
+    queue.cursor = cursor;
+}
+
 namespace playback_detail {
 
 inline bool sameEntry(const Item& a, const Item& b) {

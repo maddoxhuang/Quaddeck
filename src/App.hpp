@@ -21,6 +21,7 @@
 #include "SingleInstance.hpp"
 #include "SourceReaper.hpp"
 #include "SyncState.hpp"
+#include "VideoSets.hpp"
 #include "VideoSource.hpp"
 #include "WindowSurface.hpp"
 
@@ -65,7 +66,7 @@ enum class SeekStyle { Synchronized, Fast };
 // The one-line boxes typed into where the sheet draws them
 // (AppTextFields.cpp): the Emby browser's search and the Emby sign-in's
 // server, user and password.
-enum class TextFieldId { None, EmbySearch, EmbyServer, EmbyUser, EmbyPassword };
+enum class TextFieldId { None, EmbySearch, EmbyServer, EmbyUser, EmbyPassword, VideoSetName };
 
 class App {
 public:
@@ -117,6 +118,7 @@ private:
     // places moves once and not with every frame.
     float paneSubtitleClearance(std::size_t pane, bool settled = false) const;
     void refreshChromeGeometry(const RECT& client);
+    void measurePaneTime(std::size_t pane, const std::wstring& whole, const std::wstring& shortened);
     OverlayHit hitTestAt(POINT local) const;
     void buildOverlayScene();
     // PanelScroll drags the sheet's content; PanelScrollbar drags its thumb.
@@ -162,8 +164,10 @@ private:
     // band and the caption's drag area, HTCLIENT elsewhere and everywhere
     // in fullscreen.
     LRESULT frameHitTest(POINT screen) const;
-    // A video dragged where no pane can take it moves the window instead.
-    bool paneDragMovesWindow() const;
+    // A video dragged over the picture swaps with another shown beside it.
+    // With one shown -- the only video, or one alone (Solo) -- there is none
+    // to go to, and a drag on the picture does nothing.
+    bool paneDragHasTarget() const;
     // F5 and Settings in the menu: the settings window (AppSettingsWindow.cpp)
     // shown, or put away when it is up. The sheet beside it is left as it is.
     void toggleSettingsPanel();
@@ -216,11 +220,23 @@ private:
     // a search still reads (its items take no press until it is whole). An
     // item is marked in the colour of the first video playing it by place
     // on the screen: the place of each pane's file, -1 where it plays none.
+    // The folders they are in are marked the same way, so a page or a
+    // folder above shows which way the video is: an Emby item's folders by
+    // id (`embyHolding`), and for each pane the param of the local list's
+    // folder row its file is in, at any depth (`localHolding`, -1 none).
     struct ListRowMarks {
         std::map<std::string, int> embyPlaying;
+        std::map<std::string, int> embyHolding;
         PaneArray<int> localPlaying{};
+        PaneArray<int> localHolding{};
         PaneArray<int> localPositions{};
         bool embyItemsEnabled{true};
+        // The place an item is marked in: played, or a folder holding one.
+        int embyPlace(const std::string& id) const {
+            if (const auto played = embyPlaying.find(id); played != embyPlaying.end()) return played->second;
+            const auto holding = embyHolding.find(id);
+            return holding == embyHolding.end() ? -1 : holding->second;
+        }
     };
     std::vector<PanelRow> buildLocalRows(float sheetWidth, std::vector<PanelListRun>* runs = nullptr) const;
     void fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const;
@@ -293,6 +309,19 @@ private:
     void composePanelRows(std::vector<PanelRow> rows, std::vector<PanelListRun> runs);
     void fillListWindow(const ListRowMarks& marks);
     void placePanelScrollMarks(const ListRowMarks& marks);
+    // The list shown beside the video follows a step of the video `pane`
+    // to what it plays next: the step keys, the bar's Previous and Next,
+    // the media keys and the menu (`asked`), and the playback order at its
+    // end, which only while the row of the video it replaces is in view --
+    // a list scrolled away to look at something else stays there.
+    void followStepInList(std::size_t pane, bool asked);
+    // The rows of the list shown that show what `pane` plays: its own row
+    // or tile, each place an Emby item is listed, or else the rows of the
+    // folders it is in, as the scrollbar marks them.
+    std::vector<std::size_t> listRowsShowing(std::size_t pane) const;
+    // Once the followed video has changed and the list shows the new one,
+    // its row comes to the middle of the list (panelFollowScroll).
+    void applyListFollow();
     void refreshPanelGeometry(const RECT& client);
     // Whether the sheet takes the pointer: only while it is open and
     // drawn. Closing, it still fades out for a moment, but a click, a
@@ -380,6 +409,13 @@ private:
     void spinEditKey(WPARAM key, bool ctrl, bool shift);
     void spinEditCharacter(wchar_t character);
     void endSpinEdit(bool apply);
+    // What the keys and its right-click menu do to the number typed, as to
+    // a text box (textFieldApplyEdit), a paste taking its digits alone; and
+    // a right-click on it, which opens that menu (DropDown::editMenu), the
+    // number taking the typing first if it had not. True when the digits
+    // changed.
+    bool spinEditApply(TextFieldEdit edit);
+    void settingsWindowRightClick(POINT local);
     // A spin box's number as it stands, and set; nothing for a row that is
     // not one.
     std::optional<int> spinBoxValue(SettingId id) const;
@@ -423,7 +459,9 @@ private:
     // runs later with the command of the item picked, and not at all when
     // it closes unpicked.
     void openPanelMenu(PanelMenu menu, SettingId id, int part, int param, std::function<void(unsigned)> choose);
-    void openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose);
+    // With `keepTyping` the box typed into keeps the typing under it, as a
+    // box's own menu needs; any other menu takes it.
+    void openPanelMenuAt(PanelMenu menu, POINT local, std::function<void(unsigned)> choose, bool keepTyping = false);
     // What a menu over the picture hangs from: a bar button (a BarItem), a
     // pane's tag, a button on a pane's strip (`chip` of `chipPane`), or
     // else a point of the client -- a right-click's.
@@ -445,7 +483,7 @@ private:
     // colour.
     void openWindowMenu(PanelMenu menu, WindowMenuAnchor anchor, std::function<void(unsigned)> choose,
                         int pane = -1);
-    void takePointerAndKeysForPanelMenu();
+    void takePointerAndKeysForPanelMenu(bool keepTyping = false);
     void closePanelMenu();
     // Each frame and on opening: where it stands now, under its button; it
     // closes when the button has gone (another page, the sheet closed) or
@@ -549,6 +587,9 @@ private:
         std::uint64_t accountSerial{};
         std::uint64_t queueReorderSerial{};
         std::wstring title;
+        // What a video set keeps of the item, to find it again should the
+        // server give it another id; from the item's reply.
+        emby::RefindKey refind;
         std::int64_t runTimeTicks{};
         std::int64_t resumeTicks{};
         std::vector<emby::MediaStream> streams;
@@ -556,6 +597,8 @@ private:
         // The account's favorite mark as the item reply gave it, then as
         // QuadDeck set it; nothing until the item has come.
         std::optional<bool> favorite;
+        // The item's type as the item reply gave it, for the menu's Delete.
+        std::string itemType;
         bool photo{};
         bool autoplay{};
         bool startPlaying{};
@@ -637,6 +680,11 @@ private:
     // The browser's arrangement: view, order, filters. A change of order or
     // filter asks the server again; a change of view only redraws.
     void embySetView(int view);
+    // Whether the page is in a library with posters, and the view it is
+    // drawn in: where there are none the browser's Posters shows as
+    // thumbnails and stays the browser's choice.
+    bool embyPageHasPosters() const;
+    int embyShownView() const;
     void embySetSort(int sort);
     // A segment of the Sort row: on a playlist's page the first one is the
     // playlist's own order and the browser's orders follow it.
@@ -674,6 +722,9 @@ private:
     bool embyPageAcceptsFilters() const;
     // Lists and TV hierarchy pages are asked for page by page.
     bool embyPageIsPaged() const;
+    // The page shown is in the server's random order, drawn anew by every
+    // request from its start (emby::furtherPageLimit).
+    bool embyListInServerRandom() const;
     // What tells one page from another: the list being played remembers
     // the page it was taken from.
     static std::string embyPageKey(const EmbyPage& page);
@@ -757,8 +808,60 @@ private:
     // nothing elsewhere, and nothing the favorites page would not list.
     std::optional<emby::Item> embyItemAtHit(const PanelHit& hit) const;
     std::optional<emby::Item> embyItemAt(POINT local) const;
-    // A right-click on a browser item offers to mark or unmark it.
+    // A right-click on a browser item offers to mark or unmark it, and with
+    // deleting allowed, to delete it from the server.
     void showEmbyItemMenu(POINT local);
+    // Deleting a video from the server (AppEmbyDelete.cpp). Asked from the
+    // browser item's menu or the menu of a pane playing it, the server is
+    // asked first whether the item, its series and its season are favorites
+    // and which files go with it; a window of its own then asks to confirm,
+    // naming them, the player held still behind it (AppEmbyDeleteWindow.cpp).
+    // Confirmed, the marks are asked again and the video, closed where it
+    // plays, is deleted. One deletion at a time.
+    void embyAskDelete(const emby::Item& item);
+    void embyDeleteCheck(std::uint64_t serial);
+    void embyDeleteItemArrived(std::uint64_t serial, const EmbyClient::Response& response);
+    void embyDeleteGuardsArrived(std::uint64_t serial, const EmbyClient::Response& response);
+    void embyDeleteJudge(std::uint64_t serial, const std::vector<emby::Item>& guards);
+    bool embyDeleteCurrent(std::uint64_t serial) const;
+    void embyDeleteInfoArrived(std::uint64_t serial, const EmbyClient::Response& response);
+    void embyDeleteSend(std::uint64_t serial);
+    void embyDeleteArrived(std::uint64_t serial, const EmbyClient::Response& response);
+    void embyDeleteFailed(std::uint64_t serial, const std::wstring& reason, const EmbyClient::Response* response);
+    void embyConfirmDelete();
+    // Gives up a deletion not yet confirmed; embyDropDelete one confirmed too.
+    void embyCancelDelete();
+    void embyDropDelete();
+    void embyRemoveDeleted(const std::string& itemId);
+    bool embyDeleteAsking() const;
+    // What the window says: the item and its type, the pane it plays in,
+    // the files, the warning.
+    DeleteDialogContent embyDeleteDialogContent() const;
+    // The pane menu's entry for the video the pane plays, under its
+    // favorite entry: there only with deleting allowed and the item's type
+    // known to be one that is deleted, greyed for a favorite.
+    void appendEmbyDeleteMenu(PanelMenu& menu, std::size_t pane) const;
+    // The confirming window (AppEmbyDeleteWindow.cpp): owned by the player,
+    // a message box's size in the settings window's colours (DeleteDialog.hpp),
+    // as tall as what it says up to a share of the screen. While it is up the player is disabled, as under a
+    // Windows dialog; only Delete, pressed with the pointer, deletes. With no
+    // renderer it is state alone, as the settings window is.
+    bool openEmbyDeleteWindow();
+    void closeEmbyDeleteWindow();
+    bool createEmbyDeleteWindow();
+    static LRESULT CALLBACK embyDeleteWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handleEmbyDeleteWindowMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    void refreshEmbyDeleteWindowGeometry(const RECT& client);
+    void placeEmbyDeleteWindow();
+    void renderEmbyDeleteWindow();
+    DeleteDialogHit embyDeleteWindowHitAt(POINT local) const;
+    void embyDeleteWindowHover();
+    void embyDeleteWindowPress(POINT local);
+    void embyDeleteWindowMove(POINT local);
+    void embyDeleteWindowRelease(POINT local);
+    void embyDeleteWindowCancelPress();
+    void scrollEmbyDeleteWindow(int wheelDelta);
+    bool pointerOverEmbyDeleteWindow(POINT screen) const;
     // Something says the server has news for the page shown -- the window
     // came back to the front, a video was reported started or stopped --
     // so it is asked for again, in place, `delayMs` from now at the
@@ -783,7 +886,8 @@ private:
     // window's right edge brings the browser up, docked, and it goes again
     // once the pointer has left it for a moment. Called every hover update.
     void embyEdgeHover(POINT local, const RECT& client, bool inside);
-    bool pointerOnPlayer(POINT cursor) const;
+    bool pointerOnPlayer(POINT cursor, bool owned = true) const;
+    bool playerForeground() const;
     void embyActivateItem(int param);
     std::string embyCurrentLibraryId() const;
     std::string embyLibraryType(const std::string& libraryId) const;
@@ -798,6 +902,11 @@ private:
     void embyResolveShownLibraries();
     void embyLibraryLookupArrived(std::uint64_t account, const emby::Item& item,
                                   const EmbyClient::Response& response);
+    // The folders above each item being played, for the browser to mark on
+    // the pages above it: asked once per item while the browser is up.
+    void embyAskPlayingAncestors();
+    void embyPlayingAncestorsArrived(std::uint64_t account, const std::string& itemId,
+                                     const EmbyClient::Response& response);
     void embyToggleLibraryDetails(const std::string& libraryId = {});
     bool embyTryOpenDetails(const emby::Item& item, int param);
     void embyCloseDetails();
@@ -847,6 +956,88 @@ private:
     void embyAuthenticationArrived(std::uint64_t serial, const EmbyClient::Response& response);
     void embySignOut();
     void embySessionExpired();
+    // The video sets (AppVideoSets.cpp, VideoSets.hpp): QuadDeck's own list
+    // of decks to play whole, kept beside the settings file and shown as
+    // the sheet's face of its own. A set is the videos that played together
+    // by their places, and their arrangement. Playing one opens its videos
+    // from their start as a session used to open, keeping every setting;
+    // while its panes hold what it opened, Previous and Next step to the set
+    // before or after it, and its end -- every video ended -- gives way as
+    // the list's order says.
+    std::filesystem::path videoSetsPath() const;
+    void loadVideoSets();
+    void saveVideoSets();
+    // What plays as a set: each pane's video by its place, the arrangement.
+    std::optional<VideoSet> captureVideoSet() const;
+    void addVideoSet();
+    // The sheet on the video sets, or away from them when it is on them.
+    void toggleVideoSets();
+    void showVideoSets();
+    // A set asked for -- Play, Previous / Next, the end of the one before:
+    // `index` opened in place of the deck, or, when a video of it cannot
+    // play, the next that can, `step`'s way (videoSetSkipTo), never back to
+    // `from`. False, the deck unchanged, when none can.
+    bool playVideoSet(int index, int step = 1, int from = -1);
+    // `index`, or the first after it that can play; `skipped` says which
+    // were passed over and why, for the notice.
+    struct VideoSetSkip {
+        int index{};
+        std::wstring why;
+    };
+    bool openVideoSet(int index, std::vector<VideoSetSkip> skipped = {});
+    // The set playing: -1 when none does or its panes hold anything else.
+    int videoSetPlaying() const;
+    // A pane holding what the set playing opened in it.
+    bool videoSetPane(std::size_t pane) const;
+    // Its place and title, for the video the set playing opened in `pane`.
+    std::wstring videoSetPaneName(std::size_t pane) const;
+    // Previous / Next while a set plays.
+    void stepVideoSet(int step);
+    // A video of the set opened as `run` could not play: the set is skipped
+    // whole at the next frame (finishVideoSet), and the sheet says why.
+    // videoSetPaneFailed is false, and does nothing, for a pane of no set.
+    void videoSetFailed(std::uint64_t run, const std::wstring& path, const std::wstring& name,
+                        const std::wstring& reason);
+    bool videoSetPaneFailed(std::size_t pane, const std::wstring& reason);
+    // A source of the set playing that has failed: videoSetPaneFailed. Not
+    // while the device is lost, when every source may fail to be reopened.
+    void checkVideoSetSources();
+    void skipVideoSet();
+    // Each frame: a set with a failed video is skipped; the set playing has
+    // ended -- the shared timeline at its end, or each video of a deck of
+    // its own timelines held at its end -- and the list's order says what
+    // follows.
+    void finishVideoSet(bool sourceOpening, bool hasRepeatingSource);
+    bool videoSetPaneEnded(std::size_t pane) const;
+    // A .qdeck file's sets added to the list, from a dialog, Explorer or a drop.
+    void importVideoSets(const std::wstring& path);
+    void importVideoSetsDialog();
+    void exportVideoSetsDialog();
+    // Looks at every video of the list: a file is there or not, an Emby
+    // item is on the server signed in to or not, and one the server no
+    // longer has under its id is searched for (videoSetRefind).
+    void checkVideoSets();
+    void videoSetItemsArrived(std::uint64_t serial, std::uint64_t account,
+                              const std::vector<std::wstring>& paths, const EmbyClient::Response& response);
+    // An Emby item of the list looked for by what the set remembers of it;
+    // found, every set's video at `path` is the item found, and `done` is
+    // given its locator; not, `done` is given why.
+    void videoSetRefind(const std::wstring& path,
+                        std::function<void(const std::wstring& found, const std::wstring& problem)> done = {});
+    // An item the set playing opened that the server refused as unknown:
+    // its pane closes and the item is looked for, to open where it was;
+    // not found, the set is skipped.
+    bool videoSetItemGone(std::size_t pane, int status);
+    std::wstring videoSetProblem(const VideoSetVideo& video, bool* alert = nullptr) const;
+    std::vector<PanelRow> buildVideoSetRows() const;
+    void videoSetPanelAction(const PanelRow& row, int part);
+    void videoSetToolbarAction(int part);
+    void videoSetEntryMenu(int index);
+    void moveVideoSet(int index, int step);
+    void deleteVideoSet(int index);
+    void beginVideoSetRename(int index);
+    void commitVideoSetRename();
+    void cancelVideoSetRename();
     void embyFailure(const EmbyClient::Response& response);
     void embyOpenBrowser();
     void embyGoHome();
@@ -895,9 +1086,25 @@ private:
     // The typing's look on a box's row: its focus, composition and caret.
     void fieldDecorate(PanelRow& row, TextFieldId id) const;
     void fieldKey(WPARAM key, bool ctrl, bool shift);
+    // What the keys and a box's right-click menu both do to a box
+    // (textFieldApplyEdit): cut, copy and delete act on its selection --
+    // never a password's to copy, nothing of it leaves the box -- and paste
+    // goes in place of it, when there is text to paste. True when the text
+    // changed.
+    bool fieldApply(TextFieldId id, TextFieldEdit edit);
+    // A right-click on a box: its menu of those, as Windows' edit box has.
+    // The box takes or keeps the typing, its selection as it was.
+    void showFieldMenu(TextFieldId id, POINT local);
+    // Windows' clipboard: its text and text put on it, opened for `owner`
+    // (the player's window by default).
+    std::wstring fieldClipboard(HWND owner = nullptr) const;
+    void fieldSetClipboard(const std::wstring& text, HWND owner = nullptr);
     void fieldCharacter(wchar_t character);
     void fieldEdited(TextFieldId id);
     void fieldCancelComposition();
+    // The input method asked to finish its composition into the box, as
+    // Enter would: a right-click keeps what was typed (showFieldMenu).
+    void fieldCompleteComposition();
     const PanelRowGeometry* fieldGeometry(TextFieldId id, const PanelRow** row = nullptr) const;
     // The drawn caret's line in client pixels, measured as it is drawn.
     std::optional<OverlayRect> fieldCaretBox();
@@ -1290,6 +1497,12 @@ private:
     // After a display change: a chosen card that was not connected when the
     // device was built is used once it is back.
     void reclaimVideoAdapter();
+    // Whether the Decoder's choice is what a video opens with: not with WARP
+    // chosen or the device built on it, which has no hardware decoder; the
+    // Decoder row is greyed while it is not. The decoder a video opens with:
+    // decodeMode_ where the choice applies, else software.
+    bool decoderChoiceApplies() const;
+    DecodeMode sourceDecodeMode() const;
     // After a build: a notice when it ended on WARP though WARP was not
     // chosen, as no card made a device.
     void noticeWarpFallback();
@@ -1391,12 +1604,8 @@ private:
     // for a pane or, at -1, for none.
     void showContextMenu(int pane, WindowMenuAnchor anchor);
     void handleContextCommand(unsigned command, int pane);
-    void saveSessionDialog();
-    void loadSessionDialog();
     void saveStyleDialog();
     void loadStyleDialog();
-    bool saveSession(const std::wstring& path);
-    bool loadSession(const std::wstring& path);
     bool saveStyle(const std::wstring& path);
     bool loadStyle(const std::wstring& path);
     SessionState captureSession() const;
@@ -1492,6 +1701,38 @@ private:
     // So do subtitle streams: the first time one inside a file is asked
     // for, the server takes up to half a minute to pull it out.
     EmbyClient embySubtitles_;
+    // The video sets (AppVideoSets.cpp). The face is the sheet's while this
+    // is set and the browser is not; opening the sheet afresh clears it.
+    VideoSetList videoSets_;
+    // The file was there and could not be read: nothing is written over it.
+    bool videoSetsReadOnly_{};
+    bool videoSetsOpen_{};
+    float videoSetsScroll_{};
+    // The set last played, and what it opened in each pane (empty where it
+    // has fewer videos); videoSetPlaying says whether it still plays.
+    int videoSetIndex_{-1};
+    PaneArray<std::wstring> videoSetPanePaths_{};
+    // Each set opened is a run of its own. The run that failed, and why
+    // when its skip is still to come; the sets tried since one was asked
+    // for, and the way the list goes past those that cannot play.
+    std::uint64_t videoSetRun_{};
+    std::uint64_t videoSetFailedRun_{};
+    std::wstring videoSetFailure_;
+    std::vector<bool> videoSetTried_;
+    int videoSetDirection_{1};
+    // Why a video could not play the last time a set opened it, by its path.
+    std::unordered_map<std::wstring, std::wstring> videoSetFailures_;
+    // The set whose name is being typed, and the box.
+    int videoSetRenaming_{-1};
+    TextFieldState videoSetNameField_;
+    // What checkVideoSets and playing found of each video, by its path.
+    enum class VideoSetState { Checking, Fine, Found, FileMissing, Searching, NotFound, Unreachable };
+    struct VideoSetCheck {
+        VideoSetState state{VideoSetState::Checking};
+        std::wstring detail;
+    };
+    std::unordered_map<std::wstring, VideoSetCheck> videoSetChecks_;
+    std::uint64_t videoSetCheckSerial_{};
     ThumbnailCache thumbnails_;
     std::set<std::string> embyImagesInFlight_;
     // A local file's picture is made by the one shell worker
@@ -1510,6 +1751,11 @@ private:
     // Titles whose library a lookup could not prove: not asked again until
     // the account changes or the page is refreshed by hand.
     std::set<std::string> embyLibraryUnknown_;
+    // Each item being played and the folders above it as the server named
+    // them (its season, series, folders and library); none for an answer
+    // that failed, not asked again while a pane plays the item.
+    std::unordered_map<std::string, std::vector<std::string>> embyPlayingAncestors_;
+    std::set<std::string> embyPlayingAncestorsAsking_;
     bool embyBrowserOpen_{};
     std::vector<EmbyPage> embyPages_;
     // Explicit picture clicks choose a playback destination, never hover or
@@ -1613,6 +1859,11 @@ private:
     std::vector<emby::Item> embyResume_;
     std::vector<emby::Item> embyViews_;
     int embyTotal_{};
+    // How many the latest list request asked for, and how many the request
+    // the list shown starts with asked for: a further page of the server's
+    // random order asks that many again (emby::furtherPageLimit).
+    int embyListAskedWith_{};
+    int embyListDrawnWith_{};
     bool embyLoading_{};
     // The next page of the list shown is on its way; said at the list's
     // end, not above it, so the rows being looked at do not move.
@@ -1648,6 +1899,58 @@ private:
     bool embyShapeQuestionOut_{};
     // The items whose favorite change is on its way to the server.
     std::unordered_set<std::string> embyFavoriteAsking_;
+    // F5 > General: whether the item and pane menus offer to delete from the
+    // server.
+    bool embyDeleteEnabled_{};
+    // The one deletion under way: checked before the window asks (Checking),
+    // asked (Asking, the window up), or confirmed and checked again before
+    // and while it is sent (Deleting). Replies carry the serial and are
+    // dropped once it has moved on: cancelled, or another account.
+    struct EmbyPendingDelete {
+        enum class Stage { Checking, Asking, Deleting };
+        Stage stage{Stage::Checking};
+        std::uint64_t serial{};
+        std::uint64_t accountSerial{};
+        emby::Item item;
+        // The server's copy of the item, and the files it says go with it.
+        emby::Item fresh;
+        std::vector<std::string> paths;
+    };
+    std::optional<EmbyPendingDelete> embyPendingDelete_;
+    std::uint64_t embyDeleteSerial_{};
+    // The delete entry a pane's menu offered, kept for its command as the
+    // favorite entry's is.
+    struct EmbyDeleteOffer {
+        std::uint64_t account{};
+        int pane{-1};
+        emby::Item item;
+    };
+    mutable std::optional<EmbyDeleteOffer> embyDeleteMenuOffer_;
+    // The confirming window's state: what it says, where, and the pointer's.
+    struct EmbyDeleteWindow {
+        HWND window{};
+        bool open{};
+        // Its own DPI over 96.
+        float scale{1.0F};
+        DeleteDialogContent content;
+        DeleteDialogMeasures measures;
+        DeleteDialogLayout layout{};
+        // How far its list of files is scrolled.
+        float scroll{};
+        DeleteDialogHit hot{DeleteDialogHit::None};
+        DeleteDialogHit pressed{DeleteDialogHit::None};
+        // The list's thumb held, and how far below its top.
+        bool thumbDrag{};
+        float thumbGrab{};
+        POINT pointer{-1, -1};
+        bool pointerInside{};
+        bool trackingLeave{};
+        bool painting{};
+        Overlay overlay;
+        OverlayDeleteDialogScene scene;
+        WindowSurface surface;
+    };
+    EmbyDeleteWindow embyDeleteWindow_;
     // The favorite entry a pane's menu offered, kept for the command it
     // returns as the subtitle entries are: the pane can go on to its next
     // video under an open menu.
@@ -1671,6 +1974,9 @@ private:
     std::wstring fieldComposition_;
     std::size_t fieldCompositionCaret_{};
     unsigned long long fieldCaretTick_{};
+    // The first half of a surrogate pair typed, waiting for its second
+    // (fieldCharacter); none: 0.
+    wchar_t fieldHighSurrogate_{};
     bool fieldSystemCaret_{};
     bool fieldImeOff_{};
     bool keyboardFocus_{};
@@ -1728,6 +2034,7 @@ private:
         int audioPane{-1};
         std::uint64_t audioSerial{};
         std::optional<EmbyFavoriteOffer> favorite;
+        std::optional<EmbyDeleteOffer> deletion;
     };
     PaneMenuSnapshot takePaneMenuSnapshot();
     void clearPaneMenuSnapshot();
@@ -1741,7 +2048,7 @@ private:
     std::optional<KeyCapture> keyCapture_;
     // The last left press was a drop-down's: the second of two quick clicks,
     // which the window class makes a double-click, is a press too, not the
-    // picture's double-click (Solo) once the first has closed the menu.
+    // picture's double-click once the first has closed the menu.
     bool menuTookPress_{};
     // Space chose in a drop-down: the character TranslateMessage queued for
     // it is dropped, not typed into a box the choice focused. Cleared at the
@@ -1866,6 +2173,11 @@ private:
     PaneArray<RectF> chromeCells_{};
     PaneArray<std::wstring> pillLabels_{};
     PaneArray<float> pillWidths_{-1.0F, -1.0F, -1.0F, -1.0F, -1.0F};
+    // The widths of each pane's longest time text, whole and short, as the
+    // scene last measured them: the room the time takes on a capsule
+    // (measurePaneTime).
+    PaneArray<float> timeTextWidths_{};
+    PaneArray<float> timeShortTextWidths_{};
     // A pane's tag fades with paneChromeAlpha_, the rest of its strip --
     // rail, buttons, time -- with paneTimelineAlpha_.
     PaneArray<float> paneChromeAlpha_{};
@@ -1911,6 +2223,16 @@ private:
     // The videos being played, marked on the scrollbar where the list shows
     // them; laid out with it.
     std::vector<PanelScrollMark> panelScrollMarks_;
+    // A step the list follows (followStepInList): the video's pane, what it
+    // played when the step was asked for -- the change can wait for a folder
+    // or the server -- and when the follow is given up. A press on the sheet,
+    // the wheel over it or closing it drops it at once.
+    struct ListFollow {
+        std::size_t pane{};
+        std::wstring from;
+        ULONGLONG until{};
+    };
+    std::optional<ListFollow> listFollow_;
     PanelHitKind hotPanelKind_{PanelHitKind::None};
     int hotPanelRow_{-1};
     int hotPanelPart_{-1};
@@ -2066,10 +2388,15 @@ private:
         // coordinates, the card that window's whole client; the line lit and
         // the one pressed; and where the list window stands, in screen
         // pixels (in this window's client with no window).
+        // `editMenu`: not a list but the right-click menu of the spin box
+        // being typed (spinEdit), its lines fixed when it opened, hung from
+        // the pointer at `at` in this window's client.
         struct DropDown {
             int row{-1};
             SettingId id{SettingId::None};
             int param{-1};
+            bool editMenu{};
+            POINT at{};
             std::vector<PanelMenuItem> items;
             PanelMenuLayout layout{};
             int highlighted{-1};
@@ -2115,7 +2442,6 @@ private:
     // The custom shader file is still the choice but could not be read at the
     // last start or device rebuild; the preset runs until it can be.
     bool customShaderUnloaded_{};
-    std::wstring sessionPath_;
     WINDOWPLACEMENT previousPlacement_{sizeof(WINDOWPLACEMENT)};
     double duration_{};
     SeekBarrier seekBarrier_;
