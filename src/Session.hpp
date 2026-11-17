@@ -61,7 +61,10 @@ struct StyleState {
     bool controlsPinned{};
     std::wstring customShaderPath;
     SmartVibranceSettings smartVibrance;
+    // Each pane's view while it shares the window, and the one view of
+    // whichever video is alone in it.
     PaneArray<PaneView> paneViews{};
+    PaneView aloneView{};
 };
 
 struct AppSettings {
@@ -99,7 +102,7 @@ struct AppSettings {
 
 inline bool writeStyle(std::wostream& output, const StyleState& state) {
     const auto vibrance = clampSmartVibranceSettings(state.smartVibrance);
-    output << L"QSTYLE 3\n";
+    output << L"QSTYLE 4\n";
     output << L"settings " << static_cast<int>(state.layout) << L' '
            << state.expandedPane << L' ' << static_cast<int>(state.shader) << L' '
            << state.controlsPinned << L'\n';
@@ -112,6 +115,8 @@ inline bool writeStyle(std::wostream& output, const StyleState& state) {
                << static_cast<int>(state.paneViews[index].mode) << L' '
                << state.paneViews[index].zoom << L'\n';
     }
+    // 4: the view of a video alone in the window, after the panes'.
+    output << L"alone " << static_cast<int>(state.aloneView.mode) << L' ' << state.aloneView.zoom << L'\n';
     return output.good();
 }
 
@@ -121,7 +126,7 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
     int layout{};
     int shader{};
     if (!(input >> key >> version) || key != L"QSTYLE" ||
-        (version < 1 || version > 3)) return false;
+        (version < 1 || version > 4)) return false;
     if (!(input >> key) || key != L"settings" ||
         !(input >> layout >> state.expandedPane >> shader >> state.controlsPinned)) return false;
     if (!(input >> key) || key != L"shaderpath" ||
@@ -152,6 +157,17 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
         state.paneViews[index].mode = static_cast<ViewMode>(std::clamp(mode, 0, 2));
         state.paneViews[index].zoom = std::clamp(zoom, 1.0F, 4.0F);
     }
+    // Before 4 a video alone wore its pane's view; the first pane's, where
+    // a lone video opens, stands for it, so nothing alone changes on reading.
+    if (version < 4) {
+        state.aloneView = state.paneViews[0];
+        return true;
+    }
+    int mode{};
+    float zoom{};
+    if (!(input >> key) || key != L"alone" || !(input >> mode >> zoom) || !std::isfinite(zoom)) return false;
+    state.aloneView.mode = static_cast<ViewMode>(std::clamp(mode, 0, 2));
+    state.aloneView.zoom = std::clamp(zoom, 1.0F, 4.0F);
     return true;
 }
 
@@ -173,7 +189,15 @@ inline bool readStyle(std::wistream& input, StyleState& state) {
 // 22 adds the browser's favorites filter to the `embybrowser` line.
 // 23 adds the `embydelete` line: whether videos may be deleted from the
 // Emby server.
-inline constexpr int kAppSettingsVersion = 23;
+// 24 is 23 with the Solo step keys (the next and the previous video alone)
+// among the actions, for the reason 17 was 16 with the arrangements'.
+// 25 carries a QSTYLE 4, which adds the `alone` line: the view of a video
+// alone in the window, apart from each pane's among others. A 24 build
+// would refuse the QSTYLE 4 inside a 24, copy the file aside and save its
+// defaults; a newer version it leaves alone.
+// 26 adds to the `embybrowser` line whether a person's page opens
+// information pages.
+inline constexpr int kAppSettingsVersion = 26;
 
 // The keys of the actions whose keys differ from their defaults, as
 // keyBindingsFrom takes them; nothing for keys that are not a table.
@@ -222,7 +246,8 @@ inline bool writeAppSettings(std::wostream& output, const AppSettings& state) {
            << state.rtxVideo.rtxHdr << L'\n';
     const auto browser = clampEmbyBrowserPrefs(state.embyBrowser);
     output << L"embybrowser " << browser.view << L' ' << browser.sort << L' ' << browser.descending
-           << L' ' << browser.unplayed << L' ' << browser.flat << L' ' << browser.favorites << L'\n';
+           << L' ' << browser.unplayed << L' ' << browser.flat << L' ' << browser.favorites
+           << L' ' << browser.personDetails << L'\n';
     output << L"playorder " << static_cast<int>(state.playOrder) << L'\n';
     output << L"keyframeseek " << state.keyframeSeek << L'\n';
     const auto subtitles = clampSubtitleSettings(state.subtitles);
@@ -337,6 +362,9 @@ inline bool readAppSettings(std::wistream& input, AppSettings& state) {
         return false;
     // Older files predate the favorites filter; the whole list shows.
     if (version >= 22 && !(input >> state.embyBrowser.favorites)) return false;
+    // Older files predate the person page's switch; its titles open their
+    // information pages as their libraries say.
+    if (version >= 26 && !(input >> state.embyBrowser.personDetails)) return false;
     state.embyBrowser = clampEmbyBrowserPrefs(state.embyBrowser);
     // Older files predate the playback order; a single video plays on in order.
     if (version >= 9) {

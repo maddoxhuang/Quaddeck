@@ -76,8 +76,9 @@ enum class KeyAction : std::uint8_t {
     SubtitleBigger, SubtitleSmaller, SubtitleRaise, SubtitleLower, SubtitlePlaceReset,
     // In LayoutMode's order, as the Arrangement menu lists them.
     ArrangeAutomatic, ArrangeOneRow, ArrangeTwoRows, ArrangeOneColumn, ArrangePortrait, ArrangeLandscape,
-    // One video alone (Solo), by its place on the screen; every video again.
-    SoloV1, SoloV2, SoloV3, SoloV4, SoloV5, AllVideos,
+    // One video alone (Solo), by its place on the screen; every video again;
+    // the next and the previous video alone, round from the last to the first.
+    SoloV1, SoloV2, SoloV3, SoloV4, SoloV5, AllVideos, SoloNext, SoloPrevious,
     BrightnessDown, BrightnessUp, ContrastDown, ContrastUp, SaturationDown, SaturationUp, HueDown, HueUp,
     ColorReset,
     Fullscreen, Back, Settings, PinBar,
@@ -226,6 +227,11 @@ inline constexpr std::array<KeyActionInfo, kKeyActionCount> kActions{{
     {KeyAction::SoloV4, "solo-4", L"Solo V4 on / off", KeyGroup::Arrangement, false, {shift('4')}},
     {KeyAction::SoloV5, "solo-5", L"Solo V5 on / off", KeyGroup::Arrangement, false, {shift('5')}},
     {KeyAction::AllVideos, "all-videos", L"All videos", KeyGroup::Arrangement, false, {shift('0')}},
+    // Tab goes on to the next video alone, Shift+Tab back to the previous,
+    // from the grid to the first or the last; neither comes back to the grid.
+    {KeyAction::SoloNext, "solo-next", L"Solo the next video", KeyGroup::Arrangement, false, {plain(kVkTab)}},
+    {KeyAction::SoloPrevious, "solo-previous", L"Solo the previous video", KeyGroup::Arrangement, false,
+     {shift(kVkTab)}},
     // PotPlayer's colour keys: Q sets every control back, W and E the
     // brightness, R and T the contrast, Y and U the saturation, I and O the
     // hue. Its R, U and O are Restart's, the bar's and Open's here, so
@@ -292,6 +298,20 @@ inline std::optional<std::size_t> keyActionSoloPosition(KeyAction action) {
     const auto first = static_cast<std::size_t>(KeyAction::SoloV1);
     if (index < first || index - first >= kSoloKeyCount) return std::nullopt;
     return index - first;
+}
+
+// The place the Solo step keys show alone next among `count` loaded videos,
+// `direction` 1 forward and -1 back: from the grid -- or from a video alone
+// at no place among them -- the first going forward and the last going back;
+// from one alone, its neighbour, round from the last to the first and back.
+// The grid is never a step: Esc and All videos are the way back to it. None
+// for fewer than two videos.
+inline std::optional<std::size_t> soloStepPosition(std::optional<std::size_t> alone, std::size_t count,
+                                                   int direction) {
+    if (count < 2 || direction == 0) return std::nullopt;
+    const bool forward = direction > 0;
+    if (!alone || *alone >= count) return forward ? 0 : count - 1;
+    return forward ? (*alone + 1) % count : (*alone + count - 1) % count;
 }
 
 inline std::optional<KeyAction> keyActionNamed(std::string_view id) {

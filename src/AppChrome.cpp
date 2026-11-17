@@ -1140,6 +1140,16 @@ void App::showAllVideos() {
     showNotice(L"Back to grid");
 }
 
+void App::stepSoloVideo(int direction) {
+    std::optional<std::size_t> alone;
+    if (soloPane_ >= 0 && soloPane_ < static_cast<int>(kMaxPanes)) {
+        alone = positionForPane(static_cast<std::size_t>(soloPane_));
+    }
+    // A step's place is never the one alone, so soloVideoAt never turns it
+    // back into the grid.
+    if (const auto position = soloStepPosition(alone, soloButtonCount(), direction)) soloVideoAt(*position);
+}
+
 // ---------------------------------------------------------------------------
 // Seeking from the drawn rails
 

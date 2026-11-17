@@ -28,7 +28,14 @@
 namespace quaddeck {
 
 namespace {
+// QUARTER_TURNS, 1 to 3, makes the quad for a picture stored on its side or
+// on its head: the pane's coordinate is taken within the upright picture and
+// then turned into the texture, which holds the picture as it is stored. A
+// quarter turn clockwise shows the texture's left edge along the top.
 constexpr char kVertexShader[] = R"(
+#ifndef QUARTER_TURNS
+#define QUARTER_TURNS 0
+#endif
 cbuffer UvTransform : register(b0) { float4 uvTransform; };
 struct VSOut {
     float4 position : SV_POSITION;
@@ -48,7 +55,18 @@ VSOut main(uint id : SV_VertexID) {
     };
     VSOut output;
     output.position = float4(positions[id], 0.0, 1.0);
+#if QUARTER_TURNS == 1
+    float2 upright = coords[id] * uvTransform.xy + uvTransform.zw;
+    output.uv0 = float2(upright.y, 1.0 - upright.x);
+#elif QUARTER_TURNS == 2
+    float2 upright = coords[id] * uvTransform.xy + uvTransform.zw;
+    output.uv0 = 1.0 - upright;
+#elif QUARTER_TURNS == 3
+    float2 upright = coords[id] * uvTransform.xy + uvTransform.zw;
+    output.uv0 = float2(1.0 - upright.y, upright.x);
+#else
     output.uv0 = coords[id] * uvTransform.xy + uvTransform.zw;
+#endif
     // PotPlayer/MPC shaders found in the wild do not consistently use the
     // same TEXCOORD index. Supply the transformed video coordinate on the
     // common legacy indices so an absent semantic cannot collapse sampling
@@ -493,6 +511,7 @@ void D3DRenderer::releaseDeviceResources() {
     pixelParamsBuffer_.Reset();
     uvTransformBuffer_.Reset();
     vertexShader_.Reset();
+    for (auto& shader : turnedVertexShaders_) shader.Reset();
     swapChain_.Reset();
     videoContext1_.Reset();
     videoContext_.Reset();
@@ -1194,6 +1213,25 @@ bool D3DRenderer::createPipeline() {
     if (FAILED(hr)) {
         setError("CreateVertexShader", hr);
         return false;
+    }
+    // The same quad for a picture a quarter, a half and three quarters of a
+    // turn from upright as it is stored.
+    for (std::size_t turns = 1; turns <= turnedVertexShaders_.size(); ++turns) {
+        const std::string count = std::to_string(turns);
+        const D3D_SHADER_MACRO macros[] = {{"QUARTER_TURNS", count.c_str()}, {nullptr, nullptr}};
+        Microsoft::WRL::ComPtr<ID3DBlob> turnedBlob;
+        hr = D3DCompile(kVertexShader, sizeof(kVertexShader) - 1, "QuadDeckVS", macros, nullptr,
+                        "main", "vs_4_0", D3DCOMPILE_ENABLE_STRICTNESS, 0, &turnedBlob, nullptr);
+        if (FAILED(hr)) {
+            setError("D3DCompile(turned vertex)", hr);
+            return false;
+        }
+        hr = device_->CreateVertexShader(turnedBlob->GetBufferPointer(), turnedBlob->GetBufferSize(), nullptr,
+                                         &turnedVertexShaders_[turns - 1]);
+        if (FAILED(hr)) {
+            setError("CreateVertexShader(turned)", hr);
+            return false;
+        }
     }
     D3D11_BUFFER_DESC transformDescription{};
     transformDescription.ByteWidth = sizeof(float) * 4;
@@ -2176,9 +2214,15 @@ void D3DRenderer::render(
             softwareNv12Eligible(*frame->ownerFrame);
         const int sourceWidth = softwareVideoProcessor ? frame->ownerFrame->width : frame->width;
         const int sourceHeight = softwareVideoProcessor ? frame->ownerFrame->height : frame->height;
+        // A picture stored on its side or on its head stays so in every
+        // texture; only the pane's own draw turns it. One on its side fills
+        // the cell the other way round.
+        const int quarterTurns = frame->quarterTurns & 3;
+        const bool sideways = turnedSideways(quarterTurns);
         const auto requested = presentationSize(
             sourceWidth, sourceHeight,
-            cells[index].width * paneZoom, cells[index].height * paneZoom,
+            (sideways ? cells[index].height : cells[index].width) * paneZoom,
+            (sideways ? cells[index].width : cells[index].height) * paneZoom,
             3840, 8, magnifyForSuperResolution && (frame->hardware || softwareVideoProcessor));
         if (slots_[index].serial != frame->serial ||
             ((frame->hardware || softwareVideoProcessor) && (slots_[index].outputWidth != requested.width ||
@@ -2221,7 +2265,7 @@ void D3DRenderer::render(
         // pane and the viewport and the crop stretch it there.
         const PanePictureGeometry geometry = panePictureGeometry(
             cells[index], slots_[index].outputWidth, slots_[index].outputHeight,
-            static_cast<float>(frame->pixelAspect), views[index].mode, views[index].zoom);
+            static_cast<float>(frame->pixelAspect), views[index].mode, views[index].zoom, quarterTurns);
         const RectF& fitted = geometry.viewport;
         const float scaleX = geometry.scaleX;
         const float scaleY = geometry.scaleY;
@@ -2241,7 +2285,9 @@ void D3DRenderer::render(
         // the other kernels, never widened, would only make shimmer.
         const bool colorPass = !hdrOutput_ && !videoColorNeutral(videoOutput_);
         VideoScaling scaling = videoOutput_.scaling;
-        if (width * scaleX > viewport.Width * 1.01F || height * scaleY > viewport.Height * 1.01F) {
+        // Across the viewport lie the texture's rows when it is on its side.
+        if ((sideways ? height : width) * scaleX > viewport.Width * 1.01F ||
+            (sideways ? width : height) * scaleY > viewport.Height * 1.01F) {
             scaling = VideoScaling::Bilinear;
         }
         bool outputPass = colorPass || scaling != VideoScaling::Bilinear;
@@ -2256,6 +2302,8 @@ void D3DRenderer::render(
         // presentation target and the pane's state for this pane and every
         // following pane.
         context_->OMSetRenderTargets(1, renderTarget_.GetAddressOf(), nullptr);
+        context_->VSSetShader(quarterTurns != 0 ? turnedVertexShaders_[static_cast<std::size_t>(quarterTurns) - 1].Get()
+                                                : vertexShader_.Get(), nullptr, 0);
         context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, transform, 0, 0);
         context_->RSSetViewports(1, &viewport);
         if (outputPass) {

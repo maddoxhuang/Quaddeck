@@ -315,20 +315,25 @@ std::vector<PanelRow> App::buildSettingsTabRows() const {
             choice(SettingId::Layout, L"Arrangement",
                    std::move(arrangements), static_cast<int>(layoutMode_));
         }
+        // The views in use: a video alone in the window has the one view of
+        // a video alone, and the rows show and set that alone (the others
+        // are not on screen); else the loaded videos' own.
+        const int alone = shownAlonePane();
         std::size_t reference = 0;
         for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
             if (paneLogicallyLoaded(pane)) { reference = pane; break; }
         }
+        const PaneView& shown = alone >= 0 ? aloneView_ : paneViews_[reference];
         bool commonViewMode = true, commonZoom = true;
-        for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
+        for (std::size_t pane = 0; alone < 0 && pane < kMaxPanes; ++pane) {
             if (!paneLogicallyLoaded(pane)) continue;
-            commonViewMode = commonViewMode && paneViews_[pane].mode == paneViews_[reference].mode;
-            commonZoom = commonZoom && std::abs(paneViews_[pane].zoom - paneViews_[reference].zoom) < 0.001F;
+            commonViewMode = commonViewMode && paneViews_[pane].mode == shown.mode;
+            commonZoom = commonZoom && std::abs(paneViews_[pane].zoom - shown.zoom) < 0.001F;
         }
         choice(SettingId::AllView, L"All videos", {L"Fit", L"Fill / crop", L"Stretch"},
-               commonViewMode ? static_cast<int>(paneViews_[reference].mode) : -1);
+               commonViewMode ? static_cast<int>(shown.mode) : -1);
         std::wostringstream zoom;
-        if (commonZoom) zoom << std::fixed << std::setprecision(2) << paneViews_[reference].zoom << L"×";
+        if (commonZoom) zoom << std::fixed << std::setprecision(2) << shown.zoom << L"×";
         else zoom << L"Mixed";
         buttons(SettingId::ZoomAll, -1, L"Zoom all", {L"−0.25×", L"1×", L"+0.25×"}, zoom.str());
 
@@ -1346,18 +1351,24 @@ void App::activatePanelRow(const PanelRow& row, const PanelHit& hit, std::option
         if (hit.part >= 0 && hit.part <= 5) chooseLayout(static_cast<LayoutMode>(hit.part));
         break;
     case SettingId::AllView:
+        // Alone in the window, the video alone's view; else every pane's
+        // own. Neither touches the other.
         if (hit.part >= 0 && hit.part <= 2) {
-            for (auto& view : paneViews_) view.mode = static_cast<ViewMode>(hit.part);
+            if (shownAlonePane() >= 0) aloneView_.mode = static_cast<ViewMode>(hit.part);
+            else for (auto& view : paneViews_) view.mode = static_cast<ViewMode>(hit.part);
             showNotice(L"All videos  " + std::wstring(viewModeName(static_cast<ViewMode>(hit.part))));
         }
         break;
-    case SettingId::ZoomAll:
-        for (auto& view : paneViews_) {
+    case SettingId::ZoomAll: {
+        const auto step = [&](PaneView& view) {
             if (hit.part == 0) view.zoom = std::max(1.0F, view.zoom - 0.25F);
             else if (hit.part == 2) view.zoom = std::min(4.0F, view.zoom + 0.25F);
             else view.zoom = 1.0F;
-        }
+        };
+        if (shownAlonePane() >= 0) step(aloneView_);
+        else for (auto& view : paneViews_) step(view);
         break;
+    }
     case SettingId::Shader:
         if (hit.part >= 0 && hit.part <= 4) {
             if (applyShaderPreset(static_cast<ShaderPreset>(hit.part))) {

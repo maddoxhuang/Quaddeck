@@ -12,6 +12,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <utility>
 
 namespace quaddeck {
 
@@ -98,6 +99,9 @@ struct EmbyBrowserPrefs {
     bool unplayed{};
     bool flat{};         // every video under a folder, subfolders flattened
     bool favorites{};    // only the account's favorites under the page
+    // A title chosen on a person's page opens its information page, where
+    // its library has them; off, it plays at once whatever its library says.
+    bool personDetails{true};
     friend bool operator==(const EmbyBrowserPrefs&, const EmbyBrowserPrefs&) = default;
 };
 
@@ -232,6 +236,28 @@ struct PaneView {
     ViewMode mode{ViewMode::Fit};
     float zoom{1.0F};
 };
+
+// The pane that is the only picture in the window -- the one shown alone
+// among several (Solo, as activeLayoutCells takes it), or the only one
+// loaded -- else -1, several sharing it or none.
+inline int paneShownAlone(const PaneArray<bool>& active, int solo) {
+    if (solo >= 0 && solo < static_cast<int>(kMaxPanes) && active[static_cast<std::size_t>(solo)]) return solo;
+    int alone = -1;
+    for (std::size_t pane = 0; pane < active.size(); ++pane) {
+        if (!active[pane]) continue;
+        if (alone >= 0) return -1;
+        alone = static_cast<int>(pane);
+    }
+    return alone;
+}
+
+// The views the panes are drawn with. The picture alone in the window wears
+// the one view of a video alone, whichever pane it is; panes that share the
+// window wear their own, so a choice made in one never shows in the other.
+inline PaneArray<PaneView> shownPaneViews(PaneArray<PaneView> views, const PaneView& alone, int alonePane) {
+    if (alonePane >= 0 && alonePane < static_cast<int>(kMaxPanes)) views[static_cast<std::size_t>(alonePane)] = alone;
+    return views;
+}
 
 inline int dockInteractiveHeight(
     float progress, int dockHeight, int revealZone) {
@@ -721,6 +747,31 @@ inline float displayAspect(int width, int height, float pixelAspect = 1.0F) {
     return static_cast<float>(width) / static_cast<float>(height) * pixelAspect;
 }
 
+// How many quarter turns clockwise stand a stored picture upright, 0 to 3,
+// from the angle its display matrix turns it counterclockwise, as FFmpeg
+// reads one. A phone held upright stores its picture lying on its side and
+// says so there: a quarter turn either way, or a half turn for one held
+// upside down. An angle that is not a whole number of quarter turns (within
+// a degree, as FFmpeg's own tools take it), or not a number at all, leaves
+// the picture as it is stored.
+inline int quarterTurnsClockwise(double counterclockwiseDegrees) {
+    if (!std::isfinite(counterclockwiseDegrees)) return 0;
+    const double clockwise = -counterclockwiseDegrees;
+    const double turns = std::round(clockwise / 90.0);
+    if (std::abs(clockwise - turns * 90.0) >= 1.0) return 0;
+    return static_cast<int>(((static_cast<long long>(turns) % 4) + 4) % 4);
+}
+
+// A picture turned one quarter or three lies on its side as stored: its
+// stored width is its height on screen.
+inline bool turnedSideways(int quarterTurns) { return (quarterTurns & 1) != 0; }
+
+// A picture's shape on screen once it is turned upright: a 1920x1080 phone
+// video a quarter turn round is 9:16.
+inline float turnedAspect(float aspect, int quarterTurns) {
+    return turnedSideways(quarterTurns) && std::isfinite(aspect) && aspect > 0.0F ? 1.0F / aspect : aspect;
+}
+
 inline RectF fitInside(const RectF& cell, int sourceWidth, int sourceHeight, float pixelAspect = 1.0F) {
     if (sourceWidth <= 0 || sourceHeight <= 0 || cell.width <= 0 || cell.height <= 0) {
         return cell;
@@ -801,11 +852,18 @@ inline float storedPixelAspect(int width, int height, float aspect) {
 // sampling the centre of the texture that has the cell's shape. A zoom then
 // samples the centre 1/zoom of that. Square pixels give exactly what the
 // stored proportions alone gave.
+//
+// A picture stored on its side (`quarterTurns`, clockwise, to stand it
+// upright) is shaped and cropped as the upright picture: its texture's
+// height is its width on screen and its pixels are 1 / pixelAspect wide.
+// The texture itself stays as it is stored; the renderer turns the
+// coordinates it samples.
 struct PanePictureGeometry {
     // Where the picture is drawn, before the renderer's one-pixel inset.
     RectF viewport;
-    // The texture coordinates sampled: u = scaleX * x + offsetX for x from 0
-    // to 1 across the viewport, and v alike.
+    // The part of the upright picture sampled: scaleX * x + offsetX of its
+    // width for x from 0 to 1 across the viewport, and down it alike. With
+    // no turn these are the texture coordinates themselves.
     float scaleX{1.0F};
     float scaleY{1.0F};
     float offsetX{0.0F};
@@ -813,8 +871,13 @@ struct PanePictureGeometry {
 };
 
 inline PanePictureGeometry panePictureGeometry(const RectF& cell, int outputWidth, int outputHeight,
-                                               float pixelAspect, ViewMode mode, float zoom) {
+                                               float pixelAspect, ViewMode mode, float zoom,
+                                               int quarterTurns = 0) {
     PanePictureGeometry geometry;
+    if (turnedSideways(quarterTurns)) {
+        std::swap(outputWidth, outputHeight);
+        pixelAspect = std::isfinite(pixelAspect) && pixelAspect > 0.0F ? 1.0F / pixelAspect : 1.0F;
+    }
     geometry.viewport = mode == ViewMode::Fit ? fitInside(cell, outputWidth, outputHeight, pixelAspect) : cell;
     if (mode == ViewMode::Fill) {
         const float sourceAspect = displayAspect(outputWidth, std::max(1, outputHeight), pixelAspect);

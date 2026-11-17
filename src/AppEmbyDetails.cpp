@@ -224,6 +224,13 @@ void App::embyToggleLibraryDetails(const std::string& libraryId) {
 
 bool App::embyTryOpenDetails(const emby::Item& item, int param) {
     if (item.type != "Movie" && item.type != "Series") return false;
+    // A person's page has its own switch: off, its titles play (a series
+    // lists its seasons) whatever their libraries say. The resume row is
+    // the home page's, never a person's.
+    if (param >= 0 && !embyBrowser_.personDetails && !embyPages_.empty() &&
+        embyPages_.back().kind == EmbyPage::Kind::Person) {
+        return false;
+    }
     const auto library = embyItemLibraryId(item);
     if (!embyLibraryDetailsEnabled(embyLibraries_, emby_.session().serverId, library, embyLibraryType(library))) {
         return false;

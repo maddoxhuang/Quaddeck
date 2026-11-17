@@ -113,10 +113,13 @@ void App::showContextMenu(int pane, WindowMenuAnchor anchor) {
         speedItem(CmdSpeed200, 2.0, L"2.0x");
         menu.submenu(L"Playback speed", std::move(speed));
 
+        // The view this video is drawn with now: the one of a video alone
+        // while it is alone in the window, else its own among the others.
+        const ViewMode shownMode = shownView(index).mode;
         PanelMenu view;
-        view.option(CmdViewFit, L"Fit", paneViews_[index].mode == ViewMode::Fit)
-            .option(CmdViewFill, L"Fill", paneViews_[index].mode == ViewMode::Fill)
-            .option(CmdViewStretch, L"Stretch", paneViews_[index].mode == ViewMode::Stretch)
+        view.option(CmdViewFit, L"Fit", shownMode == ViewMode::Fit)
+            .option(CmdViewFill, L"Fill", shownMode == ViewMode::Fill)
+            .option(CmdViewStretch, L"Stretch", shownMode == ViewMode::Stretch)
             .separator()
             .option(CmdZoomIn, L"Zoom in")
             .option(CmdZoomOut, L"Zoom out")
@@ -399,11 +402,11 @@ void App::handleContextCommand(unsigned command, int pane) {
                << std::setprecision(3) << playbackRates_[index] << L"x";
         showNotice(notice.str());
     } else if (validPane && command >= CmdViewFit && command <= CmdViewStretch) {
-        paneViews_[index].mode = static_cast<ViewMode>(command - CmdViewFit);
-        showNotice(L"V" + std::to_wstring(positionForPane(index) + 1) + L"  " +
-                   viewModeName(paneViews_[index].mode));
+        PaneView& shown = shownView(index);
+        shown.mode = static_cast<ViewMode>(command - CmdViewFit);
+        showNotice(L"V" + std::to_wstring(positionForPane(index) + 1) + L"  " + viewModeName(shown.mode));
     } else if (validPane && (command == CmdZoomIn || command == CmdZoomOut || command == CmdZoomReset)) {
-        auto& zoom = paneViews_[index].zoom;
+        auto& zoom = shownView(index).zoom;
         if (command == CmdZoomIn) zoom = std::min(4.0F, zoom + 0.25F);
         else if (command == CmdZoomOut) zoom = std::max(1.0F, zoom - 0.25F);
         else zoom = 1.0F;

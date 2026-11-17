@@ -2,6 +2,75 @@
 
 Public releases start at 1.0.0. See [README.md](README.md) for current usage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation and file-format details.
 
+## 1.6.0 (2026-11-17)
+
+This release steps through the videos one at a time with `Tab`, gives a
+video shown alone its own Fit / Fill / Stretch and zoom, adds an **Info
+pages** switch to a person's page, and shows a video recorded upright on a
+phone the right way up. Settings are now `QCONFIG 26` and styles `QSTYLE 4`,
+which 1.5.0 and earlier cannot read, so back up `settings.qconfig` before
+trying this version. Video sets remain `QSETS 1`.
+
+### Several videos
+
+- Press `Tab` to show the next video alone, in the order they are on screen:
+  from all videos to V1, then V2, V3 and so on, and from the last back to
+  V1. `Shift+Tab` goes the other way, starting from the last video. Stepping
+  never returns to all videos; use `Esc` or `Shift+0` for that. Holding
+  `Tab` does not run through the videos, it does nothing with one video, and
+  in a text box it still belongs to the box.
+- Find both keys on `F5 → Keys` under **Arrangement**, after **All videos**,
+  as **Solo the next video** and **Solo the previous video**; change, clear
+  or reset them there. If you had already given `Tab` or `Shift+Tab` to
+  another action, it stays with that action.
+- Keep Fit / Fill / Stretch and zoom separately for a video shown alone and
+  for videos shown together. A video is alone when it is the only one open
+  or when one of several is in Solo; whichever video that is, it uses the
+  same single setting. Videos shown together still have one each. Neither
+  changes the other: choose Fill alone and Fit together, and alone is still
+  Fill when you come back.
+- **View / zoom** in the right-click menu, and **All videos** and **Zoom
+  all** on `F5 → Picture`, show and change the setting in use on screen;
+  with no video open they change the one for videos shown together.
+- After upgrading, a video shown alone starts with the first pane's earlier
+  setting, so a single open video looks as it did. `.qstyle` files carry
+  the new setting as well.
+
+### Emby
+
+- Use the new **Info pages** button on a person's page. Lit, which is the
+  default, a title opens its information page first where its library shows
+  them, as before. Turned off, a movie on any person's page plays at once
+  and a series lists its seasons.
+- The switch belongs to people's pages only. It does not change any
+  library's own **Info pages**, so titles in a library still open their
+  information pages and those still lead to a person. Favorites and
+  searches across all libraries have no such button and follow each
+  library's setting.
+
+### Picture
+
+- Show a video recorded upright on a phone the right way up. Such a file
+  stores a sideways picture with a rotation mark, which QuadDeck did not
+  read, so the video lay on its side. Rotations of 90°, 180° and 270° are
+  now followed for local files and Emby videos alike.
+- Work out the arrangement, Fit / Fill / Stretch, zoom and subtitle position
+  from the upright picture, so an upright phone video is simply a tall one.
+- A video whose mark also mirrors the picture is still shown as stored.
+  There is no command to rotate a video by hand and no switch to turn the
+  automatic rotation off.
+- `QuadDeck.log` adds `turned=90` (or 180, 270) to the `Decoder setup` line
+  of such a video: the clockwise angle that stands the picture upright.
+
+### Settings files
+
+- `QCONFIG 24` allows the two new keys on `shortcut` lines, `QCONFIG 25`
+  carries `QSTYLE 4` with its new `alone` line, and `QCONFIG 26` adds the
+  person page's switch to the `embybrowser` line. Files from 1.5.0 and
+  earlier are read as before and keep their values.
+- An earlier version that finds a `QCONFIG 26` file leaves it untouched and
+  runs with its defaults.
+
 ## 1.5.0 (2026-11-10)
 
 This release replaces saved sessions with a list of video sets, can delete a

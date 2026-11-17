@@ -92,6 +92,10 @@ private:
     // or a single video, changes nothing.
     void soloVideoAt(std::size_t position);
     void showAllVideos();
+    // Among several videos: the next one alone (`direction` 1) or the
+    // previous (-1), by place, round from the last to the first; from the
+    // grid the first or the last (soloStepPosition). Never the grid.
+    void stepSoloVideo(int direction);
     // How many places the bar's buttons for the videos cover: the videos
     // loaded among several, none for one or none.
     std::size_t soloButtonCount() const;
@@ -1584,6 +1588,13 @@ private:
     long long seekBarrierElapsedMs() const;
     bool paneLogicallyLoaded(std::size_t pane) const;
     PaneArray<bool> activePanes() const;
+    // The pane alone in the window (paneShownAlone), and the view a pane is
+    // drawn with: aloneView_ for that one, else its own in paneViews_. The
+    // menu and the settings window edit the view in use.
+    int shownAlonePane() const;
+    PaneView& shownView(std::size_t pane);
+    const PaneView& shownView(std::size_t pane) const;
+    PaneArray<PaneView> shownViews() const;
     PaneArray<float> paneAspectRatios() const;
     void refreshAutoLayoutFocus(const PaneArray<float>& aspects);
     PaneArray<RectF> currentLayoutCells(
@@ -1676,7 +1687,10 @@ private:
     // sought. Audio-only operations must never consume this discontinuity
     // detector or a repeat wrap can leave video parked at EOF.
     PaneArray<double> lastVideoMappedTimes_{-1.0, -1.0, -1.0, -1.0, -1.0};
+    // Fit, Fill or Stretch and the zoom: each pane's while it shares the
+    // window, and one for whichever video is alone in it (shownView).
     PaneArray<PaneView> paneViews_{};
+    PaneView aloneView_{};
     bool masterLoopEnabled_{};
     double masterLoopA_{};
     double masterLoopB_{};

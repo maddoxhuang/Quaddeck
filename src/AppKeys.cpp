@@ -161,6 +161,8 @@ void App::runKeyAction(KeyAction action) {
         soloVideoAt(*keyActionSoloPosition(action));
         break;
     case KeyAction::AllVideos: showAllVideos(); break;
+    case KeyAction::SoloNext: stepSoloVideo(1); break;
+    case KeyAction::SoloPrevious: stepSoloVideo(-1); break;
     // The colour controls, as the Video tab sets them (AppVideo.cpp).
     case KeyAction::BrightnessDown:
     case KeyAction::BrightnessUp:

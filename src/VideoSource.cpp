@@ -25,6 +25,7 @@ extern "C" {
 #include <libavutil/mathematics.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/display.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libswresample/swresample.h>
@@ -198,10 +199,49 @@ std::int64_t effectiveVideoFrameDuration(
 // its own pixels' width. Not the size read at open, which a broadcast going
 // from 1920x1080 to 1440x1080 at 4:3 leaves behind (video-decode#4). Zero for
 // a frame with no size.
+// A frame stored on its side is shown upright, so its shape is the other way
+// round.
 float shownDisplayAspect(const HardwareVideoFrame& frame) {
     const bool decoded = frame.ownerFrame && frame.ownerFrame->width > 0 && frame.ownerFrame->height > 0;
-    return displayAspect(decoded ? frame.ownerFrame->width : frame.width,
-                         decoded ? frame.ownerFrame->height : frame.height, static_cast<float>(frame.pixelAspect));
+    return turnedAspect(displayAspect(decoded ? frame.ownerFrame->width : frame.width,
+                                      decoded ? frame.ownerFrame->height : frame.height,
+                                      static_cast<float>(frame.pixelAspect)),
+                        frame.quarterTurns);
+}
+
+// The quarter turns clockwise a display matrix asks for, as
+// quarterTurnsClockwise counts them; -1 where there is no matrix. A matrix
+// that mirrors the picture as well is not followed at all: mirroring is not
+// drawn, and a turn without its mirror could stand the picture on its head.
+int displayMatrixTurns(const std::uint8_t* data, std::size_t size) {
+    std::int32_t matrix[9];
+    if (!data || size < sizeof matrix) return -1;
+    std::memcpy(matrix, data, sizeof matrix);
+    const std::int64_t determinant = static_cast<std::int64_t>(matrix[0]) * matrix[4] -
+                                     static_cast<std::int64_t>(matrix[1]) * matrix[3];
+    if (determinant < 0) return 0;
+    return quarterTurnsClockwise(av_display_rotation_get(matrix));
+}
+
+// What the container says of the whole stream: MP4's track matrix, as a
+// phone writes it.
+int streamDisplayTurns(const AVStream* stream) {
+    if (!stream || !stream->codecpar) return 0;
+    const AVPacketSideData* matrix = av_packet_side_data_get(
+        stream->codecpar->coded_side_data, stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    return matrix ? std::max(0, displayMatrixTurns(matrix->data, matrix->size)) : 0;
+}
+
+// A frame's own matrix, which the decoder gives it from the container's or
+// from the bitstream (H.264's display orientation); the stream's where the
+// frame has none.
+int frameDisplayTurns(const AVFrame* frame, int streamTurns) {
+    if (frame) {
+        if (const AVFrameSideData* matrix = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) {
+            if (const int turns = displayMatrixTurns(matrix->data, matrix->size); turns >= 0) return turns;
+        }
+    }
+    return streamTurns;
 }
 }  // namespace
 
@@ -262,6 +302,7 @@ bool VideoSource::open(const std::wstring& path, ID3D11Device* device,
     videoWidth_.store(0);
     videoHeight_.store(0);
     videoDisplayAspect_.store(0.0F);
+    videoQuarterTurns_.store(0);
     audioStreamAvailability_.store(0);
     exactSeekReadyGeneration_.store(0);
     seekEndedWithoutFrame_.store(0);
@@ -343,6 +384,7 @@ void VideoSource::close() {
     videoWidth_.store(0);
     videoHeight_.store(0);
     videoDisplayAspect_.store(0.0F);
+    videoQuarterTurns_.store(0);
 }
 
 // The video worker giving up: the audio worker's waits test running_, so it
@@ -483,6 +525,7 @@ std::shared_ptr<const HardwareVideoFrame> VideoSource::frameForTime(double secon
         // screen, not of one decoded ahead of it.
         if (popped && frame) {
             if (const float aspect = shownDisplayAspect(*frame); aspect > 0.0F) videoDisplayAspect_.store(aspect);
+            videoQuarterTurns_.store(frame->quarterTurns);
         }
     }
     // The window thread asks for every pane's frame every tick. Only a frame
@@ -1129,6 +1172,7 @@ bool VideoSource::openVideoInput() {
         setError("Cannot allocate final seek fallback frame");
         return false;
     }
+    streamQuarterTurns_ = streamDisplayTurns(stream);
     {
         // This is setup, not proof of the path used by returned frames:
         // Automatic may fall back after D3D11VA was initially selected.
@@ -1138,6 +1182,9 @@ bool VideoSource::openVideoInput() {
                  << (usingHardware_ ? (decodeMode_ == DecodeMode::Hardware
                          ? "D3D11VA-required" : "D3D11VA-preferred") : "software")
                  << " threads=" << videoCodec_->thread_count;
+        // A picture stored on its side or on its head, and the turn
+        // clockwise that stands it upright.
+        if (streamQuarterTurns_ != 0) summary << " turned=" << streamQuarterTurns_ * 90;
         appendDiagnostic(summary.str());
     }
     videoStartPts_ = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
@@ -1145,9 +1192,13 @@ bool VideoSource::openVideoInput() {
     videoHeight_.store(std::max(0, videoCodec_->height));
     // Until a frame is shown: the container's ratio (Matroska's display size,
     // MP4's pasp), else the one the stream info read from the bitstream.
+    // And the container's turn, which stands a phone's picture upright.
     const AVRational sampleAspect = av_guess_sample_aspect_ratio(videoFormat_, stream, nullptr);
-    videoDisplayAspect_.store(displayAspect(videoCodec_->width, videoCodec_->height,
-                                            static_cast<float>(pixelAspectRatio(sampleAspect.num, sampleAspect.den))));
+    videoQuarterTurns_.store(streamQuarterTurns_);
+    videoDisplayAspect_.store(turnedAspect(
+        displayAspect(videoCodec_->width, videoCodec_->height,
+                      static_cast<float>(pixelAspectRatio(sampleAspect.num, sampleAspect.den))),
+        streamQuarterTurns_));
     if (videoFormat_->duration != AV_NOPTS_VALUE) {
         duration_.store(static_cast<double>(videoFormat_->duration) / AV_TIME_BASE);
     }
@@ -1818,6 +1869,7 @@ bool VideoSource::pushVideoFrame(AVFrame* decoded, bool endOfStreamFallback) {
         videoSeekFallbackGeneration_ = 0;
     }
     auto frame = std::make_shared<HardwareVideoFrame>();
+    frame->quarterTurns = frameDisplayTurns(decoded, streamQuarterTurns_);
     if (decoded->format == AV_PIX_FMT_D3D11 && decoded->data[0]) {
         frame->ownerFrame = av_frame_clone(decoded);
         if (!frame->ownerFrame) { setError("Cannot retain D3D11VA surface"); return false; }
@@ -1833,10 +1885,12 @@ bool VideoSource::pushVideoFrame(AVFrame* decoded, bool endOfStreamFallback) {
         }
         frame->ownerFrame = av_frame_clone(decoded);
         if (!frame->ownerFrame) { setError("Cannot retain software video frame"); return false; }
-        const auto requested = presentationSize(
-            decoded->width, decoded->height,
-            preferredWidth_.load(std::memory_order_relaxed),
-            preferredHeight_.load(std::memory_order_relaxed));
+        // The pane's size is the upright picture's; one stored on its side
+        // fills it the other way round.
+        int paneWidth = preferredWidth_.load(std::memory_order_relaxed);
+        int paneHeight = preferredHeight_.load(std::memory_order_relaxed);
+        if (turnedSideways(frame->quarterTurns)) std::swap(paneWidth, paneHeight);
+        const auto requested = presentationSize(decoded->width, decoded->height, paneWidth, paneHeight);
         frame->width = requested.width;
         frame->height = requested.height;
         frame->stride = frame->width * 4;

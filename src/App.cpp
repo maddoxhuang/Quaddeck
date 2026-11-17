@@ -955,9 +955,10 @@ void App::publishPreferredSizes(const PaneArray<float>& aspects) {
     const float height = static_cast<float>(std::min<LONG>(
         std::max(1L, client.bottom), std::max(1U, contentHeight_)));
     const auto cells = currentLayoutCells(width, height, aspects);
+    const auto views = shownViews();
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
         if (!sources_[pane] || cells[pane].width <= 0 || cells[pane].height <= 0) continue;
-        const float zoom = std::clamp(paneViews_[pane].zoom, 1.0F, 4.0F);
+        const float zoom = std::clamp(views[pane].zoom, 1.0F, 4.0F);
         sources_[pane]->setPreferredSize(
             static_cast<int>(std::lround(cells[pane].width * zoom)),
             static_cast<int>(std::lround(cells[pane].height * zoom)));
@@ -1227,7 +1228,7 @@ void App::tick() {
     if (!window_ || !IsIconic(window_)) {
         publishPreferredSizes(aspects);
         buildOverlayScene();
-        renderer_.render(frames, paneViews_, activePanes(), layoutMode_,
+        renderer_.render(frames, shownViews(), activePanes(), layoutMode_,
                          expandedPane_, soloPane_, contentHeight_, aspects,
                          autoLayoutFocus_, autoLayoutFocusPane_);
         if (renderer_.deviceLost()) {

@@ -346,6 +346,9 @@ private:
     RenderStats stats_{};
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> renderTarget_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vertexShader_;
+    // The quad for a picture stored 1, 2 and 3 quarter turns from upright:
+    // only a pane's own draw uses them, every other pass the one above.
+    std::array<Microsoft::WRL::ComPtr<ID3D11VertexShader>, 3> turnedVertexShaders_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> uvTransformBuffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> pixelParamsBuffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> smartVibranceBuffer_;

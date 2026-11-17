@@ -72,6 +72,11 @@ struct HardwareVideoFrame {
     // square ones, 64/45 for a 16:9 PAL DVD stored at 720x576. A software
     // frame is scaled alike in both directions, so it holds for its BGRA.
     double pixelAspect{1.0};
+    // The quarter turns clockwise that stand the picture upright, 0 to 3,
+    // as its display matrix asks: a phone's upright video is stored lying
+    // on its side. The pixels above stay as they are stored, on both paths;
+    // the renderer turns them as it draws.
+    int quarterTurns{};
     std::uint64_t serial{};
     std::uint64_t seekGeneration{};
     bool exactSeekFrame{};
@@ -239,8 +244,14 @@ public:
     // the frame last handed out, by its own decoded size and pixel aspect,
     // since a broadcast may change either as it plays. It is never the size
     // read at open with a later frame's ratio: videoWidth() and videoHeight()
-    // stay what they were at open. Zero until a video is open.
+    // stay what they were at open. Zero until a video is open. A picture
+    // stored on its side is given upright: a phone's 1920x1080 a quarter
+    // turn round is 9:16.
     float videoDisplayAspect() const { return videoDisplayAspect_.load(); }
+    // The quarter turns clockwise that stand the picture upright, 0 to 3:
+    // the stream's display matrix at open, then the shown frame's own.
+    // videoWidth() and videoHeight() are the stored size whatever it is.
+    int videoQuarterTurns() const { return videoQuarterTurns_.load(); }
     bool audioStreamKnown() const { return audioStreamAvailability_.load() != 0; }
     bool hasAudioStream() const { return audioStreamAvailability_.load() > 0; }
     AudioDecodeStatus audioDecodeStatus() const;
@@ -435,6 +446,10 @@ private:
     std::atomic<int> videoWidth_{0};
     std::atomic<int> videoHeight_{0};
     std::atomic<float> videoDisplayAspect_{0.0F};
+    std::atomic<int> videoQuarterTurns_{0};
+    // The stream's own display matrix, read at open, for a frame that
+    // carries none. The video worker's.
+    int streamQuarterTurns_{0};
     std::atomic<int> audioStreamAvailability_{0};
     // Seeded with the previous fixed ceiling so frames decoded before the
     // first layout hint arrives are no larger than they used to be.

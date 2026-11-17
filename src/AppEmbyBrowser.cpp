@@ -379,18 +379,22 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     // View and Sort open their drop-downs. Each filter is a button of its
     // own that switches it at once, lit while it is on: Unplayed, the
     // favorites under the page, All videos where the page lists folders, a
-    // movie or TV library's information pages. One the page does not offer
-    // leaves its slot empty, so a part always names the same button
-    // (embyToolbarAction).
+    // movie or TV library's information pages. A person's page lists every
+    // library's titles, so its Info pages is a switch of its own
+    // (EmbyBrowserPrefs::personDetails) and no library's. One the page does
+    // not offer leaves its slot empty, so a part always names the same
+    // button (embyToolbarAction).
     buttons(SettingId::EmbyToolbar,
             {view + L" \x25BE", arrange ? sort + L" \x25BE" : L"", arrange ? L"Unplayed" : L"",
              favoritesOffered ? L"\x2665 Favorites" : L"", flatOffered ? L"All videos" : L"",
-             libraryDetails ? L"Info pages" : L""});
+             libraryDetails || personPage ? L"Info pages" : L""});
     rows.back().buttonMinWidth = 80.0F;
     rows.back().buttonsOn = {false, false, arrange && embyBrowser_.unplayed,
                              favoritesOffered && embyBrowser_.favorites, flatOffered && embyBrowser_.flat,
-                             libraryDetails && embyLibraryDetailsEnabled(embyLibraries_, emby_.session().serverId,
-                                                                         libraryId, libraryType)};
+                             personPage ? embyBrowser_.personDetails
+                                        : libraryDetails && embyLibraryDetailsEnabled(embyLibraries_,
+                                                                                      emby_.session().serverId,
+                                                                                      libraryId, libraryType)};
     // Navigation and the compact arrangement stay available while the list scrolls.
     for (auto& row : rows) row.pinned = true;
     if (personPage) rows.push_back(embyPersonRow(embyPages_.back()));
@@ -700,13 +704,16 @@ void App::embyToolbarAction(int part) {
     const bool ownOrder = playlist && embyPages_.back().ownOrder;
     // The filters, each its own button, switch at once; the row saves them
     // (activatePanelRow). Information pages are only a movie or TV
-    // library's, which embyToggleLibraryDetails checks.
+    // library's, which embyToggleLibraryDetails checks, but for a person's
+    // page, which has its own switch over every library's titles.
     if (part >= 2) {
         if (part == 2 && arrange) embyToggleUnplayed();
         else if (part == 3 && arrange && embyPages_.back().kind != EmbyPage::Kind::Favorites) {
             embyToggleFavoritesFilter();
         } else if (part == 4 && arrange && embyPageAcceptsFlat()) embyToggleFlat();
-        else if (part == 5) embyToggleLibraryDetails();
+        else if (part == 5 && embyPages_.back().kind == EmbyPage::Kind::Person) {
+            embyBrowser_.personDetails = !embyBrowser_.personDetails;
+        } else if (part == 5) embyToggleLibraryDetails();
         return;
     }
     if (part == 1 && !arrange) return;

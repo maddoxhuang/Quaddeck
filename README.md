@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml"><img src="https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml/badge.svg?branch=main" alt="Windows Build status"></a>
-  <a href="CHANGELOG.md#150-2026-11-10"><img src="https://img.shields.io/badge/version-1.5.0-0891b2" alt="Version 1.5.0"></a>
+  <a href="CHANGELOG.md#160-2026-11-17"><img src="https://img.shields.io/badge/version-1.6.0-0891b2" alt="Version 1.6.0"></a>
   <a href="#upgrading-and-building"><img src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078d4" alt="Windows 10 / 11"></a>
   <a href="CMakeLists.txt"><img src="https://img.shields.io/badge/C%2B%2B-20-00599c" alt="C++20"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-16a34a" alt="GPL-3.0 licence"></a>
@@ -41,13 +41,13 @@
 | **Styled subtitles** | Display ASS / SSA subtitles with their styling and attached fonts, or load SRT / WebVTT files. |
 | **GPU decoding and shaders** | Use hardware decoding, adjust Vibrance+ and enable RTX Video features on supported systems. |
 
-**New in v1.5.0:** a list of video sets in place of sessions, deleting a video from the Emby server (off by default), Emby lists that load in full, a list that follows the video you step to and marks the folders it is in, one control capsule per video in Linked mode, and a right-click menu in text boxes. See the [changelog](CHANGELOG.md#150-2026-11-10) for all changes.
+**New in v1.6.0:** `Tab` and `Shift+Tab` step through the videos one at a time, a video shown alone keeps its own Fit / Fill / Stretch and zoom, a person's page has its own **Info pages** switch, and a video recorded upright on a phone is shown the right way up. See the [changelog](CHANGELOG.md#160-2026-11-17) for all changes.
 
 <details>
 <summary><strong>More features</strong></summary>
 
 - **Playback controls:** shared and independent timelines, per-video offsets, playback speed, repeat and A-B loops. Exact synchronised seeking is used when starting or restarting a group.
-- **Layouts:** six arrangements adapt to the videos you open. Focus on one pane with Solo, choose a larger main pane, and adjust each video's zoom or Fit / Fill / Stretch mode.
+- **Layouts:** six arrangements adapt to the videos you open. Focus on one pane with Solo, choose a larger main pane, and adjust each video's zoom or Fit / Fill / Stretch mode; a video shown alone keeps its own.
 - **Audio:** play audio from several panes at once, switch tracks and adjust each pane's level and delay. Choose the output device, stereo or every speaker, a volume limit up to 200%, a preferred audio language and effects: a 10-band equalizer, loudness normalisation, night mode, channel options, voice emphasis, crossfeed and widening. Sound keeps its pitch at other speeds. When the selected audio source ends, QuadDeck can switch to the next pane automatically.
 - **Folder browsing:** press `F6` for thumbnails, duration and file size. Open subfolders and go back with **↑ Up**, or choose **All videos** to list every video under the folder and its subfolders in one list. Sort by name, size, date or duration, or shuffle the list. Click an item to replace the current pane; use `+Add` to open it muted in an empty pane. Each pane keeps its own queue. The folders a playing video is in are marked in its colour, and the list stays on the video you step to.
 - **Emby:** press `Ctrl+E` to browse libraries, folders, series, playlists, favorites and search results. Search across libraries, or within the folder you are in, with `Ctrl+F`, choose list, poster or thumbnail views, and open movie details or season and episode lists. Lists load in full without scrolling. Local and Emby videos can play side by side, with separate queues and progress reporting. Optionally, delete a video from the server after a confirmation; favorites are never deleted.
@@ -64,11 +64,11 @@
 
 ## Get started
 
-1. **Download QuadDeck.** Get `QuadDeck-<version>-win-x64.zip` from the [latest release](https://github.com/maddoxhuang/Quaddeck/releases/latest); for this version it is [QuadDeck-1.5.0-win-x64.zip](https://github.com/maddoxhuang/Quaddeck/releases/download/v1.5.0/QuadDeck-1.5.0-win-x64.zip). You can also [build from source](#build-from-source).
+1. **Download QuadDeck.** Get `QuadDeck-<version>-win-x64.zip` from the [latest release](https://github.com/maddoxhuang/Quaddeck/releases/latest); for this version it is [QuadDeck-1.6.0-win-x64.zip](https://github.com/maddoxhuang/Quaddeck/releases/download/v1.6.0/QuadDeck-1.6.0-win-x64.zip). You can also [build from source](#build-from-source).
 2. **Extract and run.** Extract the ZIP, then open `QuadDeck\QuadDeck.exe`. Keep the accompanying files together. QuadDeck requires Windows 10/11 x64 and the [Microsoft Visual C++ v14 x64 runtime](https://aka.ms/vc14/vc_redist.x64.exe).
 3. **Open some videos.** Press `O` or drop files into the window. Use `F6` to browse local files, `Ctrl+E` for Emby and `F5` for settings.
 
-See the [1.5.0 release notes](CHANGELOG.md#150-2026-11-10) and [settings and compatibility](#settings-and-compatibility) before replacing an existing installation. The latest published download may be older than this source version; check its release number.
+See the [1.6.0 release notes](CHANGELOG.md#160-2026-11-17) and [settings and compatibility](#settings-and-compatibility) before replacing an existing installation. The latest published download may be older than this source version; check its release number.
 
 For a development build, sign in to GitHub and download **QuadDeck-win-x64** from a successful [Windows Build](https://github.com/maddoxhuang/Quaddeck/actions/workflows/windows-build.yml) run for `main`. Extract the downloaded artifact, then the ZIP inside it.
 
@@ -112,7 +112,7 @@ In a narrow window, some controls are hidden to leave room for the seek bar. The
 
 When signed out, `Ctrl+E` opens **Server**, **User name** and **Password** fields inside the sheet. Use `Tab` / `Shift+Tab` to move between them and `Enter` or **Sign in** to connect. The password is masked, cannot be copied or cut, and uses direct keyboard input. A failed sign-in keeps the form open and highlights the field to correct; success clears the password.
 
-Movie and series information pages show **Cast & Crew** portraits. Select a person to see their biography and titles across your libraries, then use **Back** to return to the information page. Play and Add use compact split buttons; expand **More details** for technical information.
+Movie and series information pages show **Cast & Crew** portraits. Select a person to see their biography and titles across your libraries, then use **Back** to return to the information page. The **Info pages** button on a person's page is that page's own switch: lit, a title opens its information page first where its library shows them; turned off, a movie plays at once and a series lists its seasons. It does not change any library's own **Info pages**. Play and Add use compact split buttons; expand **More details** for technical information.
 
 Browse using the View and Sort menus and the filter buttons on the toolbar: **Unplayed**, **♥ Favorites** (the current page's favorites, including those in subfolders), **All videos** and, in movie and series libraries, **Info pages**. A lit button is on. Choose the checked sort order again to reverse it. F6 local folders switch between list and thumbnails with the **Thumbnails** button; Emby also offers Posters, except in home video and photo libraries. Emby lists load in full in the background after their first 300 items, so shuffle and repeat reach the whole list. Failed lists have a separate error and **Retry** action. Adding a sixth video opens a compact replacement list with thumbnails; Cancel preserves the current videos.
 
@@ -174,9 +174,9 @@ Press `0` to reset all offsets at once. In a manually opened group, seeking a pa
 - With two or more videos, use the arrangement button on the bottom bar or **Arrangement** in the right-click menu.
 - With three or five videos, right-click to choose the larger main pane. Select it again to return to the automatic choice.
 - Drag a video to another pane to swap their positions.
-- With one video, double-click it to pause or resume. With several, double-click a video to enter Solo, and double-click again or press `Esc` to return. `Shift+1`–`Shift+5` show V1–V5 alone, switching straight from one to another, and `Shift+0` shows every video again; the **All videos** and **V1**…**V5** buttons on the bar do the same.
+- With one video, double-click it to pause or resume. With several, double-click a video to enter Solo, and double-click again or press `Esc` to return. `Shift+1`–`Shift+5` show V1–V5 alone, switching straight from one to another, and `Shift+0` shows every video again; the **All videos** and **V1**…**V5** buttons on the bar do the same. `Tab` shows the next video alone, from all videos to V1 and from the last back to V1, and `Shift+Tab` the previous one, starting from the last; neither returns to all videos.
 - With several videos, each has its own colour by position: V1 blue, V2 orange, V3 green, V4 purple and V5 pink. Its tag, seek and volume bars, lit buttons, outlines, menus, settings rows and its marks in the F6 and Emby lists use that colour. Closing a video or changing the layout renumbers the videos and their colours.
-- Adjust each pane's zoom and choose Fit, Fill or Stretch to control how the picture fills its space.
+- Adjust each pane's zoom and choose Fit, Fill or Stretch to control how the picture fills its space. A video shown alone, whether it is the only one open or one of several in Solo, has a single setting of its own, whichever video it is; videos shown together have one each, and neither changes the other. **View / zoom** in the right-click menu and **All videos** and **Zoom all** on `F5 → Picture` show and change the one in use.
 
 ## Decoding and pixel shaders
 
@@ -251,6 +251,7 @@ Try [example-warm.hlsl](shaders/example-warm.hlsl) for a simple colour adjustmen
 | Reset subtitle position | `Alt+Home` |
 | Choose an arrangement: Automatic, One row, Two rows, One column, Portrait focus, Landscape focus | `Alt+1` – `Alt+6` |
 | Show V1–V5 alone; all videos again | `Shift+1` – `Shift+5`; `Shift+0` |
+| Show the next / previous video alone | `Tab` / `Shift+Tab` |
 | Brightness / contrast / saturation / hue down and up | `W` `E` / `Shift+R` `T` / `Y` `Shift+U` / `I` `Shift+O` |
 | Reset the colour controls | `Q` |
 | Auto-hide / pin the controls | `U` |
@@ -291,7 +292,7 @@ Local builds keep `QuadDeck.pdb` beside the EXE for diagnostic logs and preserve
 
 - Close QuadDeck before replacing a build or switching to another copy.
 - Settings are stored in `%LOCALAPPDATA%\QuadDeck\settings.qconfig`, and the video sets in `videosets.qsets` beside it. Copies running under the same Windows account share these files. Back them up, along with any `.qstyle` presets, before upgrading.
-- Version 1.5.0 uses `QCONFIG 23`, `QSETS 1` and `QSTYLE 3`; version 1.4.0 uses `QCONFIG 22` and `QDECK 6` sessions, version 1.3.0 `QCONFIG 15`, and versions 1.2.0, 1.1.0 and 1.0.0 `QCONFIG 14`. Each version reads earlier settings, but older applications cannot read settings saved by a newer one, so back up `settings.qconfig` before trying 1.5.0. Settings from 1.4.0 keep their values. Version 1.5.0 no longer opens `.qdeck` sessions saved by earlier versions; its `.qdeck` files are exported video sets. Settings from 1.3.0 keep their values in 1.4.0 and later; the audio, video and key settings added in 1.4.0 start from their defaults. When importing older settings, the single subtitle switch applies to every video and, from files older than `QCONFIG 14`, subtitle height returns to the default position; other valid settings are retained.
+- Version 1.6.0 uses `QCONFIG 26`, `QSETS 1` and `QSTYLE 4`; version 1.5.0 uses `QCONFIG 23`, `QSETS 1` and `QSTYLE 3`, version 1.4.0 `QCONFIG 22` and `QDECK 6` sessions, version 1.3.0 `QCONFIG 15`, and versions 1.2.0, 1.1.0 and 1.0.0 `QCONFIG 14`. Each version reads earlier settings, but older applications cannot read settings saved by a newer one, so back up `settings.qconfig` before trying 1.6.0. Settings from 1.5.0 and 1.4.0 keep their values; a video shown alone starts with the first pane's earlier view. Version 1.5.0 no longer opens `.qdeck` sessions saved by earlier versions; its `.qdeck` files are exported video sets. Settings from 1.3.0 keep their values in 1.4.0 and later; the audio, video and key settings added in 1.4.0 start from their defaults. When importing older settings, the single subtitle switch applies to every video and, from files older than `QCONFIG 14`, subtitle height returns to the default position; other valid settings are retained.
 - Versions 1.1.0 and later protect unreadable settings: a newer `QCONFIG` version is left untouched and changes are not saved during that run. Other invalid files are copied to `settings.qconfig.unreadable` before defaults are saved; if the copy fails, nothing is saved. Version 1.0.0 predates this protection, so keep a backup before switching builds.
 - Video sets refer to video paths and Emby items, and visual presets refer to custom shader paths. They do not include the files themselves, so keep those files in place or select them again after moving them.
 - If Explorer opens an older copy, use `F5 → General → Register…` in the new copy, then choose QuadDeck in Windows' Default apps. Registration also supports `.ass`, `.ssa`, `.srt` and `.vtt` files.
@@ -306,7 +307,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md#decode-and-render-paths) for details of th
 ## Current limitations
 
 - Only text subtitles are supported; PGS and VobSub image subtitles are not displayed. ASS subtitles may use a substitute font if the requested font is neither installed nor attached to the video. In files with poorly interleaved subtitle tracks, some subtitles may appear late.
-- Video rotation, mirroring and recording are not supported.
+- A video's stored rotation is followed, but there is no command to rotate or mirror a video by hand, and no recording.
 - Hardware decoding support depends on the video format, GPU and driver.
 - Synchronisation uses media timestamps and manual offsets; professional genlock is not supported.
 - Windows may block drag-and-drop from Explorer when QuadDeck runs as administrator. Use **Open** in that case.

@@ -590,6 +590,22 @@ PaneArray<bool> App::activePanes() const {
     return active;
 }
 
+int App::shownAlonePane() const {
+    return paneShownAlone(activePanes(), soloPane_);
+}
+
+PaneView& App::shownView(std::size_t pane) {
+    return static_cast<int>(pane) == shownAlonePane() ? aloneView_ : paneViews_[pane];
+}
+
+const PaneView& App::shownView(std::size_t pane) const {
+    return static_cast<int>(pane) == shownAlonePane() ? aloneView_ : paneViews_[pane];
+}
+
+PaneArray<PaneView> App::shownViews() const {
+    return shownPaneViews(paneViews_, aloneView_, shownAlonePane());
+}
+
 bool App::paneLogicallyLoaded(std::size_t pane) const {
     if (pane >= sources_.size()) return false;
     return sources_[pane] != nullptr ||

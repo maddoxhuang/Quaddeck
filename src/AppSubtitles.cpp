@@ -868,8 +868,11 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
     if (!syncAssSubtitles(pane)) return nullptr;
     drawn = true;
     const RectF& cell = chromeCells_[pane];
-    const int videoWidth = sources_[pane]->videoWidth();
-    const int videoHeight = sources_[pane]->videoHeight();
+    int videoWidth = sources_[pane]->videoWidth();
+    int videoHeight = sources_[pane]->videoHeight();
+    // A picture stored on its side is drawn upright, and a script is placed
+    // against the upright frame: its stored height is the frame's width.
+    if (turnedSideways(sources_[pane]->videoQuarterTurns())) std::swap(videoWidth, videoHeight);
     // The picture as the renderer shapes it: the shown frame's own shape.
     // libass is still given the size read at open as its storage size and
     // works out the pixels' shape from it and the frame, so the rectangles
@@ -878,11 +881,12 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
     // that opened at 1920x1080 and now shows 1440x1080 at 4:3, 16:9 alike.
     const float pixelAspect =
         storedPixelAspect(videoWidth, videoHeight, sources_[pane]->videoDisplayAspect());
-    const ViewMode mode = paneViews_[pane].mode;
+    const PaneView& view = shownView(pane);
+    const ViewMode mode = view.mode;
     const AssPane& state = assPanes_[pane];
     const SubtitlePlacement placement = subtitlePlacement(
         cell, visiblePictureRect(cell, videoWidth, videoHeight, mode, pixelAspect),
-        pictureRect(cell, videoWidth, videoHeight, mode, paneViews_[pane].zoom, pixelAspect), videoWidth,
+        pictureRect(cell, videoWidth, videoHeight, mode, view.zoom, pixelAspect), videoWidth,
         videoHeight, state.plain);
     const SubtitleFrame& frame = placement.frame;
     if (frame.width <= 0 || frame.height <= 0) return nullptr;

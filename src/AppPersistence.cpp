@@ -79,6 +79,7 @@ StyleState App::captureStyle() const {
     state.customShaderPath = customShaderPath_;
     state.smartVibrance = smartVibrance_;
     state.paneViews = paneViews_;
+    state.aloneView = aloneView_;
     return state;
 }
 
@@ -110,6 +111,7 @@ bool App::applyStyle(const StyleState& state) {
     controlsPinned_ = state.controlsPinned;
     controlsLastInteraction_ = GetTickCount64();
     paneViews_ = state.paneViews;
+    aloneView_ = state.aloneView;
     setControlsVisible(true);
     layoutHoverControls();
     updateHoverControls();
