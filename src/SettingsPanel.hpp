@@ -243,6 +243,21 @@ struct PanelTextField {
     bool masked{};
 };
 
+// What one tile of a Tiles row shows on its picture, besides its title.
+struct PanelTile {
+    std::string key;         // picture cache key, empty for none
+    std::wstring badge;      // top-right: "23:40", "3 new", "Folder"
+    std::wstring mark;       // top-left: "▶ 40%", "✓"
+    float progress{};        // 0..1 along the picture's bottom, 0 for none
+    std::wstring tag;        // bottom-left, in the accent: "Sub"; empty for none
+    bool favorite{};         // the account's Emby favorite: a heart under the badge
+    bool addAvailable{};     // an Add of its own; the tile itself still opens or plays
+    // The video playing it, by its place on the screen (0 for V1), whose
+    // colour its frame and its progress are in: -1 for none.
+    int playing{-1};
+    bool operator==(const PanelTile&) const = default;
+};
+
 struct PanelRow {
     PanelRowKind kind{PanelRowKind::Note};
     SettingId id{SettingId::None};
@@ -267,10 +282,12 @@ struct PanelRow {
     // A slider may carry one small toggle at its right end (per-pane mute).
     bool trailingToggle{};
     bool trailingOn{};
-    // Tiles: options are the titles; one entry per tile in each of these.
-    std::vector<std::string> tileKeys;      // picture cache key, empty for none
-    std::vector<std::wstring> tileBadges;   // "✓", "▶ 40%", "23:40"
+    // Tiles: `options` are the titles and `tileParams` the items, one per
+    // tile from when the row is built; `tiles` what each shows, one per tile
+    // once the row's content is filled. A CompactItem's picture is the key
+    // of its one tile.
     std::vector<int> tileParams;            // the item each tile (or band) stands for
+    std::vector<PanelTile> tiles;
     float tileWidth{220.0F};                // 96-DPI width of one tile
     float tileAspect{16.0F / 9.0F};         // picture width over height
     // Choice: segments on one line, 0 for the sheet's default of three.
@@ -303,37 +320,30 @@ struct PanelRow {
     float labelWidth{-1.0F};
     float valueWidth{-1.0F};
     // Item: this row is the item being played. Tiles: `selected` is the
-    // first tile being played (-1 for none); one entry per tile in these too.
+    // first tile being played (-1 for none), each tile's `playing` its own.
     bool current{};
     // The video playing it, by its place on the screen (0 for V1), whose
-    // colour the mark is drawn in: -1 for none. Tiles: one per tile.
+    // colour the mark is drawn in: -1 for none.
     int playingPosition{-1};
-    std::vector<int> tilePlaying;
     // Toggle, Slider, Buttons and CompactItem rows about one video: its
     // place on the screen (0 for V1), -1 for none. Its name is in a pale
     // shade of that video's colour, a switch, slider or picture frame of it
     // in the colour.
     int video{-1};
-    std::vector<std::wstring> tileMarks;    // top-left: "▶ 40%", "✓"
-    std::vector<float> tileProgress;        // 0..1 along the picture's bottom, 0 for none
-    // Item: an accent pill before the value ("Sub"). Tiles: one per tile,
-    // at the picture's bottom-left; empty for none.
+    // Item: an accent pill before the value ("Sub"); a tile's is its own.
     std::wstring tag;
-    std::vector<std::wstring> tileTags;
     // Item and Buttons: the account's Emby favorite, a heart before the tag
-    // or at the end of the label line. Tiles: one per tile, a heart under
-    // the top-right badge. Painted only; it takes no click of its own.
+    // or at the end of the label line; a tile's is its own. Painted only;
+    // it takes no click of its own.
     bool favorite{};
-    std::vector<bool> tileFavorites;
     // MediaDetail: 0 primary, 1 from beginning, 2 more/less, 3 add,
     // 4 add from beginning, 5 favorite (`on` while it is one). Empty
     // captions hide slots without renumbering.
     PanelMediaDetail mediaDetail;
     PanelTextField field;
-    // Item/Tiles: an independent add action; the ordinary entry still
-    // opens details or plays. Tile availability follows its item index.
+    // Item: an independent add action; the ordinary entry still opens
+    // details or plays. A tile's is its own.
     bool addAvailable{};
-    std::vector<bool> tileAddAvailable;
     // Buttons only: opt into wrapping at this minimum width in DIPs.
     // Zero preserves existing fixed one-line rows. Empty slots stay hidden.
     float buttonMinWidth{};
@@ -356,6 +366,82 @@ struct PanelRow {
     // strip, while the rest scroll beneath them. Only a leading run counts:
     // a pinned row after one that scrolls scrolls too.
     bool pinned{};
+};
+
+// How a page puts its plain rows down: each call appends one row of its
+// kind with what every page gives such a row, and returns it for whatever
+// else the page sets on it. The reference holds until the next row is added.
+// A note wraps unless told not to; a Choice or Buttons row without `param`
+// keeps the row's default.
+class PanelRowAppender {
+public:
+    explicit PanelRowAppender(std::vector<PanelRow>& rows) : rows_(rows) {}
+
+    PanelRow& header(std::wstring label) {
+        PanelRow& row = add(PanelRowKind::Header, SettingId::None, -1);
+        row.label = std::move(label);
+        return row;
+    }
+    PanelRow& note(std::wstring label, bool wrap = true) {
+        PanelRow& row = add(PanelRowKind::Note, SettingId::None, -1);
+        row.label = std::move(label);
+        row.wrapNote = wrap;
+        return row;
+    }
+    PanelRow& toggle(SettingId id, int param, std::wstring label, bool on, bool enabled = true) {
+        PanelRow& row = add(PanelRowKind::Toggle, id, param);
+        row.label = std::move(label);
+        row.on = on;
+        row.enabled = enabled;
+        return row;
+    }
+    // A few short options are segments beside the label; a long list, or
+    // long names, a drop-down.
+    PanelRow& choice(SettingId id, int param, std::wstring label, std::vector<std::wstring> options, int selected,
+                     bool dropDown = false) {
+        PanelRow& row = add(PanelRowKind::Choice, id, param);
+        row.label = std::move(label);
+        row.options = std::move(options);
+        row.selected = selected;
+        row.dropDown = dropDown;
+        return row;
+    }
+    PanelRow& choice(SettingId id, std::wstring label, std::vector<std::wstring> options, int selected,
+                     bool dropDown = false) {
+        return choice(id, -1, std::move(label), std::move(options), selected, dropDown);
+    }
+    PanelRow& slider(SettingId id, int param, std::wstring label, float value01, std::wstring value,
+                     bool enabled = true) {
+        PanelRow& row = add(PanelRowKind::Slider, id, param);
+        row.label = std::move(label);
+        row.slider01 = std::clamp(value01, 0.0F, 1.0F);
+        row.value = std::move(value);
+        row.enabled = enabled;
+        return row;
+    }
+    PanelRow& buttons(SettingId id, int param, std::wstring label, std::vector<std::wstring> captions,
+                      std::wstring value = {}, bool enabled = true) {
+        PanelRow& row = add(PanelRowKind::Buttons, id, param);
+        row.label = std::move(label);
+        row.options = std::move(captions);
+        row.value = std::move(value);
+        row.enabled = enabled;
+        return row;
+    }
+    PanelRow& buttons(SettingId id, std::vector<std::wstring> captions) {
+        return buttons(id, -1, {}, std::move(captions));
+    }
+
+private:
+    PanelRow& add(PanelRowKind kind, SettingId id, int param) {
+        PanelRow& row = rows_.emplace_back();
+        row.kind = kind;
+        row.id = id;
+        row.param = param;
+        return row;
+    }
+
+    std::vector<PanelRow>& rows_;
 };
 
 // A browser list among the sheet's rows: one Item row per entry, or one
@@ -1221,7 +1307,7 @@ inline void panelRowParts(PanelRowGeometry& geometry, const PanelRow& row, float
         for (std::size_t i = 0; i < row.options.size(); ++i) {
             geometry.parts.push_back({innerX + static_cast<float>(i) * (tileWidth + gap), y, tileWidth, tileHeight});
             OverlayRect add;
-            if (i < row.tileAddAvailable.size() && row.tileAddAvailable[i] && tileWidth > 12.0F * s) {
+            if (i < row.tiles.size() && row.tiles[i].addAvailable && tileWidth > 12.0F * s) {
                 const auto& tile = geometry.parts.back();
                 const float pictureHeight = tileWidth / std::max(0.1F, row.tileAspect);
                 const float buttonHeight = std::min(28.0F * s, std::max(0.0F, pictureHeight - 12.0F * s));

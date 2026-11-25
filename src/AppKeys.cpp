@@ -30,10 +30,14 @@ constexpr std::array<std::pair<KeyAction, emby::SortKey>, emby::kSortKeyCount> k
 
 }  // namespace
 
+bool App::keyHeld(int virtualKey) {
+    return GetKeyState(virtualKey) < 0;
+}
+
 KeyChord App::keyChordOf(WPARAM key, bool alt) const {
     unsigned modifiers = 0;
-    if (GetKeyState(VK_CONTROL) < 0) modifiers |= kKeyCtrl;
-    if (GetKeyState(VK_SHIFT) < 0) modifiers |= kKeyShift;
+    if (keyHeld(VK_CONTROL)) modifiers |= kKeyCtrl;
+    if (keyHeld(VK_SHIFT)) modifiers |= kKeyShift;
     if (alt) modifiers |= kKeyAlt;
     return {static_cast<unsigned>(key), modifiers};
 }

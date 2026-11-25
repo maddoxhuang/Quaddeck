@@ -17,7 +17,6 @@
 #include "AppInternal.hpp"
 #include "Diagnostics.hpp"
 
-#include <dwmapi.h>
 #include <imm.h>
 #include <windowsx.h>
 
@@ -35,11 +34,6 @@ constexpr wchar_t kEmbyDeleteWindowClass[] = L"QuadDeckEmbyDeleteWindow";
 // The share of the work area's height it grows to before its list scrolls.
 constexpr float kEmbyDeleteWindowTallest = 0.8F;
 
-OverlayRect overlayRect(const RECT& rect) {
-    return {static_cast<float>(rect.left), static_cast<float>(rect.top), static_cast<float>(rect.right - rect.left),
-            static_cast<float>(rect.bottom - rect.top)};
-}
-
 }  // namespace
 
 bool App::openEmbyDeleteWindow() {
@@ -48,8 +42,10 @@ bool App::openEmbyDeleteWindow() {
     // Another dialog holds the player already.
     if (window_ && !IsWindowEnabled(window_)) return false;
     // With a renderer it is a window or nothing: a player disabled with no
-    // window to answer would be stuck.
-    if (renderer_.device() && !createEmbyDeleteWindow()) return false;
+    // window to answer would be stuck. So it would with a renderer whose
+    // device is lost and not yet rebuilt, which has none to make the window
+    // on: only one made before the loss can answer then.
+    if (renderer_.device() ? !createEmbyDeleteWindow() : renderer_.deviceLost() && !dialog.window) return false;
     dialog.open = true;
     dialog.scroll = 0.0F;
     dialog.hot = DeleteDialogHit::None;
@@ -90,14 +86,8 @@ bool App::createEmbyDeleteWindow() {
     if (dialog.window) return true;
     // Painted on the renderer's device.
     if (!window_ || !renderer_.device()) return false;
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = &App::embyDeleteWindowProc;
-    windowClass.hInstance = instance_;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    windowClass.lpszClassName = kEmbyDeleteWindowClass;
-    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    if (!registerWindowClass(instance_, kEmbyDeleteWindowClass, &App::embyDeleteWindowProc, 0,
+                             static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)))) {
         appendDiagnostic("Emby delete window class could not be registered");
         return false;
     }
@@ -111,11 +101,7 @@ bool App::createEmbyDeleteWindow() {
         appendDiagnostic("Emby delete window could not be created");
         return false;
     }
-    SetWindowPos(window, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    const BOOL darkTitle = TRUE;
-    const DWORD darkTitleAttribute = 20;
-    DwmSetWindowAttribute(window, darkTitleAttribute, &darkTitle, sizeof(darkTitle));
+    darkCaptionlessFrame(window);
     // Nothing in it is typed into.
     ImmAssociateContextEx(window, nullptr, 0);
     dialog.scale = static_cast<float>(windowDpi(window)) / 96.0F;
@@ -165,15 +151,10 @@ void App::placeEmbyDeleteWindow() {
 }
 
 LRESULT CALLBACK App::embyDeleteWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    App* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        app = static_cast<App*>(create->lpCreateParams);
-        app->embyDeleteWindow_.window = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    }
-    return app ? app->handleEmbyDeleteWindowMessage(message, wParam, lParam)
-               : DefWindowProcW(window, message, wParam, lParam);
+    App* app = windowApp(window, message, lParam);
+    if (!app) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == WM_NCCREATE) app->embyDeleteWindow_.window = window;
+    return app->handleEmbyDeleteWindowMessage(message, wParam, lParam);
 }
 
 LRESULT App::handleEmbyDeleteWindowMessage(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -181,18 +162,10 @@ LRESULT App::handleEmbyDeleteWindowMessage(UINT message, WPARAM wParam, LPARAM l
     const HWND window = dialog.window;
     const auto local = [&] { return POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; };
     switch (message) {
-    case WM_NCCALCSIZE: {
+    case WM_NCCALCSIZE:
         // No title bar, as the player and the settings window have none:
-        // Windows keeps its frame on the sides and the bottom, and the
-        // window's own strip is the caption.
-        RECT* client = wParam ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam)->rgrc[0]
-                              : reinterpret_cast<RECT*>(lParam);
-        const LONG top = client->top;
-        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
-        if (result != 0) return result;
-        client->top = top;
-        return 0;
-    }
+        // the window's own strip is the caption.
+        return captionlessClientArea(window, wParam, lParam);
     case WM_NCHITTEST: {
         const LRESULT standard = DefWindowProcW(window, message, wParam, lParam);
         if (standard != HTCLIENT || !window) return standard;
@@ -201,32 +174,21 @@ LRESULT App::handleEmbyDeleteWindowMessage(UINT message, WPARAM wParam, LPARAM l
         ScreenToClient(window, &point);
         return embyDeleteWindowHitAt(point) == DeleteDialogHit::Caption ? HTCAPTION : HTCLIENT;
     }
-    case WM_DPICHANGED: {
+    case WM_DPICHANGED:
         // Its own monitor's, once moved to another.
-        dialog.scale = static_cast<float>(HIWORD(wParam)) / 96.0F;
-        if (const auto* suggested = reinterpret_cast<const RECT*>(lParam)) {
-            SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
-                         suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        followDpiChange(window, wParam, lParam, dialog.scale);
         return 0;
-    }
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) renderEmbyDeleteWindow();
         return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        BeginPaint(window, &paint);
-        EndPaint(window, &paint);
+    case WM_PAINT:
+        validatePaint(window);
         renderEmbyDeleteWindow();
         return 0;
-    }
     case WM_ERASEBKGND:
         return 1;
     case WM_MOUSEMOVE:
-        if (!dialog.trackingLeave) {
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
-            dialog.trackingLeave = TrackMouseEvent(&track) != FALSE;
-        }
+        trackMouseLeave(window, dialog.trackingLeave);
         embyDeleteWindowMove(local());
         return 0;
     case WM_MOUSELEAVE:

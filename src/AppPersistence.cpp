@@ -33,6 +33,12 @@ namespace quaddeck {
 
 using namespace app_internal;
 
+namespace {
+
+constexpr const wchar_t* kStyleFilter = L"QuadDeck visual preset (*.qstyle)\0*.qstyle\0All files\0*.*\0";
+
+}  // namespace
+
 SessionState App::captureSession() const {
     SessionState state;
     state.timeline = deviceRecoveryPending_
@@ -179,25 +185,40 @@ AppSettings App::captureAppSettings() const {
     return state;
 }
 
-bool App::saveAppSettings() const {
+bool App::settingsDocument(std::filesystem::path& path, std::wstring& text) const {
+    path.clear();
+    text.clear();
     // Before the file is read the App holds only its defaults, which would
     // replace the user's file whole.
     if (!settingsRead_) return true;
     // The refusal was logged once at startup; there is nothing to retry.
     if (settingsReadOnly_) return true;
-    const auto path = settingsPath();
-    if (path.empty()) return false;
+    const auto file = settingsPath();
+    if (file.empty()) return false;
+    std::wostringstream output;
+    output.imbue(std::locale::classic());
+    if (!writeAppSettings(output, captureAppSettings()) || !output.good()) return false;
+    path = file;
+    text = output.str();
+    return true;
+}
+
+bool App::saveAppSettings() const {
+    std::filesystem::path path;
+    std::wstring text;
+    if (!settingsDocument(path, text)) return false;
+    if (path.empty()) return true;
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
     if (error) return false;
-    const AppSettings state = captureAppSettings();
-    return writeUtf8FileAtomically(
-        path, [&](std::wostream& output) { return writeAppSettings(output, state); });
+    return writeUtf8FileAtomically(path, [&](std::wostream& output) {
+        output << text;
+        return output.good();
+    });
 }
 
 void App::scheduleAppSettingsSave() {
     settingsSavePending_ = true;
-    settingsSaveRetryCount_ = 0;
     if (window_ && SetTimer(window_, kSettingsSaveTimer, kSettingsSaveDelayMs, nullptr)) {
         return;
     }
@@ -208,22 +229,27 @@ void App::scheduleAppSettingsSave() {
 void App::flushScheduledAppSettingsSave() {
     if (window_) KillTimer(window_, kSettingsSaveTimer);
     if (!settingsSavePending_) return;
-    if (saveAppSettings()) {
-        settingsSavePending_ = false;
-        settingsSaveRetryCount_ = 0;
+    settingsSavePending_ = false;
+    std::filesystem::path path;
+    std::wstring text;
+    if (!settingsDocument(path, text)) {
+        appendDiagnostic("Could not save application settings");
         return;
     }
-    if (window_ && settingsSaveRetryCount_ < kMaximumSettingsSaveRetries) {
-        ++settingsSaveRetryCount_;
-        appendDiagnostic("Could not save application settings; retry scheduled");
-        if (SetTimer(window_, kSettingsSaveTimer,
-                     kSettingsSaveRetryDelayMs, nullptr)) {
-            return;
-        }
+    if (path.empty()) return;
+    // Until 2026-11-26 the file was written here: a write Windows held back
+    // for 6.4 s held the window thread, and the video, as long.
+    if (!settingsWriter_) {
+        settingsWriter_ = std::make_unique<BackgroundDocumentWriter>(
+            kMaximumSettingsSaveRetries, std::chrono::milliseconds(kSettingsSaveRetryDelayMs),
+            [](bool written, bool retrying) {
+                if (!written) {
+                    appendDiagnostic(retrying ? "Could not save application settings; retry scheduled"
+                                              : "Could not save application settings");
+                }
+            });
     }
-    settingsSavePending_ = false;
-    settingsSaveRetryCount_ = 0;
-    appendDiagnostic("Could not save application settings");
+    settingsWriter_->write(std::move(path), std::move(text));
 }
 
 bool App::loadAppSettings() {
@@ -351,28 +377,15 @@ bool App::loadAppSettings() {
 }
 
 void App::saveStyleDialog() {
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"QuadDeck visual preset (*.qstyle)\0*.qstyle\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrDefExt = L"qstyle";
-    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    if (GetSaveFileNameW(&dialog) && !saveStyle(path)) {
+    const auto path = saveFileDialog(window_, {.filter = kStyleFilter, .extension = L"qstyle"});
+    if (path && !saveStyle(*path)) {
         MessageBoxW(window_, L"Could not save this visual preset.", L"Preset error", MB_ICONERROR);
     }
 }
 
 void App::loadStyleDialog() {
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"QuadDeck visual preset (*.qstyle)\0*.qstyle\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&dialog) && !loadStyle(path)) {
+    const auto path = openFileDialog(window_, {.filter = kStyleFilter});
+    if (path && !loadStyle(*path)) {
         std::string detail = renderer_.error();
         if (detail.empty()) detail = "The preset file is invalid.";
         MessageBoxA(window_, detail.c_str(), "Preset error", MB_ICONERROR);
@@ -393,13 +406,7 @@ void App::applySession(const SessionState& state) {
     soloPane_ = -1;
     hoverPane_ = -1;
     lastPointerPane_ = -1;
-    for (auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
-    audio_.flush();
-    for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
-    sourceInitialAlignmentPending_.fill(false);
-    sourceProvisionalTargets_.fill(0.0);
+    retireAllSources();
     paths_.fill({});
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) resetPaneMediaState(pane);
     ShaderPreset loadedPreset = state.shader;

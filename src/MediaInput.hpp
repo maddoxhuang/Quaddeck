@@ -30,6 +30,15 @@ inline int denySecondaryOpen(AVFormatContext*, AVIOContext**, const char*, int, 
     return AVERROR(EACCES);
 }
 
+// Whether the FFmpeg loaded can be told to check a server's certificate. It
+// checks none unless asked: without this an https server is whoever answers,
+// and is sent the credential.
+inline bool canVerifyServerCertificate() {
+    const AVClass* tls = avio_protocol_get_class("tls");
+    const AVOption* verify = tls ? av_opt_find(&tls, "tls_verify", nullptr, 0, AV_OPT_SEARCH_FAKE_OBJ) : nullptr;
+    return verify != nullptr;
+}
+
 inline int openAuthenticatedFile(AVFormatContext* context, AVIOContext** io, const char* url,
                                   int flags, AVDictionary** options) {
     // Static Emby media is one file. A playlist or container must not reuse
@@ -41,6 +50,46 @@ inline int openAuthenticatedFile(AVFormatContext* context, AVIOContext** io, con
     return avio_open2(io, url, flags, &context->interrupt_callback, options);
 }
 
+// The options a request carrying a credential is opened with, or why it may
+// not be made: only HTTP and HTTPS carry one, and only with an FFmpeg that
+// can be held to the one server named.
+inline int authenticatedOptions(const std::string& path, const std::string& headers,
+                                std::chrono::microseconds readTimeout, AVDictionary** dictionary) {
+    const char* protocol = avio_find_protocol_name(path.c_str());
+    if (!protocol || (std::strcmp(protocol, "http") != 0 && std::strcmp(protocol, "https") != 0)) {
+        return AVERROR(EACCES);
+    }
+    // Check the loaded dependency before any request. An ignored option
+    // discovered after opening would already have leaked the credential.
+    const AVClass* protocolClass = avio_protocol_get_class(protocol);
+    const AVOption* redirects = protocolClass ? av_opt_find(&protocolClass, "max_redirects", nullptr,
+        0, AV_OPT_SEARCH_FAKE_OBJ) : nullptr;
+    if (!redirects || redirects->type != AV_OPT_TYPE_INT || redirects->min > 0) {
+        return AVERROR(ENOSYS);
+    }
+    const bool secure = std::strcmp(protocol, "https") == 0;
+    if (secure && !canVerifyServerCertificate()) return AVERROR(ENOSYS);
+    const auto set = [&](const char* name, const char* value) {
+        return av_dict_set(dictionary, name, value, 0);
+    };
+    int result = set("max_redirects", "0");
+    // The server proves it is the one named before it is sent the
+    // credential, as the requests WinHTTP makes already require. HTTP hands
+    // the option to the TLS connection under it, and to the one each seek
+    // or reconnect makes.
+    if (result >= 0 && secure) result = set("tls_verify", "1");
+    if (result >= 0) result = set("headers", headers.c_str());
+    if (result >= 0) result = set("user_agent", buildUserAgent().c_str());
+    if (result >= 0) result = set("reconnect", "1");
+    if (result >= 0) result = set("reconnect_on_network_error", "1");
+    if (result >= 0) result = set("reconnect_delay_max", "4");
+    // The generic URL option, which FFmpeg copies to the TCP/TLS
+    // connection under it and again to every reconnect.
+    if (result >= 0) result = set("rw_timeout", std::to_string(readTimeout.count()).c_str());
+    if (result < 0) av_dict_free(dictionary);
+    return result;
+}
+
 }  // namespace media_input_detail
 
 // Shared by video, photos and the independent audio demuxer. Keep the policy
@@ -50,34 +99,8 @@ inline int openMediaInput(AVFormatContext** context, const std::string& path,
     AVDictionary* dictionary = nullptr;
     if (!headers.empty()) {
         if (!context || !*context || (*context)->pb) return AVERROR(EINVAL);
-        const char* protocol = avio_find_protocol_name(path.c_str());
-        if (!protocol || (std::strcmp(protocol, "http") != 0 && std::strcmp(protocol, "https") != 0)) {
-            return AVERROR(EACCES);
-        }
-        // Check the loaded dependency before any request. An ignored option
-        // discovered after opening would already have leaked the credential.
-        const AVClass* protocolClass = avio_protocol_get_class(protocol);
-        const AVOption* redirects = protocolClass ? av_opt_find(&protocolClass, "max_redirects", nullptr,
-            0, AV_OPT_SEARCH_FAKE_OBJ) : nullptr;
-        if (!redirects || redirects->type != AV_OPT_TYPE_INT || redirects->min > 0) {
-            return AVERROR(ENOSYS);
-        }
-        const auto set = [&](const char* name, const char* value) {
-            return av_dict_set(&dictionary, name, value, 0);
-        };
-        int result = set("max_redirects", "0");
-        if (result >= 0) result = set("headers", headers.c_str());
-        if (result >= 0) result = set("user_agent", buildUserAgent().c_str());
-        if (result >= 0) result = set("reconnect", "1");
-        if (result >= 0) result = set("reconnect_on_network_error", "1");
-        if (result >= 0) result = set("reconnect_delay_max", "4");
-        // The generic URL option, which FFmpeg copies to the TCP/TLS
-        // connection under it and again to every reconnect.
-        if (result >= 0) result = set("rw_timeout", std::to_string(kHttpReadTimeout.count()).c_str());
-        if (result < 0) {
-            av_dict_free(&dictionary);
-            return result;
-        }
+        const int prepared = media_input_detail::authenticatedOptions(path, headers, kHttpReadTimeout, &dictionary);
+        if (prepared < 0) return prepared;
         (*context)->io_open = media_input_detail::openAuthenticatedFile;
     }
     const int result = avformat_open_input(context, path.c_str(), nullptr,

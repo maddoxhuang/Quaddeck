@@ -89,15 +89,14 @@ void App::logAudioOutput(const char* what) {
     message << what << ": " << wideToUtf8Text(audioOutputName(audio_.requestedDevice()))
             << (audio_.openedRequestedDevice() ? "" : " (did not open; Windows' default instead)")
             << ", " << audio_.deviceChannelCount() << " channels, voices in " << audio_.sourceChannels();
+    if (!audio_.effectsRun()) message << "; the effects do not run on it";
     appendDiagnostic(message.str());
 }
 
 // Every pane's sound stops, the output is taken down and brought up on the
 // output wanted, and each pane is sought again in the new layout.
 bool App::reopenAudioOutput(const char* reason) {
-    for (const auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
+    silenceAllSources();
     const bool opened = audio_.reopen(wantedAudioOutput(), audioSettings_.deviceChannels);
     if (opened) {
         audioReopenFailed_ = false;
@@ -589,67 +588,13 @@ bool App::handleAudioKey(KeyAction action) {
 // The Audio tab
 
 void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
-    const auto header = [&](const wchar_t* text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Header;
-        row.label = text;
-        rows.push_back(std::move(row));
-    };
-    const auto note = [&](const std::wstring& text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Note;
-        row.wrapNote = true;
-        row.label = text;
-        rows.push_back(std::move(row));
-    };
-    const auto toggle = [&](SettingId id, int param, const std::wstring& label, bool on) {
-        PanelRow row;
-        row.kind = PanelRowKind::Toggle;
-        row.id = id;
-        row.param = param;
-        row.label = label;
-        row.on = on;
-        rows.push_back(std::move(row));
-    };
-    // A few short options are segments beside the label; a long list, or
-    // long names, a drop-down.
-    const auto choice = [&](SettingId id, int param, const std::wstring& label, std::vector<std::wstring> options,
-                            int selected, bool dropDown = false) {
-        PanelRow row;
-        row.kind = PanelRowKind::Choice;
-        row.id = id;
-        row.param = param;
-        row.label = label;
-        row.options = std::move(options);
-        row.selected = selected;
-        row.dropDown = dropDown;
-        rows.push_back(std::move(row));
-    };
+    PanelRowAppender add(rows);
     // A volume, muted from the button at its end.
     const auto volume = [&](SettingId id, int param, const std::wstring& label, float value01,
                             const std::wstring& value, bool muted) {
-        PanelRow row;
-        row.kind = PanelRowKind::Slider;
-        row.id = id;
-        row.param = param;
-        row.label = label;
-        row.slider01 = std::clamp(value01, 0.0F, 1.0F);
-        row.value = value;
+        PanelRow& row = add.slider(id, param, label, value01, value);
         row.trailingToggle = true;
         row.trailingOn = muted;
-        rows.push_back(std::move(row));
-    };
-    const auto buttons = [&](SettingId id, int param, const std::wstring& label, std::vector<std::wstring> captions,
-                             const std::wstring& value, bool enabled = true) {
-        PanelRow row;
-        row.kind = PanelRowKind::Buttons;
-        row.id = id;
-        row.param = param;
-        row.label = label;
-        row.options = std::move(captions);
-        row.value = value;
-        row.enabled = enabled;
-        rows.push_back(std::move(row));
     };
     const auto withKey = [&](const std::wstring& label, KeyAction action) {
         const std::wstring key = shortcut(action);
@@ -661,8 +606,8 @@ void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
            audio_.muted());
     rows.back().hint = L"The button at the end mutes every video (" + shortcut(KeyAction::Mute) + L").";
     // The limit a percent at a time, in a spin box: an arrow held steps on.
-    buttons(SettingId::AudioMaxVolume, -1, L"Volume can reach", {L"Up", L"Down"},
-            std::to_wstring(audioSettings_.maxVolume) + L"%");
+    add.buttons(SettingId::AudioMaxVolume, -1, L"Volume can reach", {L"Up", L"Down"},
+                std::to_wstring(audioSettings_.maxVolume) + L"%");
     rows.back().spinBox = true;
     rows.back().slider01 = static_cast<float>(audioSettings_.maxVolume - kAudioMaxVolumeLeast) /
                            static_cast<float>(kAudioMaxVolumeMost - kAudioMaxVolumeLeast);
@@ -674,12 +619,12 @@ void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
     for (std::size_t position = 0; position < kMaxPanes; ++position) {
         const auto pane = paneForPosition(position);
         if (!sources_[pane]) continue;
-        if (!videos) header(L"Videos");
+        if (!videos) add.header(L"Videos");
         videos = true;
         const int video = static_cast<int>(position);
         const std::wstring name = L"V" + std::to_wstring(position + 1);
-        toggle(SettingId::PaneAudio, video, withKey(name + L" sound", static_cast<KeyAction>(
-                   static_cast<std::size_t>(KeyAction::AudioV1) + position)), audioPaneEnabled(pane));
+        add.toggle(SettingId::PaneAudio, video, withKey(name + L" sound", static_cast<KeyAction>(
+                       static_cast<std::size_t>(KeyAction::AudioV1) + position)), audioPaneEnabled(pane));
         rows.back().video = video;
         rows.back().hint = L"Several videos can be heard at once.";
         volume(SettingId::PaneVolume, video, name + L" volume", audio_.paneVolume(pane), percent(audio_.paneVolume(pane)),
@@ -692,18 +637,18 @@ void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
             tracks.push_back(audioTrackLabel(track));
         }
         const bool any = !tracks.empty();
-        choice(SettingId::PaneAudioTrack, video, name + L" audio track",
-               std::move(tracks), chosen, true);
+        add.choice(SettingId::PaneAudioTrack, video, name + L" audio track",
+                   std::move(tracks), chosen, true);
         rows.back().value = L"No audio track";
         rows.back().enabled = any;
         rows.back().video = video;
-        buttons(SettingId::PaneAudioDelay, video, name + L" sound timing", {L"Earlier", L"Later", L"In step"},
-                audioDelayText(audioDelays_[pane]), paneLogicallyLoaded(pane));
+        add.buttons(SettingId::PaneAudioDelay, video, name + L" sound timing", {L"Earlier", L"Later", L"In step"},
+                    audioDelayText(audioDelays_[pane]), paneLogicallyLoaded(pane));
         rows.back().video = video;
         rows.back().hint = L"Its sound against its picture, 50 ms a press.";
     }
 
-    header(L"Output");
+    add.header(L"Output");
     {
         // Windows' default, then the outputs as listed; one chosen that is
         // not connected stays the choice, last.
@@ -717,8 +662,8 @@ void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
             outputs.push_back(audioSettings_.deviceName + L"  (not connected)");
             selected = static_cast<int>(outputs.size() - 1);
         }
-        choice(SettingId::AudioDevice, -1, withKey(L"Output device", KeyAction::AudioOutputNext), std::move(outputs),
-               selected, true);
+        add.choice(SettingId::AudioDevice, -1, withKey(L"Output device", KeyAction::AudioOutputNext), std::move(outputs),
+                   selected, true);
     }
     {
         std::wostringstream playing;
@@ -729,59 +674,65 @@ void App::appendAudioSettingsRows(std::vector<PanelRow>& rows) const {
                     << audio_.deviceChannelCount() << L" channels";
             if (!audio_.openedRequestedDevice()) playing << L" (it did not open; Windows' default plays)";
             playing << L".";
+            // Said, or Sound's switches and the volume past 100% would
+            // seem to do nothing for no reason.
+            if (!audio_.effectsRun()) {
+                playing << L" The effects under Sound do not run on this output, and volume above 100% is not "
+                           L"kept from clipping.";
+            }
         }
-        note(playing.str());
+        add.note(playing.str());
     }
-    choice(SettingId::AudioSpeakers, -1, L"Speakers",
-           {L"Stereo", L"Every speaker  (" + std::to_wstring(audio_.deviceChannelCount()) + L")"},
-           audioSettings_.deviceChannels ? 1 : 0);
+    add.choice(SettingId::AudioSpeakers, -1, L"Speakers",
+               {L"Stereo", L"Every speaker  (" + std::to_wstring(audio_.deviceChannelCount()) + L")"},
+               audioSettings_.deviceChannels ? 1 : 0);
     rows.back().hint = L"Stereo mixes every track down to two channels; every speaker plays a 5.1 or 7.1 track "
                        L"on the output's own speakers.";
-    buttons(SettingId::AudioDelayAll, -1, L"Every video's sound",
-            {L"Earlier", L"Later", L"In step"}, audioDelayText(audioSettings_.delayMs / 1000.0));
+    add.buttons(SettingId::AudioDelayAll, -1, L"Every video's sound",
+                {L"Earlier", L"Later", L"In step"}, audioDelayText(audioSettings_.delayMs / 1000.0));
     rows.back().hint = L"For an output that is late itself, such as Bluetooth headphones: 50 ms a press.";
 
-    header(L"Sound");
-    toggle(SettingId::AudioNormalize, -1, withKey(L"Normalize loudness", KeyAction::Normalizer),
-           audioSettings_.effects.normalize);
+    add.header(L"Sound");
+    add.toggle(SettingId::AudioNormalize, -1, withKey(L"Normalize loudness", KeyAction::Normalizer),
+               audioSettings_.effects.normalize);
     rows.back().hint = L"Quiet and loud videos come out at much the same level.";
     {
         std::vector<std::wstring> strengths;
         for (int strength = 0; strength < kAudioStrengthCount; ++strength) strengths.emplace_back(audioStrengthLabel(strength));
-        choice(SettingId::AudioNightMode, -1, withKey(L"Night mode", KeyAction::NightMode), strengths,
-               audioSettings_.effects.compression);
+        add.choice(SettingId::AudioNightMode, -1, withKey(L"Night mode", KeyAction::NightMode), strengths,
+                   audioSettings_.effects.compression);
         rows.back().hint = L"Loud scenes are brought down and quiet speech up, for listening at low volume.";
         std::vector<std::wstring> modes;
         for (int mode = 0; mode < kAudioStereoModeCount; ++mode) {
             modes.emplace_back(audioStereoModeLabel(static_cast<AudioStereoMode>(mode)));
         }
-        choice(SettingId::AudioChannels, -1, L"Channels", std::move(modes), static_cast<int>(audioSettings_.effects.stereo),
-               true);
+        add.choice(SettingId::AudioChannels, -1, L"Channels", std::move(modes), static_cast<int>(audioSettings_.effects.stereo),
+                   true);
         rows.back().hint = L"Swapped " + shortcut(KeyAction::SwapChannels) + L", voice removal " +
                            shortcut(KeyAction::VoiceRemoval) + L": what is in the middle cancels out.";
-        toggle(SettingId::AudioVoice, -1, withKey(L"Voice emphasis", KeyAction::VoiceEmphasis),
-               audioSettings_.effects.voiceEmphasis);
-        toggle(SettingId::AudioCrossfeed, -1, L"Headphone crossfeed", audioSettings_.effects.crossfeed);
+        add.toggle(SettingId::AudioVoice, -1, withKey(L"Voice emphasis", KeyAction::VoiceEmphasis),
+                   audioSettings_.effects.voiceEmphasis);
+        add.toggle(SettingId::AudioCrossfeed, -1, L"Headphone crossfeed", audioSettings_.effects.crossfeed);
         rows.back().hint = L"Each ear hears a little of the other side, as from speakers: less tiring on headphones.";
-        choice(SettingId::AudioWidening, -1, L"Stereo widening", std::move(strengths), audioSettings_.effects.widening);
+        add.choice(SettingId::AudioWidening, -1, L"Stereo widening", std::move(strengths), audioSettings_.effects.widening);
     }
-    toggle(SettingId::AudioPitch, -1, L"Keep pitch at other speeds", audioSettings_.pitchCorrection);
+    add.toggle(SettingId::AudioPitch, -1, L"Keep pitch at other speeds", audioSettings_.pitchCorrection);
     {
         std::vector<std::wstring> languages;
         for (int language = 0; language < kAudioLanguageCount; ++language) {
             languages.emplace_back(audioLanguageLabel(static_cast<AudioLanguage>(language)));
         }
-        choice(SettingId::AudioLanguage, -1, L"Preferred audio language", std::move(languages),
-               static_cast<int>(audioSettings_.language), true);
+        add.choice(SettingId::AudioLanguage, -1, L"Preferred audio language", std::move(languages),
+                   static_cast<int>(audioSettings_.language), true);
         rows.back().hint = L"Automatic: the file's default track, or the one Emby names.";
     }
 
-    header(L"Equalizer");
-    toggle(SettingId::Equalizer, -1, withKey(L"Use the equalizer", KeyAction::Equalizer), audioSettings_.effects.equalizer);
+    add.header(L"Equalizer");
+    add.toggle(SettingId::Equalizer, -1, withKey(L"Use the equalizer", KeyAction::Equalizer), audioSettings_.effects.equalizer);
     {
         std::vector<std::wstring> presets;
         for (const auto& preset : kEqualizerPresets) presets.emplace_back(preset.name);
-        choice(SettingId::EqualizerPreset, -1, L"Preset", std::move(presets), audioSettings_.equalizerPreset, true);
+        add.choice(SettingId::EqualizerPreset, -1, L"Preset", std::move(presets), audioSettings_.equalizerPreset, true);
         rows.back().value = L"Custom";
     }
     {

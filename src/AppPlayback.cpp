@@ -71,12 +71,10 @@ void App::togglePlayback() {
     }
     if (clock_.isPlaying()) {
         clock_.pause();
-        for (auto& source : sources_) {
-            if (source) source->setAudioEnabled(false);
-        }
+        silenceAllSources();
         audio_.pause();
         audio_.flush();
-    } else {
+    } else if (!resumeInPlace(clock_.position())) {
         beginSynchronizedSeek(clock_.position(), false, true);
     }
     showNotice(playbackIntended() ? L"Playing" : L"Paused");
@@ -121,7 +119,7 @@ void App::stopPlayback() {
     }
     cancelSeekBarrier();
     clock_.pause();
-    for (auto& source : sources_) if (source) source->setAudioEnabled(false);
+    silenceAllSources();
     audio_.pause();
     audio_.flush();
     if (independentDeck) {
@@ -233,9 +231,7 @@ void App::seekAbsolute(double position, SeekStyle style, bool keepEmbyPhotos) {
         // A barrier that was going to resume had parked the clock.
         clock_.play();
     }
-    for (auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
+    silenceAllSources();
     const auto origins = keepEmbyPhotos ? paneOrigins() : PaneOrigins{};
     for (std::size_t index = 0; index < sources_.size(); ++index) {
         if (!sources_[index]) {
@@ -286,70 +282,38 @@ void App::seekAbsolute(double position, SeekStyle style, bool keepEmbyPhotos) {
 void App::alignBrowserPanesToTime(double requested, bool announce) {
     if (!linkedBrowserSeekBars() || !std::isfinite(requested)) return;
     const auto origins = paneOrigins();
-    if (deviceRecoveryPending_) {
-        // Recovery retains paths and adjustments while decoders are absent.
-        // Save the same source-second target in those adjustments; openSource
-        // will reuse them when the device and streams return.
-        double longest = 0.0;
-        for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
-            if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
-            const double knownDuration = sources_[pane] ? sources_[pane]->duration()
-                                                         : deviceRecoverySourceDurations_[pane];
-            if (knownDuration <= 0.0) {
-                pendingSeekDirection_ = 0;
-                showNotice(L"Wait for video lengths after device recovery");
-                return;
-            }
-            longest = std::max(longest, knownDuration - browserOffsets_[pane]);
-        }
-        if (longest <= 0.0) {
-            pendingSeekDirection_ = 0;
-            return;
-        }
-        const double target = std::clamp(requested, 0.0, longest);
-        duration_ = target;
-        for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
-            if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
-            const double knownDuration = sources_[pane] ? sources_[pane]->duration()
-                                                         : deviceRecoverySourceDurations_[pane];
-            const double paneTarget = std::min(target + browserOffsets_[pane], knownDuration);
-            syncAdjustments_[pane] = paneTarget -
-                (target - startDelays_[pane]) * playbackRates_[pane];
-            const bool heldAtEnd = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
-                                   (localPanes_[pane] && localPanes_[pane]->endHandled);
-            if (heldAtEnd) sourcePaused_[pane] = false;
-            if (sourcePaused_[pane]) sourcePausedTimes_[pane] = std::max(0.0, paneTarget);
-            if (embyPanes_[pane]) embyPanes_[pane]->endHandled = false;
-            if (localPanes_[pane]) localPanes_[pane]->endHandled = false;
-            duration_ = std::max(duration_, timelineDuration(knownDuration,
-                startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]));
-        }
-        browserSeekAligned_ = true;
-        seekAbsolute(target, SeekStyle::Fast, true);
-        if (announce) showNotice(L"Aligned video time to " + formatTime(target));
-        return;
-    }
+    const auto aligned = [&](std::size_t pane) {
+        return origins[pane] != PaneOrigin::Empty && origins[pane] != PaneOrigin::EmbyPhoto;
+    };
+    // Each aligned video's length, or why the deck cannot be aligned yet.
+    PaneArray<double> lengths{};
     double longest = 0.0;
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
-        if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
-        if (sources_[pane] && !sources_[pane]->error().empty()) {
-            pendingSeekDirection_ = 0;
-            showNotice(L"Close the failed video before aligning");
-            return;
+        if (!aligned(pane)) continue;
+        const wchar_t* refusal = nullptr;
+        if (deviceRecoveryPending_) {
+            // Recovery retains paths and adjustments while decoders are
+            // absent. Save the same source-second target in those
+            // adjustments; openSource will reuse them when the device and
+            // streams return.
+            lengths[pane] = sources_[pane] ? sources_[pane]->duration() : deviceRecoverySourceDurations_[pane];
+            if (lengths[pane] <= 0.0) refusal = L"Wait for video lengths after device recovery";
+        } else if (sources_[pane] && !sources_[pane]->error().empty()) {
+            refusal = L"Close the failed video before aligning";
+        } else if (!sources_[pane] || !sources_[pane]->ready()) {
+            refusal = L"Wait for every video to finish opening before aligning";
+        } else {
+            lengths[pane] = sources_[pane]->duration();
+            if (lengths[pane] <= 0.0) refusal = L"Cannot align a video with unknown duration";
         }
-        if (!sources_[pane] || !sources_[pane]->ready()) {
+        if (refusal) {
             pendingSeekDirection_ = 0;
-            showNotice(L"Wait for every video to finish opening before aligning");
-            return;
-        }
-        if (sources_[pane]->duration() <= 0.0) {
-            pendingSeekDirection_ = 0;
-            showNotice(L"Cannot align a video with unknown duration");
+            showNotice(refusal);
             return;
         }
         // The rail runs to where the last video ends among the others, each
         // counted from its offset.
-        longest = std::max(longest, sources_[pane]->duration() - browserOffsets_[pane]);
+        longest = std::max(longest, lengths[pane] - browserOffsets_[pane]);
     }
     if (longest <= 0.0) {
         pendingSeekDirection_ = 0;
@@ -358,12 +322,12 @@ void App::alignBrowserPanesToTime(double requested, bool announce) {
     const double target = std::clamp(requested, 0.0, longest);
     duration_ = target;
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
-        if (origins[pane] == PaneOrigin::Empty || origins[pane] == PaneOrigin::EmbyPhoto) continue;
+        if (!aligned(pane)) continue;
         // Each video goes to the target plus its own offset; one whose
         // offset puts it before its start waits there. A shorter video can
         // only reach its own end, where one that repeats waits for the
         // others; an A-B loop remains in force and may remap that end.
-        const double paneTarget = std::min(target + browserOffsets_[pane], sources_[pane]->duration());
+        const double paneTarget = std::min(target + browserOffsets_[pane], lengths[pane]);
         syncAdjustments_[pane] = paneTarget -
             (target - startDelays_[pane]) * playbackRates_[pane];
         const bool heldAtEnd = (embyPanes_[pane] && embyPanes_[pane]->endHandled) ||
@@ -373,14 +337,14 @@ void App::alignBrowserPanesToTime(double requested, bool announce) {
         if (embyPanes_[pane]) embyPanes_[pane]->endHandled = false;
         if (localPanes_[pane]) localPanes_[pane]->endHandled = false;
         duration_ = std::max(duration_, timelineDuration(
-            sources_[pane]->duration(), startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]));
+            lengths[pane], startDelays_[pane], syncAdjustments_[pane], playbackRates_[pane]));
     }
     browserSeekAligned_ = true;
     seekAbsolute(target, SeekStyle::Fast, true);
     if (announce) showNotice(L"Aligned video time to " + formatTime(target));
 }
 
-void App::beginSynchronizedSeek(double position, bool showKeyframePreview, bool resume) {
+void App::parkClockForBarrier(double position) {
     cancelSeekBarrier();
     seekBarrierStarted_ = std::chrono::steady_clock::now();
     // The tracking error says nothing across a discontinuity; start over.
@@ -388,9 +352,11 @@ void App::beginSynchronizedSeek(double position, bool showKeyframePreview, bool 
     clock_.pause();
     clock_.seek(position);
     audio_.pause();
-    for (auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
+}
+
+void App::beginSynchronizedSeek(double position, bool showKeyframePreview, bool resume) {
+    parkClockForBarrier(position);
+    silenceAllSources();
 
     const bool anyWait = seekBarrier_.begin(
         position, resume, paneTimings(), audioMask_, activeSeekMode());
@@ -418,6 +384,52 @@ void App::beginSynchronizedSeek(double position, bool showKeyframePreview, bool 
             << " resume=" << resume << " preview=" << showKeyframePreview;
     appendDiagnostic(message.str());
     if (!anyWait) completeSeekBarrier();
+}
+
+bool App::resumeInPlace(double position) {
+    const auto timings = paneTimings();
+    const SeekMode seek = activeSeekMode();
+    PaneArray<ShownFrame> shown{};
+    for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
+        if (!sources_[pane]) continue;
+        // A pane that failed, or whose place is still to be settled after
+        // its open, is the seek's to deal with.
+        if (!sources_[pane]->error().empty() || sourceInitialAlignmentPending_[pane]) return false;
+        // Nor is one that has not started asked for a frame, as in tick().
+        if (!paneIsActive(timings[pane], position)) return false;
+        // The frame a stopped source hands out for this time, as tick() asks
+        // for it; none while a seek of its own has yet to give its first.
+        const auto frame = sources_[pane]->frameForTime(mappedPaneTime(timings[pane], position, seek), false);
+        if (frame) shown[pane] = {true, frame->pts, frame->duration};
+    }
+    if (!canResumeInPlace(position, timings, shown, seek)) return false;
+
+    parkClockForBarrier(position);
+    const bool anyAudio = seekBarrier_.beginResume(position, timings, audioMask_, seek);
+    for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
+        if (!sources_[pane]) {
+            audio_.flush(pane);
+            continue;
+        }
+        sources_[pane]->setAudioEnabled(false);
+        audio_.setRate(pane, static_cast<float>(playbackRates_[pane]));
+        if (!seekBarrier_.audioWaiting(pane)) {
+            audio_.flush(pane);
+            continue;
+        }
+        // The sound starts again at the same place, under a generation of
+        // its own, as when Play is pressed during a paused seek.
+        const auto audioGeneration = sources_[pane]->requestAudioSeek(seekBarrier_.paneTarget(pane));
+        audio_.flush(pane, audioGeneration);
+        seekBarrier_.setAudioGeneration(pane, audioGeneration);
+        sources_[pane]->setAudioEnabled(true);
+    }
+    std::ostringstream message;
+    message << "Resume in place target=" << std::fixed << std::setprecision(3) << position
+            << " audio_wait=" << anyAudio;
+    appendDiagnostic(message.str());
+    if (!anyAudio) completeSeekBarrier();
+    return true;
 }
 
 void App::cancelSeekBarrier() {

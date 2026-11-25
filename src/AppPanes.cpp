@@ -49,12 +49,8 @@ void App::loadFiles(const std::vector<std::wstring>& files) {
         deviceRecoveryPosition_ = 0.0;
         deviceRecoveryResume_ = false;
     }
-    for (auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
-    audio_.flush();
+    retireAllSources();
     duration_ = 0.0;
-    for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
     paths_.fill({});
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) resetPaneMediaState(pane);
     startDelays_.fill(0.0);
@@ -67,8 +63,6 @@ void App::loadFiles(const std::vector<std::wstring>& files) {
     sourceLoopA_.fill(0.0);
     sourceLoopB_.fill(0.0);
     lastVideoMappedTimes_.fill(-1.0);
-    sourceInitialAlignmentPending_.fill(false);
-    sourceProvisionalTargets_.fill(0.0);
     masterLoopEnabled_ = false;
     masterLoopA_ = masterLoopB_ = 0.0;
 
@@ -185,6 +179,20 @@ void App::retireSource(std::size_t pane) {
     sourceReaper_.retire(std::move(sources_[pane]));
     lastDecodedFrames_[pane] = 0;
     lastCapacityWaits_[pane] = 0;
+}
+
+void App::silenceAllSources() {
+    for (auto& source : sources_) {
+        if (source) source->setAudioEnabled(false);
+    }
+}
+
+void App::retireAllSources() {
+    silenceAllSources();
+    audio_.flush();
+    for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
+    sourceInitialAlignmentPending_.fill(false);
+    sourceProvisionalTargets_.fill(0.0);
 }
 
 void App::startSourceStream(std::size_t pane, const std::wstring& url, const SourceOptions& options,
@@ -856,6 +864,9 @@ void App::swapPanes(std::size_t first, std::size_t second) {
         setSubtitlesShownFor(subtitleSettings_, second, firstShown);
     }
     std::swap(assPanes_[first], assPanes_[second]);
+    // Laid out for the cell each was in: made again where each is now.
+    picturePanes_[first] = {};
+    picturePanes_[second] = {};
     audio_.swapPaneSettings(first, second);
     const bool firstAudio = audioPaneEnabled(first);
     const bool secondAudio = audioPaneEnabled(second);

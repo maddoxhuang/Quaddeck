@@ -1862,13 +1862,13 @@ void Overlay::drawPanel(const OverlayScene& scene) {
             litFace(geometry.row, row.enabled && hotRow && !pressedRow, row.enabled && pressedRow, rowAlpha, s);
             const auto& picture = geometry.control;
             fillRound(picture, 6.0F * s, withAlpha(rgba(15, 19, 26, 0.94F), rowAlpha));
-            ID2D1Bitmap* bitmap = panel.thumbnails && !row.tileKeys.empty()
-                ? bitmapFor(row.tileKeys.front(), *panel.thumbnails) : nullptr;
+            ID2D1Bitmap* bitmap = panel.thumbnails && !row.tiles.empty()
+                ? bitmapFor(row.tiles.front().key, *panel.thumbnails) : nullptr;
             bool drawn = false;
             if (bitmap && picture.visible()) {
                 const auto size = bitmap->GetSize();
                 if (size.width > 0.0F && size.height > 0.0F) {
-                    const float aspect = panel.thumbnails->drawAspect(row.tileKeys.front(), size.width, size.height);
+                    const float aspect = panel.thumbnails->drawAspect(row.tiles.front().key, size.width, size.height);
                     const float width = std::min(picture.width, picture.height * aspect), height = width / aspect;
                     const OverlayRect destination{picture.x + (picture.width - width) * 0.5F,
                         picture.y + (picture.height - height) * 0.5F, width, height};
@@ -2472,7 +2472,9 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
     const float radius = 8.0F * s;
     // Until its picture comes, a button's face.
     fillRound(picture, radius, withAlpha(rgba(255, 255, 255, pressed ? kFacePressed : hot ? kFaceHot : kFaceRest), alpha));
-    const std::string& key = part < row.tileKeys.size() ? row.tileKeys[part] : std::string();
+    // What the tile shows, once the row's content is filled.
+    const PanelTile* tile = part < row.tiles.size() ? &row.tiles[part] : nullptr;
+    const std::string& key = tile ? tile->key : std::string();
     ID2D1Bitmap* bitmap = cache ? bitmapFor(key, *cache) : nullptr;
     if (bitmap) {
         // The whole picture inside the frame, letterboxed: a portrait phone
@@ -2498,8 +2500,7 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
         text(initial, OverlayTextStyle::Title, picture, withAlpha(kTextDim, alpha * 0.6F));
     }
     // The tile being played framed in the colour of the video playing it.
-    const int playing = part < row.tilePlaying.size() ? row.tilePlaying[part]
-                      : row.selected == static_cast<int>(part) ? 0 : -1;
+    const int playing = tile ? tile->playing : row.selected == static_cast<int>(part) ? 0 : -1;
     const bool current = playing >= 0;
     if (hot || pressed || current) {
         strokeRound(picture, radius, current ? withAlpha(paneColor(playing), alpha) : withAlpha(kAccent, 0.9F * alpha),
@@ -2507,7 +2508,7 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
     }
     // How far it was watched, along the picture's bottom edge: in the colour
     // of the video playing it, as its frame.
-    const float progress = part < row.tileProgress.size() ? std::clamp(row.tileProgress[part], 0.0F, 1.0F) : 0.0F;
+    const float progress = tile ? std::clamp(tile->progress, 0.0F, 1.0F) : 0.0F;
     if (progress > 0.0F) {
         const OverlayRect track{picture.x + 6.0F * s, picture.bottom() - 7.0F * s, picture.width - 12.0F * s, 3.0F * s};
         fillRound(track, 1.5F * s, withAlpha(rgba(0, 0, 0, 0.55F), alpha));
@@ -2533,19 +2534,21 @@ void Overlay::drawTile(const PanelRow& row, std::size_t part, const OverlayRect&
     // a tag in the accent below them, or in the colour of the video
     // playing it.
     const D2D1_COLOR_F shade = rgba(0, 0, 0, 0.65F);
-    if (part < row.tileMarks.size()) pill(row.tileMarks[part], true, true, shade);
-    if (part < row.tileBadges.size()) pill(row.tileBadges[part], false, true, shade);
-    if (part < row.tileTags.size()) pill(row.tileTags[part], true, false, paneColor(playing, 0.92F));
+    if (tile) {
+        pill(tile->mark, true, true, shade);
+        pill(tile->badge, false, true, shade);
+        pill(tile->tag, true, false, paneColor(playing, 0.92F));
+    }
     // A favorite's heart in the right-hand column, under the badge: the
     // bottom-right corner is the Add button's, placed as settingsPanelLayout
     // places it, and on a tile too small for both the heart gives way.
-    if (part < row.tileFavorites.size() && row.tileFavorites[part]) {
+    if (tile && tile->favorite) {
         const float size = 20.0F * s;
-        const bool badge = part < row.tileBadges.size() && !row.tileBadges[part].empty();
+        const bool badge = !tile->badge.empty();
         const OverlayRect heartBox{picture.right() - size - 6.0F * s, picture.y + (badge ? 30.0F : 6.0F) * s,
                                    size, size};
         float free = picture.bottom();
-        if (part < row.tileAddAvailable.size() && row.tileAddAvailable[part] && box.width > 12.0F * s) {
+        if (tile->addAvailable && box.width > 12.0F * s) {
             free -= std::min(28.0F * s, std::max(0.0F, pictureHeight - 12.0F * s)) + 12.0F * s;
         }
         if (heartBox.bottom() <= free) {

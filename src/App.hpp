@@ -13,6 +13,7 @@
 #include "LocalPlaylist.hpp"
 #include "LocalThumbnails.hpp"
 #include "FileAssociations.hpp"
+#include "FilePersistence.hpp"
 #include "HangWatchdog.hpp"
 #include "Overlay.hpp"
 #include "OverlayLayout.hpp"
@@ -354,6 +355,9 @@ private:
         std::size_t slot{};
     };
     KeyChord keyChordOf(WPARAM key, bool alt) const;
+    // Whether Ctrl, Shift or Alt is held as a key press arrives: Windows'
+    // word for the window's thread.
+    static bool keyHeld(int virtualKey);
     // Does what the key's chord is bound to; false when it is bound to
     // nothing. A held key repeats only a step (KeyActionInfo::repeats).
     bool runShortcut(WPARAM key, LPARAM lParam, bool alt);
@@ -960,6 +964,10 @@ private:
     void embyAuthenticationArrived(std::uint64_t serial, const EmbyClient::Response& response);
     void embySignOut();
     void embySessionExpired();
+    // What signing out and a refused token share: whatever plays from the
+    // account stops, its token is forgotten here and on disk, and the
+    // browser closes with nothing of it left. `logOut` tells the server too.
+    void embyForgetAccount(bool logOut);
     // The video sets (AppVideoSets.cpp, VideoSets.hpp): QuadDeck's own list
     // of decks to play whole, kept beside the settings file and shown as
     // the sheet's face of its own. A set is the videos that played together
@@ -1198,9 +1206,13 @@ private:
         SubtitleSelection what;
         std::wstring label;
         SubtitleCandidate candidate;
-        // A stream of pictures is listed so the menu can say it is there,
-        // but only text is shown.
+        // A stream that cannot be shown is listed so the menu can say it is
+        // there: one of pictures that is not inside the file, or that the
+        // source has no decoder for.
         bool usable{true};
+        // A stream of pictures: the player chooses one by itself only
+        // where there is no text to show.
+        bool pictures{};
         // A file that could not be read when it was last tried: still on
         // the menu, but neither the player nor Alt+L picks it.
         bool unreadable{};
@@ -1315,6 +1327,11 @@ private:
     // nothing is on screen.
     std::shared_ptr<const SubtitleBitmap> renderAssSubtitles(std::size_t pane, double seconds, bool& drawn,
                                                              POINT& origin);
+    // The pane's subtitle at `seconds` of its video when the stream shown is
+    // one of pictures: its canvas laid over the pane's picture, in window
+    // positions and cut to the pane. Null when none is up. None of the
+    // subtitle settings' font, size or position applies to it.
+    std::shared_ptr<const SubtitleBitmap> renderPictureSubtitles(std::size_t pane, double seconds);
     // The Subtitles submenu, shared by the pane menu and the bar's button.
     void appendSubtitleMenu(PanelMenu& menu, std::size_t pane) const;
     void showSubtitleMenu(int pane, WindowMenuAnchor anchor);
@@ -1337,6 +1354,12 @@ private:
     void chooseSeekMode(SeekMode mode);
     void selectAudioTrack(std::size_t pane, int streamIndex);
     void retireSource(std::size_t pane);
+    // No source hands its sound to the output any more.
+    void silenceAllSources();
+    // The deck between one set of sources and the next: every source
+    // silenced, the sound the output still held dropped, each source
+    // retired, and nothing left of a new source's place still to settle.
+    void retireAllSources();
     void startSourceStream(std::size_t pane, const std::wstring& url, const SourceOptions& options,
                           int audioStream, double position, bool playing);
     LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
@@ -1418,6 +1441,9 @@ private:
     bool audioPaneEnabled(std::size_t pane) const;
     bool shouldOutputAudio(std::size_t pane, double timeline, bool playing) const;
     bool playbackIntended() const;
+    // Each tick: tells Windows what the deck now needs kept awake, when
+    // that has changed. `release` gives it up whatever plays, at exit.
+    void updateKeepAwake(bool release = false);
     void adjustVolumeFromWheel(short wheelDelta);
     // The master volume by 5 percent a step, up for positive steps.
     void stepVolume(int steps);
@@ -1626,8 +1652,17 @@ private:
     std::filesystem::path settingsPath() const;
     AppSettings captureAppSettings() const;
     bool loadAppSettings();
+    // The settings file's path and text as saving it would write them;
+    // false when they cannot be made. An empty path is nothing to write:
+    // the file not read yet, or read-only.
+    bool settingsDocument(std::filesystem::path& path, std::wstring& text) const;
+    // Writes the settings file before returning, on the calling thread:
+    // closing.
     bool saveAppSettings() const;
     void scheduleAppSettingsSave();
+    // The timer's save: the text is made here and written on
+    // settingsWriter_'s thread, so the window thread, which draws the
+    // video, never waits on the disk.
     void flushScheduledAppSettingsSave();
     void tick();
     void renderFrame();
@@ -1642,6 +1677,15 @@ private:
     void updateTitle();
     void toggleFullscreen();
     void beginSynchronizedSeek(double position, bool showKeyframePreview, bool resume);
+    // The start of a barrier, the seek's or the resume's: the one before it
+    // given up, the clock parked at `position` with its slew reset, the
+    // output paused.
+    void parkClockForBarrier(double position);
+    // Play after Pause from the pictures that are up, when canResumeInPlace
+    // says they are the ones for `position`: no video is sought, and the
+    // barrier waits only for the sound, started again there. False, with
+    // nothing done, when the deck has to be sought into place instead.
+    bool resumeInPlace(double position);
     void cancelSeekBarrier();
     bool seekBarrierReady() const;
     void completeSeekBarrier();
@@ -1687,6 +1731,10 @@ private:
     // sought. Audio-only operations must never consume this discontinuity
     // detector or a repeat wrap can leave video parked at EOF.
     PaneArray<double> lastVideoMappedTimes_{-1.0, -1.0, -1.0, -1.0, -1.0};
+    // Each pane's frame was past its middle when its source last handed it
+    // out (secondFieldDue): of an interlaced one the renderer then shows
+    // the second field.
+    PaneArray<bool> shownSecondField_{};
     // Fit, Fill or Stretch and the zoom: each pane's while it shares the
     // window, and one for whichever video is alone in it (shownView).
     PaneArray<PaneView> paneViews_{};
@@ -1747,6 +1795,11 @@ private:
     };
     std::unordered_map<std::wstring, VideoSetCheck> videoSetChecks_;
     std::uint64_t videoSetCheckSerial_{};
+    // The videos the last check asked about, the Emby account it asked as
+    // and when: the same asked again soon after is not (checkVideoSets).
+    std::vector<std::wstring> videoSetCheckAsked_;
+    std::uint64_t videoSetCheckAccount_{};
+    std::chrono::steady_clock::time_point videoSetCheckedAt_{};
     ThumbnailCache thumbnails_;
     std::set<std::string> embyImagesInFlight_;
     // A local file's picture is made by the one shell worker
@@ -2106,6 +2159,16 @@ private:
         bool failed{};
     };
     PaneArray<AssPane> assPanes_{};
+    // Each pane's picture subtitle as it was last laid out: scaled once for
+    // the picture, its place and the pane it was cut to, then drawn as it is
+    // until one of them changes.
+    struct PicturePane {
+        std::shared_ptr<const SubtitlePicture> picture;
+        RectF canvas;
+        RectF cell;
+        std::shared_ptr<const SubtitleBitmap> bitmap;
+    };
+    PaneArray<PicturePane> picturePanes_{};
     mutable std::optional<std::vector<std::string>> systemLanguagesRead_;
     std::shared_ptr<MainThreadQueue> mainQueue_{std::make_shared<MainThreadQueue>()};
     // Set when settings.qconfig names a newer version than this build reads,
@@ -2140,6 +2203,7 @@ private:
     ULONGLONG pointerLastMoved_{};
     POINT lastPointerScreen_{std::numeric_limits<LONG>::min(), std::numeric_limits<LONG>::min()};
     bool cursorHidden_{};
+    KeepAwake keptAwake_{KeepAwake::None};
     int wheelDeltaRemainder_{};
     bool repeatAll_{true};
     PlayOrder playOrder_{PlayOrder::InOrder};
@@ -2165,7 +2229,9 @@ private:
     PaneArray<bool> sourceInitialAlignmentPending_{};
     PaneArray<double> sourceProvisionalTargets_{};
     bool settingsSavePending_{};
-    unsigned settingsSaveRetryCount_{};
+    // Made with the first save the timer flushes; it tries a failed write
+    // again itself (kMaximumSettingsSaveRetries).
+    std::unique_ptr<BackgroundDocumentWriter> settingsWriter_;
     PaneArray<float> lastLayoutAspects_{};
     unsigned contentHeight_{};
     // The drawn interface: the painter, the scene it paints and the geometry

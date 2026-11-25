@@ -18,12 +18,6 @@
 
 namespace quaddeck {
 
-namespace {
-
-std::wstring widen(const std::string& text) { return utf8ToWideText(text); }
-
-}  // namespace
-
 // The worker starts from the body, after every member it uses exists.
 EmbyClient::EmbyClient() { worker_ = std::thread(&EmbyClient::workerMain, this); }
 
@@ -118,7 +112,7 @@ void EmbyClient::workerMain() {
 
 EmbyClient::Response EmbyClient::perform(const Job& job) {
     Response response;
-    const std::wstring url = widen(job.session.serverUrl);
+    const std::wstring url = utf8ToWideText(job.session.serverUrl);
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
     wchar_t host[256]{};
@@ -134,7 +128,7 @@ EmbyClient::Response EmbyClient::perform(const Job& job) {
     const bool secure = parts.nScheme == INTERNET_SCHEME_HTTPS;
     std::wstring path = prefix;
     if (path == L"/") path.clear();
-    path += widen(job.path);
+    path += utf8ToWideText(job.path);
 
     const auto failure = [](const char* step) {
         std::ostringstream out;
@@ -155,7 +149,7 @@ EmbyClient::Response EmbyClient::perform(const Job& job) {
         return response;
     }
     HINTERNET request = WinHttpOpenRequest(
-        connection, widen(job.method).c_str(), path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        connection, utf8ToWideText(job.method).c_str(), path.c_str(), nullptr, WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0);
     if (!request) {
         response.error = failure("Preparing the request");
@@ -180,9 +174,10 @@ EmbyClient::Response EmbyClient::perform(const Job& job) {
         activeRequest_ = request;
     }
     std::wstring headers = L"X-Emby-Authorization: " +
-                           widen(emby::authorizationHeader(job.session.deviceId)) + L"\r\n";
-    if (!job.session.token.empty()) headers += L"X-Emby-Token: " + widen(job.session.token) + L"\r\n";
-    headers += L"Accept: " + widen(job.accept.empty() ? std::string("application/json") : job.accept) + L"\r\n";
+                           utf8ToWideText(emby::authorizationHeader(job.session.deviceId)) + L"\r\n";
+    if (!job.session.token.empty()) headers += L"X-Emby-Token: " + utf8ToWideText(job.session.token) + L"\r\n";
+    headers += L"Accept: " + utf8ToWideText(job.accept.empty() ? std::string("application/json") : job.accept) +
+               L"\r\n";
     if (!job.body.empty()) headers += L"Content-Type: application/json\r\n";
     WinHttpAddRequestHeaders(request, headers.c_str(), static_cast<DWORD>(headers.size()),
                              WINHTTP_ADDREQ_FLAG_ADD);

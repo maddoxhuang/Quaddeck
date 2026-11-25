@@ -5,6 +5,7 @@
 #include "ColorConversion.hpp"
 #include "Diagnostics.hpp"
 #include "MediaInput.hpp"
+#include "TextEncoding.hpp"
 
 #include <windows.h>
 #include <algorithm>
@@ -26,6 +27,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/display.h>
+#include <libavutil/dovi_meta.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_d3d11va.h>
 #include <libswresample/swresample.h>
@@ -77,19 +79,47 @@ std::uint64_t nextAudioGeneration() noexcept {
     return gAudioGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
-std::string wideToUtf8(const std::wstring& value) {
-    if (value.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<std::size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
-    result.pop_back();
-    return result;
-}
-
 std::string ffmpegError(int code) {
     char buffer[AV_ERROR_MAX_STRING_SIZE]{};
     av_strerror(code, buffer, sizeof(buffer));
     return buffer;
+}
+
+// Whether reading again may get further than the read that failed with
+// `code`: a share that dropped out, a connection reset, a server restarting.
+// Not what the same bytes or the same request would meet again.
+bool transientReadError(int code) {
+    switch (code) {
+    case AVERROR_INVALIDDATA:
+    case AVERROR_PATCHWELCOME:
+    case AVERROR(ENOMEM):
+    case AVERROR(ENOSYS):
+    case AVERROR(EACCES):
+    case AVERROR_HTTP_BAD_REQUEST:
+    case AVERROR_HTTP_UNAUTHORIZED:
+    case AVERROR_HTTP_FORBIDDEN:
+    case AVERROR_HTTP_NOT_FOUND:
+        return false;
+    default:
+        return true;
+    }
+}
+
+// The error a read of `format`'s input met, 0 for none. A demuxer may end
+// the stream there as if the file did: Matroska's reports the end of the
+// file for a connection that dropped, and the pane stopped on its last
+// picture with nothing said. AVIO keeps what the read returned until it is
+// cleared, which every seek does here.
+int inputReadError(const AVFormatContext* format) {
+    const AVIOContext* io = format->pb;
+    return io && io->error < 0 && io->error != AVERROR_EOF ? io->error : 0;
+}
+
+void clearInputReadError(AVFormatContext* format) {
+    if (format->pb) {
+        format->pb->error = 0;
+        format->pb->eof_reached = 0;
+    }
 }
 
 // Matroska's index (Cues) normally lists the video's keyframes alone, and
@@ -297,12 +327,17 @@ bool VideoSource::open(const std::wstring& path, ID3D11Device* device,
     videoDecodeFromStart_ = true;
     lastVideoSeek_ = {};
     videoStartProbe_ = StartProbe::None;
+    videoReadRetries_ = 0;
+    videoLastQueuedPts_.reset();
+    videoResumeGate_ = false;
+    videoAskedSeconds_.store(-1.0);
     audioChunksDecoded_.store(0);
     duration_.store(0.0);
     videoWidth_.store(0);
     videoHeight_.store(0);
     videoDisplayAspect_.store(0.0F);
     videoQuarterTurns_.store(0);
+    undecodedDolbyVision_.store(0);
     audioStreamAvailability_.store(0);
     exactSeekReadyGeneration_.store(0);
     seekEndedWithoutFrame_.store(0);
@@ -337,7 +372,7 @@ bool VideoSource::open(const std::wstring& path, ID3D11Device* device,
     }
     colourMatrix_.store(static_cast<int>(SubtitleMatrix::None));
     videoSkipToKeyframe_ = false;
-    appendDiagnostic(std::string("Opening v") + kBuildVersion + ": " + wideToUtf8(path));
+    appendDiagnostic(std::string("Opening v") + kBuildVersion + ": " + wideToUtf8Text(path));
     if (!device_ || !deviceContext_ || !deviceMutex_) {
         setError("Shared D3D11 device is unavailable");
         return false;
@@ -385,6 +420,7 @@ void VideoSource::close() {
     videoHeight_.store(0);
     videoDisplayAspect_.store(0.0F);
     videoQuarterTurns_.store(0);
+    undecodedDolbyVision_.store(0);
 }
 
 // The video worker giving up: the audio worker's waits test running_, so it
@@ -426,6 +462,8 @@ std::uint64_t VideoSource::requestSeekInternal(double seconds, bool showKeyframe
         videoSeekKeyframeRequested_ = keyframe;
         videoSeekDirectionRequested_ = direction;
         seekLanding_.reset();
+        // Asked from this thread, before the seek, of the place it leaves.
+        videoAskedSeconds_.store(-1.0, std::memory_order_relaxed);
         videoQueue_.clear();
         queuedVideoFrames_.store(0);
         // heldFrame_ stays: the owner keeps the picture up until this seek's
@@ -485,6 +523,7 @@ int VideoSource::interruptCallback(void* opaque) {
 std::shared_ptr<const HardwareVideoFrame> VideoSource::frameForTime(double seconds, bool advance) {
     std::shared_ptr<const HardwareVideoFrame> frame;
     bool popped = false;
+    videoAskedSeconds_.store(seconds, std::memory_order_relaxed);
     {
         std::scoped_lock lock(mutex_);
         const std::size_t queued = videoQueue_.size();
@@ -607,6 +646,50 @@ int openInputWithOptions(AVFormatContext** context, const std::string& path,
     return openMediaInput(context, path, options.httpHeaders);
 }
 
+// Before a failed read is tried again: the input opened afresh in place of
+// `*format`, which is left as it was when that fails. Seeking the old one
+// back is not enough. FFmpeg seeks inside the bytes AVIO holds without
+// asking the protocol for anything, leaving a connection the server closed
+// as it is; Matroska's demuxer passes over a seek the protocol refused; and
+// an HTTP context that was answered 503 once takes the length of that answer
+// for the file's, and reads the end of the file from then on. A cached
+// file's reads are the cache's own, and it is not opened again: its context
+// is the one it was attached to. The streams are the same file's, or it is
+// not the stream that was playing: each keeps its decoder, opened from the
+// first, and whether it is read at all.
+int reopenInput(AVFormatContext** format, const std::string& path, const SourceOptions& options) {
+    AVFormatContext* old = *format;
+    if (old->flags & AVFMT_FLAG_CUSTOM_IO) {
+        clearInputReadError(old);
+        return 0;
+    }
+    AVFormatContext* fresh = avformat_alloc_context();
+    if (!fresh) return AVERROR(ENOMEM);
+    fresh->interrupt_callback = old->interrupt_callback;
+    // Frees the context it is given when it fails.
+    int result = openInputWithOptions(&fresh, path, options);
+    if (result < 0) return result;
+    result = avformat_find_stream_info(fresh, nullptr);
+    if (result >= 0 && fresh->nb_streams != old->nb_streams) result = AVERROR_INPUT_CHANGED;
+    for (unsigned index = 0; result >= 0 && index < old->nb_streams; ++index) {
+        const AVStream* was = old->streams[index];
+        const AVStream* is = fresh->streams[index];
+        if (was->codecpar->codec_id != is->codecpar->codec_id || av_cmp_q(was->time_base, is->time_base) != 0) {
+            result = AVERROR_INPUT_CHANGED;
+        }
+    }
+    if (result < 0) {
+        avformat_close_input(&fresh);
+        return result;
+    }
+    for (unsigned index = 0; index < old->nb_streams; ++index) {
+        fresh->streams[index]->discard = old->streams[index]->discard;
+    }
+    avformat_close_input(format);
+    *format = fresh;
+    return 0;
+}
+
 }  // namespace
 
 std::vector<AudioTrackInfo> VideoSource::audioTracks() const {
@@ -657,7 +740,21 @@ bool VideoSource::subtitleStreamHeader(int streamIndex, std::string& header, boo
 bool VideoSource::hasSubtitleReader(int streamIndex) const {
     std::scoped_lock lock(subtitleMutex_);
     return std::any_of(subtitleEvents_.begin(), subtitleEvents_.end(),
-                       [streamIndex](const auto& stream) { return stream.streamIndex == streamIndex; });
+                       [streamIndex](const auto& stream) { return stream.streamIndex == streamIndex; }) ||
+           std::find(subtitlePictureStreams_.begin(), subtitlePictureStreams_.end(), streamIndex) !=
+               subtitlePictureStreams_.end();
+}
+
+bool VideoSource::subtitleStreamIsPictures(int streamIndex) const {
+    std::scoped_lock lock(subtitleMutex_);
+    return std::find(subtitlePictureStreams_.begin(), subtitlePictureStreams_.end(), streamIndex) !=
+           subtitlePictureStreams_.end();
+}
+
+std::shared_ptr<const SubtitlePicture> VideoSource::subtitlePictureAt(double seconds) const {
+    const int shown = shownSubtitleStream_.load();
+    std::scoped_lock lock(subtitleMutex_);
+    return shown >= 0 && shown == subtitlePicturesStream_ ? subtitlePictures_.at(seconds) : nullptr;
 }
 
 std::size_t VideoSource::subtitleEventsSince(int streamIndex, std::size_t from,
@@ -678,6 +775,10 @@ std::shared_ptr<const std::vector<SubtitleFont>> VideoSource::fonts() const {
 
 namespace {
 
+// As many streams of pictures have a decoder; a disc's remux has a dozen or
+// two. Only the one shown is decoded.
+constexpr std::size_t kMaximumPictureSubtitleReaders = 32;
+
 // More text streams than this are not all read; the rest are listed only.
 constexpr std::size_t kMaximumSubtitleReaders = 32;
 // How far before the keyframe a seek lands on the demuxer starts reading,
@@ -694,6 +795,41 @@ bool textSubtitleCodec(AVCodecID id) {
     const AVCodecDescriptor* descriptor = avcodec_descriptor_get(id);
     return descriptor && (descriptor->props & AV_CODEC_PROP_TEXT_SUB) != 0 &&
            avcodec_find_decoder(id) != nullptr;
+}
+
+// A stream of pictures there is a decoder for: Blu-ray's PGS, DVD's VobSub,
+// DVB's and XSUB.
+bool pictureSubtitleCodec(AVCodecID id) {
+    const AVCodecDescriptor* descriptor = avcodec_descriptor_get(id);
+    return descriptor && (descriptor->props & AV_CODEC_PROP_BITMAP_SUB) != 0 &&
+           avcodec_find_decoder(id) != nullptr;
+}
+
+// A decoder for the subtitle stream at `index`, given the stream's
+// parameters and time base; null when it cannot be made, and when it does
+// not open, which the log says of the `kind` of stream it is.
+AVCodecContext* openSubtitleDecoder(const AVStream* stream, unsigned index, const char* kind) {
+    const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
+    AVCodecContext* codec = avcodec_alloc_context3(decoder);
+    if (!codec || avcodec_parameters_to_context(codec, stream->codecpar) < 0) {
+        avcodec_free_context(&codec);
+        return nullptr;
+    }
+    codec->pkt_timebase = stream->time_base;
+    const int result = avcodec_open2(codec, decoder, nullptr);
+    if (result < 0) {
+        appendDiagnostic(std::string(kind) + " decoder unavailable for stream " + std::to_string(index) + ": " +
+                         ffmpegError(result));
+        avcodec_free_context(&codec);
+        return nullptr;
+    }
+    return codec;
+}
+
+// A stream's metadata entry ("language", "title"); empty when it has none.
+std::string streamTag(const AVStream* stream, const char* key) {
+    const AVDictionaryEntry* entry = av_dict_get(stream->metadata, key, nullptr, 0);
+    return entry ? entry->value : std::string();
 }
 
 // A fansub release brings its faces along; a few dozen megabytes is usual,
@@ -758,6 +894,9 @@ void VideoSource::closeSubtitleDecoders() {
     std::scoped_lock lock(subtitleMutex_);
     subtitleCues_.clear();
     subtitleEvents_.clear();
+    subtitlePictureStreams_.clear();
+    subtitlePictures_.clear();
+    subtitlePicturesStream_ = -1;
     subtitleRetainedBytes_ = 0;
     subtitleRetainedEntries_ = 0;
     subtitleSaturated_ = false;
@@ -795,22 +934,10 @@ void VideoSource::openSubtitleDecoders() {
             continue;
         }
         if (!subtitleBudgetAllows(32 * static_cast<std::size_t>(extraSize) + 1024, false)) break;
-        const AVCodec* decoder = avcodec_find_decoder(stream->codecpar->codec_id);
         SubtitleReader reader;
         reader.streamIndex = static_cast<int>(index);
-        reader.codec = avcodec_alloc_context3(decoder);
-        if (!reader.codec || avcodec_parameters_to_context(reader.codec, stream->codecpar) < 0) {
-            avcodec_free_context(&reader.codec);
-            continue;
-        }
-        reader.codec->pkt_timebase = stream->time_base;
-        const int result = avcodec_open2(reader.codec, decoder, nullptr);
-        if (result < 0) {
-            appendDiagnostic("Subtitle decoder unavailable for stream " + std::to_string(index) + ": " +
-                             ffmpegError(result));
-            avcodec_free_context(&reader.codec);
-            continue;
-        }
+        reader.codec = openSubtitleDecoder(stream, index, "Subtitle");
+        if (!reader.codec) continue;
         // Every text decoder hands its lines over as ASS events, under a
         // header that names the styles they use: the stream's own for ASS
         // and SSA, a stand-in of FFmpeg's for the rest.
@@ -851,16 +978,154 @@ void VideoSource::openSubtitleDecoders() {
         appendDiagnostic(std::to_string(subtitleReaders_.size()) +
                          " text subtitle stream(s) are read with the video");
     }
+    // The streams of pictures after the text, so that none of them takes a
+    // text stream's place: a decoder each, and no header to keep. Their
+    // packets come with the video like the text's, and all but the shown
+    // stream's are passed over undecoded (decodeSubtitlePicture).
+    std::vector<int> pictureStreams;
+    for (unsigned index = 0; index < videoFormat_->nb_streams; ++index) {
+        AVStream* stream = videoFormat_->streams[index];
+        if (!stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE ||
+            !pictureSubtitleCodec(stream->codecpar->codec_id)) {
+            continue;
+        }
+        if (pictureStreams.size() >= kMaximumPictureSubtitleReaders) break;
+        // A DVD's palette is in the header; no disc's is near this long.
+        const int extraSize = stream->codecpar->extradata_size;
+        if (extraSize < 0 || static_cast<std::size_t>(extraSize) > kSubtitleTextBytes) continue;
+        SubtitleReader reader;
+        reader.streamIndex = static_cast<int>(index);
+        reader.pictures = true;
+        reader.codec = openSubtitleDecoder(stream, index, "Picture subtitle");
+        if (!reader.codec) continue;
+        stream->discard = AVDISCARD_DEFAULT;
+        pictureStreams.push_back(reader.streamIndex);
+        subtitleReaders_.push_back(std::move(reader));
+    }
+    if (!pictureStreams.empty()) {
+        appendDiagnostic(std::to_string(pictureStreams.size()) +
+                         " picture subtitle stream(s) can be shown from the video");
+    }
     std::scoped_lock lock(subtitleMutex_);
     subtitleCues_ = std::move(cues);
     subtitleEvents_ = std::move(events);
+    subtitlePictureStreams_ = std::move(pictureStreams);
+    subtitlePictures_.clear();
+    subtitlePicturesStream_ = -1;
+}
+
+void VideoSource::decodeSubtitlePicture(SubtitleReader& reader, const AVPacket* packet) {
+    // Only the stream shown: a disc's other languages are passed over. A
+    // stream joined part-way shows from its next whole picture on.
+    if (packet->stream_index != shownSubtitleStream_.load()) {
+        if (!reader.passedOver) {
+            reader.passedOver = true;
+            // What was kept of it is no longer all of it: its last picture
+            // would stay up, back at the stream, over whatever this packet
+            // said next.
+            std::scoped_lock lock(subtitleMutex_);
+            if (subtitlePicturesStream_ == reader.streamIndex) {
+                subtitlePictures_.clear();
+                subtitlePicturesStream_ = -1;
+            }
+        }
+        return;
+    }
+    // A Blu-ray stream's picture is built of parts sent before it, and a
+    // decoder that missed some would paint the ones it has from before:
+    // back at a stream, it starts with nothing.
+    if (reader.passedOver) {
+        avcodec_flush_buffers(reader.codec);
+        reader.passedOver = false;
+    }
+    if (packet->size <= 0 || static_cast<std::size_t>(packet->size) > kSubtitlePicturePacketBytes) return;
+    AVSubtitle subtitle{};
+    subtitle.pts = AV_NOPTS_VALUE;
+    int got = 0;
+    if (avcodec_decode_subtitle2(reader.codec, &subtitle, &got, packet) < 0 || !got) {
+        avsubtitle_free(&subtitle);
+        return;
+    }
+    const AVStream* stream = videoFormat_->streams[packet->stream_index];
+    // The decoder's own time first: a transport stream sends a Blu-ray
+    // picture in several packets, and the time is that of its first.
+    double base = 0.0;
+    if (subtitle.pts != AV_NOPTS_VALUE) {
+        base = static_cast<double>(subtitle.pts) / AV_TIME_BASE;
+    } else if (const std::int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+               pts != AV_NOPTS_VALUE) {
+        base = static_cast<double>(pts) * av_q2d(stream->time_base);
+    } else {
+        avsubtitle_free(&subtitle);
+        return;
+    }
+    // Source time is the video's: counted from where its stream starts.
+    base -= static_cast<double>(videoStartPts_) * av_q2d(videoFormat_->streams[videoStream_]->time_base);
+    double start = base + static_cast<double>(subtitle.start_display_time) / 1000.0;
+    // An end the stream names, or the container for it; Blu-ray's name
+    // none, and the picture stays until the stream shows its next or
+    // clears it (the timeline's rule).
+    double end = start;
+    if (subtitle.end_display_time != 0 && subtitle.end_display_time != UINT32_MAX &&
+        subtitle.end_display_time > subtitle.start_display_time) {
+        end = base + static_cast<double>(subtitle.end_display_time) / 1000.0;
+    } else if (packet->duration > 0) {
+        end = start + static_cast<double>(packet->duration) * av_q2d(stream->time_base);
+    }
+    // A picture put up a moment before the video's first frame is its.
+    if (start < 0.0 && (end <= start || end > 0.0)) {
+        if (end <= start) end = 0.0;
+        start = 0.0;
+    }
+    std::shared_ptr<SubtitlePicture> picture;
+    if (std::isfinite(start) && start >= 0.0) {
+        picture = std::make_shared<SubtitlePicture>();
+        // The canvas the decoder read from the stream -- a disc's frame --
+        // or, where the stream names none, the video's.
+        picture->canvasWidth = reader.codec->width > 0 ? reader.codec->width : videoWidth_.load();
+        picture->canvasHeight = reader.codec->height > 0 ? reader.codec->height : videoHeight_.load();
+        std::size_t pixels = 0;
+        for (unsigned index = 0; index < subtitle.num_rects; ++index) {
+            const AVSubtitleRect* rect = subtitle.rects[index];
+            if (!rect || rect->type != SUBTITLE_BITMAP || !rect->data[0] || !rect->data[1]) continue;
+            if (rect->w <= 0 || rect->h <= 0 || rect->x < -kSubtitlePictureSide || rect->y < -kSubtitlePictureSide ||
+                rect->x > 4 * kSubtitlePictureSide || rect->y > 4 * kSubtitlePictureSide) {
+                continue;
+            }
+            pixels += static_cast<std::size_t>(rect->w) * static_cast<std::size_t>(rect->h);
+            if (pixels > kSubtitlePicturePixels) break;
+            SubtitlePiece piece;
+            piece.x = rect->x;
+            piece.y = rect->y;
+            // The palette is 32-bit words in the machine's order, AARRGGBB.
+            if (subtitlePieceFromPalette(rect->data[0], rect->linesize[0], rect->w, rect->h,
+                                         reinterpret_cast<const std::uint32_t*>(rect->data[1]),
+                                         rect->nb_colors, piece)) {
+                picture->pieces.push_back(std::move(piece));
+            }
+        }
+    }
+    avsubtitle_free(&subtitle);
+    if (!std::isfinite(start) || start < 0.0) return;
+    std::scoped_lock lock(subtitleMutex_);
+    if (subtitlePicturesStream_ != reader.streamIndex) {
+        subtitlePictures_.clear();
+        subtitlePicturesStream_ = reader.streamIndex;
+    }
+    // With nothing in it, this is the stream taking its last picture down.
+    subtitlePictures_.show(start, end, std::move(picture));
 }
 
 void VideoSource::decodeSubtitlePacket(const AVPacket* packet) {
-    if (!packet || subtitleSaturated_) return;
+    if (!packet) return;
     const auto reader = std::find_if(subtitleReaders_.begin(), subtitleReaders_.end(),
         [&](const SubtitleReader& candidate) { return candidate.streamIndex == packet->stream_index; });
-    if (reader == subtitleReaders_.end() || reader->saturated) return;
+    if (reader == subtitleReaders_.end()) return;
+    if (reader->pictures) {
+        decodeSubtitlePicture(*reader, packet);
+        return;
+    }
+    if (subtitleSaturated_ || reader->saturated) return;
     if (!subtitleBudgetAllows(0, true)) return;
     if (packet->size < 0 || static_cast<std::size_t>(packet->size) > kSubtitlePacketBytes) {
         reader->saturated = true;
@@ -969,7 +1234,7 @@ void VideoSource::retainSubtitle(SubtitleReader& reader, const AVSubtitle& subti
 }
 
 bool VideoSource::openVideoInput() {
-    const std::string path = wideToUtf8(path_);
+    const std::string path = wideToUtf8Text(path_);
     videoFormat_ = avformat_alloc_context();
     if (!videoFormat_) {
         setError("Cannot allocate video format context");
@@ -1005,12 +1270,8 @@ bool VideoSource::openVideoInput() {
             if (!candidate->codecpar || candidate->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
             AudioTrackInfo info;
             info.streamIndex = static_cast<int>(index);
-            if (const AVDictionaryEntry* language = av_dict_get(candidate->metadata, "language", nullptr, 0)) {
-                info.language = language->value;
-            }
-            if (const AVDictionaryEntry* title = av_dict_get(candidate->metadata, "title", nullptr, 0)) {
-                info.title = title->value;
-            }
+            info.language = streamTag(candidate, "language");
+            info.title = streamTag(candidate, "title");
             if (const char* codecName = avcodec_get_name(candidate->codecpar->codec_id)) info.codec = codecName;
             info.channels = candidate->codecpar->ch_layout.nb_channels;
             info.isDefault = (candidate->disposition & AV_DISPOSITION_DEFAULT) != 0;
@@ -1025,22 +1286,22 @@ bool VideoSource::openVideoInput() {
         // start when the owner left the choice to its options.
         std::vector<SubtitleTrackInfo> tracks;
         std::size_t textStreams = 0;
+        std::size_t pictureStreams = 0;
         for (unsigned index = 0; index < videoFormat_->nb_streams; ++index) {
             const AVStream* candidate = videoFormat_->streams[index];
             if (!candidate->codecpar || candidate->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
             SubtitleTrackInfo info;
             info.streamIndex = static_cast<int>(index);
-            if (const AVDictionaryEntry* language = av_dict_get(candidate->metadata, "language", nullptr, 0)) {
-                info.language = language->value;
-            }
-            if (const AVDictionaryEntry* title = av_dict_get(candidate->metadata, "title", nullptr, 0)) {
-                info.title = title->value;
-            }
+            info.language = streamTag(candidate, "language");
+            info.title = streamTag(candidate, "title");
             if (const char* codecName = avcodec_get_name(candidate->codecpar->codec_id)) info.codec = codecName;
             // Only as many text streams are read as there are readers for;
             // one past them is listed like a stream that cannot be shown.
             info.text = textSubtitleCodec(candidate->codecpar->codec_id) &&
                         textStreams++ < kMaximumSubtitleReaders;
+            // A stream of pictures the same, counted by itself.
+            info.pictures = !info.text && pictureSubtitleCodec(candidate->codecpar->codec_id) &&
+                            pictureStreams++ < kMaximumPictureSubtitleReaders;
             info.isDefault = (candidate->disposition & AV_DISPOSITION_DEFAULT) != 0;
             info.forced = (candidate->disposition & AV_DISPOSITION_FORCED) != 0;
             tracks.push_back(std::move(info));
@@ -1187,6 +1448,20 @@ bool VideoSource::openVideoInput() {
         if (streamQuarterTurns_ != 0) summary << " turned=" << streamQuarterTurns_ * 90;
         appendDiagnostic(summary.str());
     }
+    if (const AVPacketSideData* record = av_packet_side_data_get(
+            stream->codecpar->coded_side_data, stream->codecpar->nb_coded_side_data, AV_PKT_DATA_DOVI_CONF);
+        record && record->size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+        const auto* dolby = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(record->data);
+        const bool undecoded = dolbyVisionNeedsItsOwnDecoding(dolby->dv_profile, dolby->dv_bl_signal_compatibility_id);
+        std::ostringstream summary;
+        summary << "Dolby Vision profile " << static_cast<int>(dolby->dv_profile) << ", base layer compatibility "
+                << static_cast<int>(dolby->dv_bl_signal_compatibility_id)
+                << (undecoded ? ": no HDR10, HLG or SDR base layer, which this player cannot decode; "
+                                "its colours will be wrong"
+                              : ": played as its base layer");
+        appendDiagnostic(summary.str());
+        undecodedDolbyVision_.store(undecoded ? dolby->dv_profile : 0);
+    }
     videoStartPts_ = stream->start_time == AV_NOPTS_VALUE ? 0 : stream->start_time;
     videoWidth_.store(std::max(0, videoCodec_->width));
     videoHeight_.store(std::max(0, videoCodec_->height));
@@ -1257,6 +1532,9 @@ void VideoSource::videoWorkerMain() {
         if (seek) {
             decodingVideoSeekGeneration_ = seekGeneration;
             videoIo_->clearError();
+            clearInputReadError(videoFormat_);
+            // A read that fails at the new place is the first of its run.
+            videoReadRetries_ = 0;
             if (!handleVideoSeek(target, showKeyframePreview, keyframe, direction)) break;
         } else if (videoStartProbe_ == StartProbe::Wanted) {
             if (!beginStartProbe()) break;
@@ -1269,7 +1547,7 @@ void VideoSource::videoWorkerMain() {
             logPassedOverErrors(videoDecodeErrors_, true);
             std::ostringstream line;
             line << "A frame decodes from the start of the stream; the seek to " << std::fixed
-                 << std::setprecision(2) << lastVideoSeek_.seconds << " s goes on: " << wideToUtf8(path_);
+                 << std::setprecision(2) << lastVideoSeek_.seconds << " s goes on: " << wideToUtf8Text(path_);
             appendDiagnostic(line.str());
             const auto resumed = lastVideoSeek_;
             if (!handleVideoSeek(resumed.seconds, resumed.showKeyframePreview, resumed.keyframe, resumed.direction)) {
@@ -1277,10 +1555,14 @@ void VideoSource::videoWorkerMain() {
             }
         }
         if (!waitForVideoCapacity()) break;
-        const int result = av_read_frame(videoFormat_, packet);
+        int result = av_read_frame(videoFormat_, packet);
         {
             std::scoped_lock lock(mutex_);
             if (videoSeekPending_) { av_packet_unref(packet); continue; }
+        }
+        // An end of the stream that a failed read made is the failed read.
+        if (result == AVERROR_EOF) {
+            if (const int failed = inputReadError(videoFormat_)) result = failed;
         }
         if (result == AVERROR_EOF) {
             if (!decodeVideoPacket(nullptr)) break;
@@ -1322,8 +1604,8 @@ void VideoSource::videoWorkerMain() {
             continue;
         }
         if (result < 0) {
-            if (running_.load()) setError("Video read error: " + ffmpegError(result));
-            break;
+            if (!running_.load() || !retryVideoRead(result)) break;
+            continue;
         }
         if (packet->stream_index == videoStream_ && firstPacket && cache_) {
             auto bitrate = videoFormat_->bit_rate;
@@ -1388,6 +1670,91 @@ bool VideoSource::waitForVideoCapacity() {
     return running_.load();
 }
 
+// A read that fails -- the share dropped out, the server closed the
+// connection, the Wi-Fi roamed -- ended the pane until 2026-11-24: its last
+// picture stayed up for good, though the same file opened again at once. The
+// input is opened afresh instead (reopenInput), sought back and read again,
+// a few times over half a minute: to where the seek under way began, or the look at the stream's
+// start, or, playing, to the keyframe before the last frame queued, what was
+// shown already being decoded again on the way and not shown twice. A stream
+// away for a while goes on from where the owner's clock is by then. A frame
+// queued ends the run of failures; one that fails at the same place every
+// time queues none, and ends the pane as before when the tries are spent.
+bool VideoSource::retryVideoRead(int result) {
+    AVStream* stream = videoFormat_->streams[videoStream_];
+    while (running_.load()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (videoReadRetries_ == 0) videoReadFailedAt_ = now;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - videoReadFailedAt_).count();
+        const auto delay = transientReadError(result)
+            ? readRetryDelayMs(videoReadRetries_ + 1, elapsed) : std::nullopt;
+        if (!delay) {
+            setError("Video read error: " + ffmpegError(result));
+            return false;
+        }
+        ++videoReadRetries_;
+        appendDiagnostic("Video read failed (" + ffmpegError(result) + "); trying again in " +
+                         std::to_string(*delay) + " ms (try " + std::to_string(videoReadRetries_) + "): " +
+                         wideToUtf8Text(path_));
+        {
+            std::unique_lock lock(mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(*delay), [&] {
+                return !running_.load() || videoSeekPending_;
+            });
+            if (!running_.load()) return false;
+            // The seek asked for reads from its own place.
+            if (videoSeekPending_) return true;
+        }
+        result = reopenInput(&videoFormat_, wideToUtf8Text(path_), options_);
+        if (result < 0) continue;
+        stream = videoFormat_->streams[videoStream_];
+        const bool probing = videoStartProbe_ != StartProbe::None;
+        const bool startOver = !probing &&
+            (videoSeekTargetPtsValid_ || videoSeekLandingPending_ || !videoLastQueuedPts_);
+        std::int64_t from = videoStartPts_;
+        std::int64_t asked = videoStartPts_;
+        if (startOver) {
+            from = streamTimestampForSeconds(
+                lastVideoSeek_.seconds, videoStartPts_, stream->time_base.num, stream->time_base.den);
+        } else if (!probing) {
+            from = *videoLastQueuedPts_;
+            const double seconds = videoAskedSeconds_.load(std::memory_order_relaxed);
+            if (std::isfinite(seconds) && seconds > 0.0) {
+                asked = streamTimestampForSeconds(
+                    seconds, videoStartPts_, stream->time_base.num, stream->time_base.den);
+                from = std::max(from, asked);
+            }
+        }
+        // The seek puts the demuxer in step, whatever the failed read left
+        // of one that was not opened again.
+        result = av_seek_frame(videoFormat_, videoStream_,
+                               videoSeekDecodeTargetPts(from, videoStartPts_, stream->duration),
+                               AVSEEK_FLAG_BACKWARD);
+        if (result < 0) continue;
+        if (probing) {
+            videoStartProbe_ = StartProbe::Wanted;
+            return true;
+        }
+        if (startOver) {
+            // Nothing of this seek is on screen but, at most, its preview.
+            const auto again = lastVideoSeek_;
+            return handleVideoSeek(again.seconds, again.showKeyframePreview && !videoLastQueuedPts_,
+                                   again.keyframe, again.direction);
+        }
+        avcodec_flush_buffers(videoCodec_);
+        videoDecodeErrors_.restartRun();
+        logPassedOverErrors(videoDecodeErrors_, true);
+        // The lines read again are known by what they say, and kept once.
+        for (auto& reader : subtitleReaders_) avcodec_flush_buffers(reader.codec);
+        videoSkipToKeyframe_ = false;
+        videoResumeAfterPts_ = *videoLastQueuedPts_;
+        videoResumeAtPts_ = asked;
+        videoResumeGate_ = true;
+        return true;
+    }
+    return false;
+}
+
 bool VideoSource::handleVideoSeek(double seconds, bool showKeyframePreview, bool keyframe, int direction) {
     // A seek replaces any look at the stream's start, and is the one the
     // next look returns to.
@@ -1421,14 +1788,32 @@ bool VideoSource::handleVideoSeek(double seconds, bool showKeyframePreview, bool
     }
     av_frame_unref(videoSeekFallbackFrame_);
     videoSeekFallbackGeneration_ = 0;
+    // Nothing of the new place has been queued, and a read retried goes on
+    // from this seek, not from where the stream was before it.
+    videoLastQueuedPts_.reset();
+    videoResumeGate_ = false;
     avcodec_flush_buffers(videoCodec_);
     // The errors before the seek were for packets it has left behind.
     videoDecodeErrors_.restartRun();
     logPassedOverErrors(videoDecodeErrors_, true);
     videoDecodeFromStart_ = seconds <= 0.0;
     for (auto& reader : subtitleReaders_) avcodec_flush_buffers(reader.codec);
+    // The text read so far is kept and known again by what it says; the
+    // pictures are of the place left behind, and those of the new place
+    // are read again.
+    bool subtitlesRead = false;
+    {
+        std::scoped_lock lock(subtitleMutex_);
+        subtitlePictures_.clear();
+        const int shown = shownSubtitleStream_.load();
+        // A stream of pictures costs a seek its read-ahead only while it
+        // is the one shown.
+        subtitlesRead = !subtitleEvents_.empty() ||
+                        std::find(subtitlePictureStreams_.begin(), subtitlePictureStreams_.end(), shown) !=
+                            subtitlePictureStreams_.end();
+    }
     videoSkipToKeyframe_ = false;
-    if (!subtitleReaders_.empty() && std::strstr(videoFormat_->iformat->name, "matroska")) {
+    if (subtitlesRead && std::strstr(videoFormat_->iformat->name, "matroska")) {
         // Matroska keeps a subtitle line in the cluster of its first moment,
         // so a seek that starts reading at a keyframe never sees the line
         // being spoken there. Where the container's index says which
@@ -1563,7 +1948,7 @@ std::optional<std::string> VideoSource::passOverDecodeError(DecodeErrors& errors
             if (std::isfinite(errors.unloggedFrom)) line << ", from " << errors.unloggedFrom << " s";
             line << ')';
         }
-        appendDiagnostic(line.str() + ": " + wideToUtf8(path_));
+        appendDiagnostic(line.str() + ": " + wideToUtf8Text(path_));
         errors.logged = now;
         errors.unlogged = 0;
         errors.unloggedFrom = errors.unloggedTo = std::numeric_limits<double>::quiet_NaN();
@@ -1593,7 +1978,7 @@ void VideoSource::logPassedOverErrors(DecodeErrors& errors, bool now) const {
     } else if (std::isfinite(errors.unloggedTo)) {
         line << " near " << errors.unloggedTo << " s";
     }
-    line << ", the last: " << errors.last << ": " << wideToUtf8(path_);
+    line << ", the last: " << errors.last << ": " << wideToUtf8Text(path_);
     appendDiagnostic(line.str());
     errors.logged = at;
     errors.unlogged = 0;
@@ -1637,7 +2022,7 @@ void VideoSource::wantStartProbe(const std::string& error) {
     logPassedOverErrors(videoDecodeErrors_, true);
     std::ostringstream line;
     line << error << " (decoding from " << std::fixed << std::setprecision(2) << lastVideoSeek_.seconds
-         << " s); trying the start of the stream: " << wideToUtf8(path_);
+         << " s); trying the start of the stream: " << wideToUtf8Text(path_);
     appendDiagnostic(line.str());
     videoStartProbe_ = StartProbe::Wanted;
 }
@@ -1653,6 +2038,7 @@ bool VideoSource::beginStartProbe() {
     videoDecodeErrors_.restartRun();
     logPassedOverErrors(videoDecodeErrors_, true);
     videoSkipToKeyframe_ = false;
+    videoResumeGate_ = false;
     videoFastDecodeUntil_ = -1.0;
     videoCodec_->skip_frame = AVDISCARD_DEFAULT;
     videoCodec_->skip_idct = AVDISCARD_DEFAULT;
@@ -1690,7 +2076,7 @@ bool VideoSource::endSeekWithHeldFrame() {
             if (videoSeekPending_) return true;
             seekEndedWithoutFrame_.store(decodingVideoSeekGeneration_, std::memory_order_release);
         }
-        line << "no picture is up to stand in, and the seek barrier waits for none from it: " << wideToUtf8(path_);
+        line << "no picture is up to stand in, and the seek barrier waits for none from it: " << wideToUtf8Text(path_);
         appendDiagnostic(line.str());
         return true;
     }
@@ -1700,7 +2086,7 @@ bool VideoSource::endSeekWithHeldFrame() {
     if (!pushVideoFrame(held->ownerFrame, true)) return false;
     // Not for a seek a newer one has replaced, which queues nothing.
     if (exactSeekReadyGeneration_.load(std::memory_order_acquire) == decodingVideoSeekGeneration_) {
-        line << "the picture up, at " << held->pts << " s, stands as its frame: " << wideToUtf8(path_);
+        line << "the picture up, at " << held->pts << " s, stands as its frame: " << wideToUtf8Text(path_);
         appendDiagnostic(line.str());
     }
     return true;
@@ -1748,6 +2134,11 @@ bool VideoSource::decodeVideoPacket(const AVPacket* packet) {
         }
         videoDecodeErrors_.restartRun();
         logPassedOverErrors(videoDecodeErrors_, false);
+        {
+            const AVCodecParameters* container = videoFormat_->streams[videoStream_]->codecpar;
+            inheritContainerColor(*decodeFrame_, container->color_trc, container->color_primaries,
+                                  container->color_space);
+        }
         if (!actualVideoFrameLogged_) {
             actualVideoFrameLogged_ = true;
             const bool hardware = decodeFrame_->format == AV_PIX_FMT_D3D11 && decodeFrame_->data[0];
@@ -1803,6 +2194,19 @@ bool VideoSource::pushVideoFrame(AVFrame* decoded, bool endOfStreamFallback) {
     double seconds = 0.0;
     if (timestamp != AV_NOPTS_VALUE) {
         seconds = static_cast<double>(timestamp - videoStartPts_) * timeBase;
+    }
+    if (videoResumeGate_ && !endOfStreamFallback) {
+        // After a read that failed, the stream was sought back to the
+        // keyframe before the place it had got to: what was shown already
+        // is decoded again on the way and not shown twice. A frame with no
+        // stamp cannot be placed, and ends the gate. Nor is what the owner's
+        // clock has passed while the stream was away.
+        if (timestamp != AV_NOPTS_VALUE &&
+            (timestamp <= videoResumeAfterPts_ ||
+             frameEndsAtOrBeforeSeekTarget(timestamp, frameDuration, videoResumeAtPts_))) {
+            return true;
+        }
+        videoResumeGate_ = false;
     }
     bool exactSeekFrame = endOfStreamFallback && decodingVideoSeekGeneration_ != 0;
     bool landed = false;
@@ -1957,13 +2361,19 @@ bool VideoSource::pushVideoFrame(AVFrame* decoded, bool endOfStreamFallback) {
         videoQueue_.push_back(std::move(frame));
         queuedVideoFrames_.store(static_cast<unsigned>(videoQueue_.size()));
     }
+    // The stream has got further: a read that fails after this goes on from
+    // here, as the first of a new run of failures.
+    if (!endOfStreamFallback) {
+        if (timestamp != AV_NOPTS_VALUE) videoLastQueuedPts_ = timestamp;
+        videoReadRetries_ = 0;
+    }
     cv_.notify_all();
     return true;
 }
 
 int VideoSource::openAudioInput(AVFormatContext** format, AVCodecContext** codec,
                                 AVFrame** frame, int* streamIndex, std::int64_t* startPts) {
-    const std::string path = wideToUtf8(path_);
+    const std::string path = wideToUtf8Text(path_);
     *format = avformat_alloc_context();
     if (!*format) return AVERROR(ENOMEM);
     (*format)->interrupt_callback.callback = &VideoSource::interruptCallback;
@@ -1987,12 +2397,8 @@ int VideoSource::openAudioInput(AVFormatContext** format, AVCodecContext** codec
             const AVStream* candidate = (*format)->streams[index];
             if (!candidate->codecpar || candidate->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
             AudioTrackCandidate track;
-            if (const AVDictionaryEntry* language = av_dict_get(candidate->metadata, "language", nullptr, 0)) {
-                track.language = language->value;
-            }
-            if (const AVDictionaryEntry* title = av_dict_get(candidate->metadata, "title", nullptr, 0)) {
-                track.title = title->value;
-            }
+            track.language = streamTag(candidate, "language");
+            track.title = streamTag(candidate, "title");
             track.isDefault = (candidate->disposition & AV_DISPOSITION_DEFAULT) != 0;
             track.commentary = (candidate->disposition & AV_DISPOSITION_COMMENT) != 0;
             candidates.push_back(std::move(track));
@@ -2128,7 +2534,7 @@ void VideoSource::audioWorkerMain() {
         const auto status = audioDecodeStatus();
         setAudioDecodeState(status.generation, AudioDecodeState::Error);
         if (running_.load()) {
-            appendDiagnostic("No usable audio stream: " + wideToUtf8(path_) +
+            appendDiagnostic("No usable audio stream: " + wideToUtf8Text(path_) +
                              " (" + ffmpegError(openResult) + ")");
         }
         if (format) avformat_close_input(&format);
@@ -2143,7 +2549,7 @@ void VideoSource::audioWorkerMain() {
         const auto status = audioDecodeStatus();
         setAudioDecodeState(status.generation, AudioDecodeState::Error);
         if (running_.load()) {
-            appendDiagnostic("Cannot allocate audio packet: " + wideToUtf8(path_));
+            appendDiagnostic("Cannot allocate audio packet: " + wideToUtf8Text(path_));
         }
         av_frame_free(&frame);
         avcodec_free_context(&codec);
@@ -2187,7 +2593,7 @@ void VideoSource::audioWorkerMain() {
         // The errors held back go in the log ahead of what ends it.
         logPassedOverErrors(decodeErrors, true);
         if (running_.load() && audioGenerationIsCurrent(decodingGeneration)) {
-            appendDiagnostic(message + ": " + wideToUtf8(path_));
+            appendDiagnostic(message + ": " + wideToUtf8Text(path_));
             setAudioDecodeState(decodingGeneration, AudioDecodeState::Error);
         }
         terminal = true;
@@ -2208,7 +2614,7 @@ void VideoSource::audioWorkerMain() {
         logPassedOverErrors(decodeErrors, true);
         std::ostringstream line;
         line << error << " (decoding the sound from " << std::fixed << std::setprecision(2) << generationTarget
-             << " s); trying the start of the stream: " << wideToUtf8(path_);
+             << " s); trying the start of the stream: " << wideToUtf8Text(path_);
         appendDiagnostic(line.str());
         startProbe = StartProbe::Wanted;
     };
@@ -2246,6 +2652,15 @@ void VideoSource::audioWorkerMain() {
     // that one frame's duration: refused, it loses up to the next packet's
     // stamp, which is credited too.
     std::int64_t lostUntil = AV_NOPTS_VALUE;
+    // A run of reads that failed, as the video worker's: the tries it has
+    // had, none while 0, when it began, and the stream time of the packet
+    // last sent before it (NaN when none was), which a packet past it ends
+    // the run at. After one, the sound already sent is read again from
+    // there, and the first frame's stamp places the count.
+    int readRetries = 0;
+    std::chrono::steady_clock::time_point readFailedAt{};
+    double readRetryFrom = std::numeric_limits<double>::quiet_NaN();
+    bool placeAfterRetry = false;
 
     // Defined below: the voice's end of the pipeline, and the stretch ahead
     // of it.
@@ -2477,7 +2892,7 @@ void VideoSource::audioWorkerMain() {
         } else {
             line << "jump " << seconds << " s ahead; sound placed again";
         }
-        appendDiagnostic(line.str() + ": " + wideToUtf8(path_));
+        appendDiagnostic(line.str() + ": " + wideToUtf8Text(path_));
     };
     auto noteRate = [&](double frames) {
         followedSeconds += frames / 48000;
@@ -2493,7 +2908,7 @@ void VideoSource::audioWorkerMain() {
         std::ostringstream line;
         line << std::fixed << std::setprecision(1) << "Audio timestamps run "
              << std::abs(stampFollower.rate()) * 100.0 << (stampFollower.rate() > 0.0 ? "% ahead of" : "% behind")
-             << " the samples; resampling to follow them: " << wideToUtf8(path_);
+             << " the samples; resampling to follow them: " << wideToUtf8Text(path_);
         appendDiagnostic(line.str());
     };
 
@@ -2560,7 +2975,7 @@ void VideoSource::audioWorkerMain() {
                     av_channel_layout_describe(&frame->ch_layout, channels, sizeof(channels));
                     appendDiagnostic("Audio changes to " + std::string(channels) + " at " +
                                      std::to_string(frame->sample_rate) + " Hz; resampler built again: " +
-                                     wideToUtf8(path_));
+                                     wideToUtf8Text(path_));
                 }
                 swr_free(&swr);
             }
@@ -2624,13 +3039,17 @@ void VideoSource::audioWorkerMain() {
                 }
                 if (!audioTimeline.located()) {
                     audioTimeline.locate(samplePts);
-                } else if (generationStarted
+                } else if (std::exchange(placeAfterRetry, false) ||
+                           (generationStarted
                                ? audioTimeline.discards(nominal)
-                               : audioTimeline.discards(nominal) && audioTimeline.discards(samplePts, nominal)) {
+                               : audioTimeline.discards(nominal) && audioTimeline.discards(samplePts, nominal))) {
                     // None of the frame would be heard: it is before the
                     // seek's target, where the count and, before the first
                     // sound, its stamp put it, or over sound already sent.
-                    // Its stamp places it instead, cutting nothing heard.
+                    // Its stamp places it instead, cutting nothing heard. So
+                    // it does the first frame read again after a read that
+                    // failed, from before the sound already sent: the count
+                    // is where that sound ends, and what precedes it is cut.
                     audioTimeline.locate(samplePts, 0);
                     stampFollower.restart();
                 } else if (!generationStarted &&
@@ -2704,6 +3123,7 @@ void VideoSource::audioWorkerMain() {
     auto seekDecoder = [&](double seconds) {
         AVStream* stream = format->streams[streamIndex];
         audioIo_->clearError();
+        clearInputReadError(format);
         // Even PCM demuxers may seek directly to the requested sample.
         // Prime the resampling filter before that point so near-EOF seeks
         // have enough input to produce their short final output. Respect
@@ -2724,6 +3144,58 @@ void VideoSource::audioWorkerMain() {
         lostUntil = AV_NOPTS_VALUE;
         sentSeconds = std::numeric_limits<double>::quiet_NaN();
         return result;
+    };
+
+    // A read that failed with `result`, which ended the generation until
+    // 2026-11-24, the pane silent until its next seek. The stream is sought
+    // back and read again, as the video's is: a generation heard already
+    // from the packet last sent, the sample timeline cutting what was handed
+    // on; one not yet heard from its target, as the seek began it; a look at
+    // the stream's start from the start. Returns with the stream in place,
+    // the generation replaced, or, the tries spent, failed as before. Sound
+    // that comes back late is the owner's to aim again, as any that drifts.
+    auto retryAudioRead = [&](int result) {
+        while (running_.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (readRetries == 0) {
+                readFailedAt = now;
+                readRetryFrom = sentSeconds;
+            }
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - readFailedAt).count();
+            // Sound heard with no stamp to its name cannot be found again.
+            const bool resumable = !generationStarted ||
+                (audioTimeline.located() && std::isfinite(readRetryFrom));
+            const auto delay = resumable && transientReadError(result)
+                ? readRetryDelayMs(readRetries + 1, elapsed) : std::nullopt;
+            if (!delay) {
+                failGeneration("Audio read failed (" + ffmpegError(result) + ")");
+                return;
+            }
+            ++readRetries;
+            appendDiagnostic("Audio read failed (" + ffmpegError(result) + "); trying again in " +
+                             std::to_string(*delay) + " ms (try " + std::to_string(readRetries) + "): " +
+                             wideToUtf8Text(path_));
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait_for(lock, std::chrono::milliseconds(*delay), [&] {
+                    return !running_.load() || audioSeekPending_;
+                });
+            }
+            if (!running_.load() || !audioGenerationIsCurrent(decodingGeneration)) return;
+            const bool probing = startProbe == StartProbe::Running;
+            const bool heard = !probing && generationStarted;
+            result = reopenInput(&format, wideToUtf8Text(path_), options_);
+            if (result < 0) continue;
+            result = seekDecoder(probing ? 0.0 : heard ? readRetryFrom : generationTarget - delaySeconds);
+            if (result < 0) continue;
+            if (heard) {
+                placeAfterRetry = true;
+            } else if (!probing) {
+                heldSound.reset();
+                audioTimeline.reset(gateSample);
+            }
+            return;
+        }
     };
 
     while (running_.load()) {
@@ -2748,6 +3220,9 @@ void VideoSource::audioWorkerMain() {
                 heldSound.reset();
                 // A seek replaces any look at the stream's start.
                 startProbe = StartProbe::None;
+                // And a read that fails at its place is the first of its run.
+                readRetries = 0;
+                placeAfterRetry = false;
                 beginGeneration();
             }
         }
@@ -2773,7 +3248,7 @@ void VideoSource::audioWorkerMain() {
                     requestedAudioStream_.store(streamIndex);
                     appendDiagnostic("Audio track switch to stream " + std::to_string(wantedStream) +
                                      " failed (" + ffmpegError(switched) + "); keeping stream " +
-                                     std::to_string(streamIndex) + ": " + wideToUtf8(path_));
+                                     std::to_string(streamIndex) + ": " + wideToUtf8Text(path_));
                 } else {
                     avcodec_free_context(&codec);
                     codec = replacement;
@@ -2793,7 +3268,7 @@ void VideoSource::audioWorkerMain() {
                     rateNoteDue = -1.0;
                     activeAudioStream_.store(streamIndex);
                     appendDiagnostic("Audio track switched to stream " + std::to_string(streamIndex) +
-                                     ": " + wideToUtf8(path_));
+                                     ": " + wideToUtf8Text(path_));
                 }
             }
             // The demuxer seeks to the source time that plays at the target,
@@ -2829,7 +3304,7 @@ void VideoSource::audioWorkerMain() {
                 logPassedOverErrors(decodeErrors, true);
                 std::ostringstream line;
                 line << "A frame decodes from the start of the stream; the sound from " << std::fixed
-                     << std::setprecision(2) << generationTarget << " s goes on: " << wideToUtf8(path_);
+                     << std::setprecision(2) << generationTarget << " s goes on: " << wideToUtf8Text(path_);
                 appendDiagnostic(line.str());
             }
             const int seekResult = seekDecoder(toStart ? 0.0 : generationTarget - delaySeconds);
@@ -2843,10 +3318,14 @@ void VideoSource::audioWorkerMain() {
             startProbe = toStart ? StartProbe::Running : StartProbe::None;
             if (!audioGenerationIsCurrent(decodingGeneration)) continue;
         }
-        const int readResult = av_read_frame(format, packet);
+        int readResult = av_read_frame(format, packet);
         if (!audioGenerationIsCurrent(decodingGeneration)) {
             av_packet_unref(packet);
             continue;
+        }
+        // An end of the stream that a failed read made is the failed read.
+        if (readResult == AVERROR_EOF) {
+            if (const int failed = inputReadError(format)) readResult = failed;
         }
         if (readResult == AVERROR(EAGAIN)) {
             std::unique_lock lock(mutex_);
@@ -2887,7 +3366,7 @@ void VideoSource::audioWorkerMain() {
         }
         if (readResult < 0) {
             if (!running_.load()) break;
-            failGeneration("Audio read failed (" + ffmpegError(readResult) + ")");
+            retryAudioRead(readResult);
             continue;
         }
         if (packet->stream_index != streamIndex) { av_packet_unref(packet); continue; }
@@ -2904,6 +3383,15 @@ void VideoSource::audioWorkerMain() {
         }
         lostUntil = AV_NOPTS_VALUE;
         sentSeconds = packetSeconds;
+        if (readRetries > 0 && std::isfinite(packetSeconds)) {
+            // The stream has got past where the read failed: the next
+            // failure is the first of a new run.
+            if (!std::isfinite(readRetryFrom)) {
+                readRetryFrom = packetSeconds;
+            } else if (packetSeconds > readRetryFrom) {
+                readRetries = 0;
+            }
+        }
         int result = avcodec_send_packet(codec, packet);
         if (result == AVERROR(EAGAIN)) {
             const ReceiveResult received = receiveFrames();

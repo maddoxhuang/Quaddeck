@@ -303,4 +303,77 @@ bool readUtf8File(const std::filesystem::path& path, std::wstring& text) {
     return decodeUtf8(bytes, text);
 }
 
+BackgroundDocumentWriter::BackgroundDocumentWriter(unsigned retries, std::chrono::milliseconds retryDelay,
+                                                   Outcome outcome, Write write)
+    : retries_(retries), retryDelay_(retryDelay), outcome_(std::move(outcome)),
+      write_(write ? std::move(write) : Write([](const std::filesystem::path& path, const std::wstring& text) {
+          std::error_code error;
+          std::filesystem::create_directories(path.parent_path(), error);
+          if (error) return false;
+          return writeUtf8FileAtomically(path, [&](std::wostream& output) {
+              output << text;
+              return output.good();
+          });
+      })) {}
+
+BackgroundDocumentWriter::~BackgroundDocumentWriter() { finish(); }
+
+void BackgroundDocumentWriter::write(std::filesystem::path path, std::wstring text) {
+    {
+        std::scoped_lock lock(mutex_);
+        pending_ = Document{std::move(path), std::move(text)};
+        if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+    }
+    changed_.notify_all();
+}
+
+void BackgroundDocumentWriter::finish() {
+    {
+        std::scoped_lock lock(mutex_);
+        stopping_ = true;
+        pending_.reset();
+    }
+    changed_.notify_all();
+    if (thread_.joinable()) thread_.join();
+    std::scoped_lock lock(mutex_);
+    stopping_ = false;
+}
+
+bool BackgroundDocumentWriter::idle(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] { return !pending_ && !busy_; });
+}
+
+void BackgroundDocumentWriter::run() {
+    std::unique_lock lock(mutex_);
+    for (;;) {
+        changed_.wait(lock, [&] { return stopping_ || pending_.has_value(); });
+        if (stopping_) return;
+        Document document = std::move(*pending_);
+        pending_.reset();
+        busy_ = true;
+        for (unsigned attempt = 0;; ++attempt) {
+            lock.unlock();
+            // An exception would end the process from this thread; it is a
+            // write that failed.
+            bool written = false;
+            try {
+                written = write_(document.path, document.text);
+            } catch (...) {
+            }
+            const bool retrying = !written && attempt < retries_;
+            try {
+                if (outcome_) outcome_(written, retrying);
+            } catch (...) {
+            }
+            lock.lock();
+            if (!retrying) break;
+            // A newer document is written instead; the end drops the retry.
+            if (changed_.wait_for(lock, retryDelay_, [&] { return stopping_ || pending_.has_value(); })) break;
+        }
+        busy_ = false;
+        changed_.notify_all();
+    }
+}
+
 }  // namespace quaddeck

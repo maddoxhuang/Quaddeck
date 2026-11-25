@@ -455,10 +455,9 @@ std::vector<PanelRow> App::buildEmbyDetailRows(float clientWidth) const {
     if (!embyDetails_) return rows;
     const auto& detail = *embyDetails_;
     const auto& item = detail.item;
-    const auto note = [&rows](const std::wstring& label, bool alert = false) {
-        if (label.empty()) return;
-        PanelRow row; row.kind = PanelRowKind::Note; row.label = label;
-        row.wrapNote = true; row.alert = alert; rows.push_back(std::move(row));
+    PanelRowAppender add(rows);
+    const auto note = [&add](const std::wstring& label, bool alert = false) {
+        if (!label.empty()) add.note(label).alert = alert;
     };
     PanelRow navigation;
     navigation.kind = PanelRowKind::Buttons;
@@ -546,17 +545,17 @@ std::vector<PanelRow> App::buildEmbyDetailRows(float clientWidth) const {
         const std::size_t firstLines = std::max(line, (kEmbyCastShown + line - 1) / line * line);
         const std::size_t shown = detail.castExpanded ? people.size() : std::min(people.size(), firstLines);
         for (std::size_t start = 0; start < shown; start += line) {
-            PanelRow tiles;
-            tiles.kind = PanelRowKind::Tiles;
-            tiles.id = SettingId::EmbyDetailPerson;
-            tiles.tileWidth = tileWidth;
-            tiles.tileAspect = 2.0F / 3.0F;
+            PanelRow castLine;
+            castLine.kind = PanelRowKind::Tiles;
+            castLine.id = SettingId::EmbyDetailPerson;
+            castLine.tileWidth = tileWidth;
+            castLine.tileAspect = 2.0F / 3.0F;
             for (std::size_t i = start; i < shown && i < start + line; ++i) {
-                tiles.tileParams.push_back(static_cast<int>(i));
-                tiles.options.push_back(creditCaption(people[i]));
-                tiles.tileKeys.push_back(emby::personImageKey(people[i], imageWidth));
+                castLine.tileParams.push_back(static_cast<int>(i));
+                castLine.options.push_back(creditCaption(people[i]));
+                castLine.tiles.push_back({.key = emby::personImageKey(people[i], imageWidth)});
             }
-            rows.push_back(std::move(tiles));
+            rows.push_back(std::move(castLine));
         }
         if (people.size() > firstLines) {
             PanelRow all;

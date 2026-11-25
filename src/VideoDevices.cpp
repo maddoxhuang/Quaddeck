@@ -28,33 +28,41 @@ void forEachHardwareAdapter(Visit&& visit) {
 // desktop they show; empty where Windows has none.
 std::map<std::wstring, std::wstring> monitorNames() {
     std::map<std::wstring, std::wstring> names;
+    for (const auto& display : activeDisplayPaths()) {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = sizeof(target);
+        target.header.adapterId = display.path.targetInfo.adapterId;
+        target.header.id = display.path.targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
+        // A mirrored desktop has two monitors; the first one names it.
+        names.try_emplace(display.device, target.monitorFriendlyDeviceName);
+    }
+    return names;
+}
+
+}  // namespace
+
+std::vector<DisplayPath> activeDisplayPaths() {
+    std::vector<DisplayPath> list;
     UINT32 pathCount = 0;
     UINT32 modeCount = 0;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return names;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) return list;
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
     if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(),
-                           nullptr) != ERROR_SUCCESS) return names;
+                           nullptr) != ERROR_SUCCESS) return list;
     for (UINT32 index = 0; index < pathCount; ++index) {
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
         source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         source.header.size = sizeof(source);
         source.header.adapterId = paths[index].sourceInfo.adapterId;
         source.header.id = paths[index].sourceInfo.id;
-        DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
-        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        target.header.size = sizeof(target);
-        target.header.adapterId = paths[index].targetInfo.adapterId;
-        target.header.id = paths[index].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
-            DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS) continue;
-        // A mirrored desktop has two monitors; the first one names it.
-        names.try_emplace(source.viewGdiDeviceName, target.monitorFriendlyDeviceName);
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
+        list.push_back({paths[index], source.viewGdiDeviceName});
     }
-    return names;
+    return list;
 }
-
-}  // namespace
 
 std::vector<VideoAdapterInfo> listVideoAdapters() {
     std::vector<VideoAdapterInfo> list;

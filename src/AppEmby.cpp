@@ -35,9 +35,6 @@ namespace {
 
 constexpr auto kEmbyProgressInterval = std::chrono::seconds(10);
 
-std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
-std::string narrow(const std::wstring& text) { return wideToUtf8Text(text); }
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -150,8 +147,8 @@ void App::embyConfigure(const emby::Session& session) {
 // The home page's account line; signed out, the sign-in page has its own.
 std::wstring App::embyStatusLine() const {
     const auto& session = emby_.session();
-    return L"Signed in as " + wide(session.userName) + L" on " +
-           wide(session.serverName.empty() ? session.serverUrl : session.serverName) + L".";
+    return L"Signed in as " + utf8ToWideText(session.userName) + L" on " +
+           utf8ToWideText(session.serverName.empty() ? session.serverUrl : session.serverName) + L".";
 }
 
 bool App::embySignInPage() const {
@@ -170,7 +167,7 @@ void App::embyOpenSignIn() {
     // since stays.
     const auto seed = [](TextFieldState& field, const std::string& value) {
         if (!field.text.empty()) return;
-        field.text = wide(value);
+        field.text = utf8ToWideText(value);
         field.caret = field.anchor = field.text.size();
     };
     seed(embySignInForm_.server, emby_.session().serverUrl);
@@ -220,7 +217,7 @@ void App::embySubmitSignIn() {
         return;
     }
     blurField();
-    embySignIn(narrow(server), narrow(user), narrow(embySignInForm_.password.text));
+    embySignIn(wideToUtf8Text(server), wideToUtf8Text(user), wideToUtf8Text(embySignInForm_.password.text));
 }
 
 void App::embySignInFailed(std::wstring note, TextFieldId field) {
@@ -248,7 +245,7 @@ void App::embySignIn(const std::string& serverUrl, const std::string& userName, 
     embyItems_.clear();
     embyResume_.clear();
     embyViews_.clear();
-    embyNote_ = L"Connecting to " + wide(session.serverUrl) + L"\x2026";
+    embyNote_ = L"Connecting to " + utf8ToWideText(session.serverUrl) + L"\x2026";
     embyNoteError_ = false;
     embyLoading_ = true;
     if (settingsOpen_) rememberSheetScroll();
@@ -267,7 +264,7 @@ void App::embyServerInfoArrived(std::uint64_t serial, const std::string& userNam
     if (serial != embyRequestSerial_) return;
     // A failure leaves the sign-in page up, saying why.
     if (!response.ok) {
-        embySignInFailed(L"Cannot reach the server: " + wide(response.error), TextFieldId::EmbyServer);
+        embySignInFailed(L"Cannot reach the server: " + utf8ToWideText(response.error), TextFieldId::EmbyServer);
         showNotice(L"Emby: cannot reach the server");
         return;
     }
@@ -294,7 +291,7 @@ void App::embyAuthenticationArrived(std::uint64_t serial, const EmbyClient::Resp
     embyLoading_ = false;
     if (!response.ok) {
         embySignInFailed(response.status == 401 ? L"Wrong user name or password."
-                                                : L"Sign-in failed: " + wide(response.error),
+                                                : L"Sign-in failed: " + utf8ToWideText(response.error),
                          TextFieldId::EmbyPassword);
         showNotice(L"Emby: sign-in failed");
         return;
@@ -316,39 +313,32 @@ void App::embyAuthenticationArrived(std::uint64_t serial, const EmbyClient::Resp
     // The password is not kept once it has done its work.
     embySignInForm_.password = TextFieldState{};
     appendDiagnostic("Emby: signed in as " + session.userName + " on " + session.serverUrl);
-    showNotice(L"Emby: signed in as " + wide(session.userName));
+    showNotice(L"Emby: signed in as " + utf8ToWideText(session.userName));
     embyGoHome();
 }
 
 void App::embySignOut() {
-    // Whatever plays from this account stops under it; nothing queued for
-    // it may run under the next one.
-    embyDetachPlayback();
-    auto session = emby_.session();
-    if (session.signedIn()) emby_.request("POST", emby::logoutPath(), "", {});
-    session.token.clear();
-    session.userId.clear();
-    embyConfigure(session);
-    embySaveAuth();
-    // The sheet showing the browser closes: there is no settings face
-    // behind it to fall back on any more.
-    if (settingsOpen_ && embyBrowserOpen_) closeSettingsPanel();
-    embyBrowserOpen_ = false;
-    embyPages_.clear();
-    embyItems_.clear();
-    embyResume_.clear();
-    embyViews_.clear();
+    embyForgetAccount(true);
     embyNote_.clear();
     embyNoteError_ = false;
-    embyLoading_ = false;
-    embyLoadingMore_ = false;
     appendDiagnostic("Emby: signed out");
     showNotice(L"Emby: signed out");
 }
 
 void App::embySessionExpired() {
+    embyForgetAccount(false);
+    embyNote_ = L"The Emby sign-in has expired. Sign in again.";
+    embyNoteError_ = false;
+    appendDiagnostic("Emby: the server refused the token; signed out");
+    showNotice(L"Emby sign-in expired");
+}
+
+void App::embyForgetAccount(bool logOut) {
+    // Whatever plays from this account stops under it; nothing queued for
+    // it may run under the next one.
     embyDetachPlayback();
     auto session = emby_.session();
+    if (logOut && session.signedIn()) emby_.request("POST", emby::logoutPath(), "", {});
     session.token.clear();
     session.userId.clear();
     embyConfigure(session);
@@ -363,10 +353,6 @@ void App::embySessionExpired() {
     embyViews_.clear();
     embyLoading_ = false;
     embyLoadingMore_ = false;
-    embyNote_ = L"The Emby sign-in has expired. Sign in again.";
-    embyNoteError_ = false;
-    appendDiagnostic("Emby: the server refused the token; signed out");
-    showNotice(L"Emby sign-in expired");
 }
 
 void App::embyDetachPlayback() {
@@ -419,6 +405,7 @@ void App::resetPaneMediaState(std::size_t pane, bool sameMedia) {
     // source it was fed by.
     if (!sameMedia || subtitleSerial_[pane] == 0) subtitleSerial_[pane] = ++subtitleSerialCounter_;
     assPanes_[pane] = {};
+    picturePanes_[pane] = {};
 }
 
 void App::embyFailure(const EmbyClient::Response& response) {
@@ -426,7 +413,7 @@ void App::embyFailure(const EmbyClient::Response& response) {
         embySessionExpired();
         return;
     }
-    embyNote_ = L"Emby: " + wide(response.error);
+    embyNote_ = L"Emby: " + utf8ToWideText(response.error);
     embyNoteError_ = true;
     appendDiagnostic("Emby: request failed: " + response.error);
 }
@@ -582,7 +569,7 @@ void App::embySubtitleRead(std::size_t pane, int streamIndex, bool ass, Subtitle
     }
     if (!read.track) {
         showNotice(read.result == SubtitleRead::TooLarge ? std::wstring(L"The subtitle stream is too large (over 16 MiB)")
-                   : read.result == SubtitleRead::Unreadable ? L"Subtitles unavailable: " + wide(error)
+                   : read.result == SubtitleRead::Unreadable ? L"Subtitles unavailable: " + utf8ToWideText(error)
                                                              : L"The subtitle stream has no lines");
         return;
     }

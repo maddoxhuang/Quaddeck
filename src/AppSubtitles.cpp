@@ -70,18 +70,15 @@ UINT hintedCodePage(const std::filesystem::path& file) {
     const auto dot = stem.find_last_of(L'.');
     if (dot == std::wstring::npos) return CP_ACP;
     const std::string language = subtitle_detail::languageFromHint(stem.substr(dot + 1));
-    if (language == "zh-Hant") return 950;
-    if (language == "zh-Hans") return 936;
-    if (language == "ja") return 932;
-    if (language == "ko") return 949;
+    if (const unsigned page = subtitleLegacyCodePage(language)) return page;
     return CP_ACP;
 }
 
 // Subtitle bytes as UTF-8: a UTF-16 byte-order mark is honoured, UTF-8 --
 // valid, or marked as UTF-8 with a stray bad byte -- passes, anything else
-// is taken as the code page named, if that reads it without an invalid
-// character, and as the system's otherwise.
-std::string subtitleBytesToUtf8(std::string bytes, UINT codePage) {
+// is taken as the first of the code pages named that reads it without an
+// invalid character, and as the system's otherwise.
+std::string subtitleBytesToUtf8(std::string bytes, const std::vector<unsigned>& codePages) {
     bytes = decodeSubtitleBytes(std::move(bytes));
     if (bytes.empty() || isUtf8Text(bytes)) return bytes;
     const auto decode = [&](UINT page, DWORD flags) -> std::optional<std::string> {
@@ -91,8 +88,8 @@ std::string subtitleBytesToUtf8(std::string bytes, UINT codePage) {
         MultiByteToWideChar(page, flags, bytes.data(), static_cast<int>(bytes.size()), converted.data(), size);
         return wideToUtf8Text(converted);
     };
-    if (codePage != CP_ACP) {
-        if (auto text = decode(codePage, MB_ERR_INVALID_CHARS)) return *text;
+    for (const unsigned page : codePages) {
+        if (auto text = decode(page, MB_ERR_INVALID_CHARS)) return *text;
     }
     if (auto text = decode(CP_ACP, 0)) return *text;
     return bytes;
@@ -100,11 +97,14 @@ std::string subtitleBytesToUtf8(std::string bytes, UINT codePage) {
 
 // A file's cues, or why there are none: it holds no line, is too large or
 // could not be read. A script of signs drawn as shapes has no cue but is
-// libass's to draw.
-SubtitleReadResult readSubtitleFile(const std::filesystem::path& file) {
+// libass's to draw. `wanted` is the languages looked for: a file that is
+// not Unicode and whose name says nothing is tried as theirs.
+SubtitleReadResult readSubtitleFile(const std::filesystem::path& file, const std::vector<std::string>& wanted) {
     std::string bytes;
     if (const auto failure = readBoundedFile(file, kSubtitleByteLimit, bytes)) return {*failure, nullptr};
-    auto track = parseSubtitles(subtitleBytesToUtf8(std::move(bytes), hintedCodePage(file)));
+    const UINT hinted = hintedCodePage(file);
+    auto track = parseSubtitles(subtitleBytesToUtf8(
+        std::move(bytes), subtitleCodePages(hinted == CP_ACP ? 0U : hinted, GetACP(), wanted)));
     if (!track || !track->hasLines()) return {SubtitleRead::NoLines, nullptr};
     return {SubtitleRead::Lines, std::make_shared<const SubtitleTrack>(std::move(*track))};
 }
@@ -139,13 +139,13 @@ std::wstring sidecarSuffix(const std::filesystem::path& video, const std::filesy
 // What the Subtitles menu shows for a stream inside the container.
 std::wstring subtitleTrackLabel(const SubtitleTrackInfo& track) {
     std::wstring label;
-    if (!track.title.empty()) label = utf8ToWide(track.title);
+    if (!track.title.empty()) label = utf8ToWideText(track.title);
     if (!track.language.empty()) {
         if (!label.empty()) label += L"  ";
-        label += utf8ToWide(track.language);
+        label += utf8ToWideText(track.language);
     }
     if (label.empty()) label = L"Track " + std::to_wstring(track.streamIndex);
-    if (!track.codec.empty()) label += L"  (" + utf8ToWide(track.codec) + L")";
+    if (!track.codec.empty()) label += L"  (" + utf8ToWideText(track.codec) + L")";
     if (track.forced) label += L"  forced";
     return label;
 }
@@ -222,15 +222,21 @@ SourceOptions App::localSourceOptions() const {
     SourceOptions options;
     options.readSubtitles = true;
     options.chooseSubtitle = [wanted = subtitleWanted()](const std::vector<SubtitleTrackInfo>& tracks) {
-        std::vector<SubtitleCandidate> candidates;
-        std::vector<int> streams;
-        for (const auto& track : tracks) {
-            if (!track.text) continue;
-            candidates.push_back({track.language, utf8ToWideText(track.title), track.isDefault, track.forced, false});
-            streams.push_back(track.streamIndex);
+        // The text streams first, as before pictures were shown; a stream
+        // of pictures only where the file has no text to show.
+        for (const bool pictures : {false, true}) {
+            std::vector<SubtitleCandidate> candidates;
+            std::vector<int> streams;
+            for (const auto& track : tracks) {
+                if (!(pictures ? track.pictures : track.text)) continue;
+                candidates.push_back(
+                    {track.language, utf8ToWideText(track.title), track.isDefault, track.forced, false});
+                streams.push_back(track.streamIndex);
+            }
+            const int best = chooseSubtitle(candidates, wanted);
+            if (best >= 0) return streams[static_cast<std::size_t>(best)];
         }
-        const int best = chooseSubtitle(candidates, wanted);
-        return best >= 0 ? streams[static_cast<std::size_t>(best)] : -1;
+        return -1;
     };
     return options;
 }
@@ -254,7 +260,10 @@ std::vector<App::SubtitleOption> App::subtitleOptions(std::size_t pane) const {
             option.label = utf8ToWideText(emby::streamLabel(stream));
             const std::wstring title = utf8ToWideText(stream.title);
             if (!title.empty() && option.label.find(title) == std::wstring::npos) option.label += L"  \x00B7  " + title;
-            option.usable = stream.isTextSubtitle;
+            // A stream of pictures is shown only from the file: the server
+            // has no text of it to hand over.
+            option.pictures = !stream.isTextSubtitle;
+            option.usable = stream.isTextSubtitle || inVideo;
             if (!option.usable) option.label += L"  (pictures, not shown)";
             // The title is the file name's own part for a file beside the
             // video; the display title spells the language out.
@@ -297,7 +306,8 @@ std::vector<App::SubtitleOption> App::subtitleOptions(std::size_t pane) const {
             SubtitleOption option;
             option.what = {SubtitleKind::Embedded, track.streamIndex, {}};
             option.label = subtitleTrackLabel(track);
-            option.usable = track.text;
+            option.pictures = track.pictures;
+            option.usable = track.text || track.pictures;
             if (!option.usable) option.label += L"  (pictures, not shown)";
             option.candidate = {track.language, utf8ToWideText(track.title), track.isDefault, track.forced, false};
             options.push_back(std::move(option));
@@ -307,7 +317,7 @@ std::vector<App::SubtitleOption> App::subtitleOptions(std::size_t pane) const {
 }
 
 bool App::embyStreamReadWithVideo(std::size_t pane, const emby::MediaStream& stream) const {
-    if (stream.isExternal || !stream.isTextSubtitle) return false;
+    if (stream.isExternal || (!stream.isTextSubtitle && !emby::isPictureSubtitleCodec(stream.codec))) return false;
     // The server numbers the streams inside a file as FFmpeg does.
     const auto& source = sources_[pane];
     if (!source || !source->ready()) return true;
@@ -385,17 +395,25 @@ int App::preferredSubtitle(std::size_t pane, const std::vector<SubtitleOption>& 
     }
     // Otherwise the language wanted; a file put beside the video before a
     // stream inside it.
+    // Text before pictures: a stream of pictures is chosen only where
+    // nothing with text is, so what was chosen before they were shown is
+    // chosen still.
     const auto wanted = subtitleWanted();
-    for (const SubtitleKind kind : {SubtitleKind::EmbyStream, SubtitleKind::File, SubtitleKind::Embedded}) {
-        std::vector<SubtitleCandidate> candidates;
-        std::vector<std::size_t> indexes;
-        for (std::size_t i = 0; i < options.size(); ++i) {
-            if (!options[i].usable || options[i].unreadable || group(options[i].what.kind) != kind) continue;
-            candidates.push_back(options[i].candidate);
-            indexes.push_back(i);
+    for (const bool pictures : {false, true}) {
+        for (const SubtitleKind kind : {SubtitleKind::EmbyStream, SubtitleKind::File, SubtitleKind::Embedded}) {
+            std::vector<SubtitleCandidate> candidates;
+            std::vector<std::size_t> indexes;
+            for (std::size_t i = 0; i < options.size(); ++i) {
+                if (!options[i].usable || options[i].unreadable || options[i].pictures != pictures ||
+                    group(options[i].what.kind) != kind) {
+                    continue;
+                }
+                candidates.push_back(options[i].candidate);
+                indexes.push_back(i);
+            }
+            const int best = chooseSubtitle(candidates, wanted);
+            if (best >= 0) return static_cast<int>(indexes[static_cast<std::size_t>(best)]);
         }
-        const int best = chooseSubtitle(candidates, wanted);
-        if (best >= 0) return static_cast<int>(indexes[static_cast<std::size_t>(best)]);
     }
     return -1;
 }
@@ -418,6 +436,18 @@ void App::adoptEmbeddedSubtitles() {
             const SubtitleSelection selection = subtitleSelection_[pane];
             if (selection.kind != SubtitleKind::Embedded) continue;
             if (source->hasSubtitleReader(selection.stream)) continue;
+            // A stream of pictures the source does not read is not shown at
+            // all: the server has no text of it to hand over.
+            const auto& streams = embyPanes_[pane]->streams;
+            const auto listed = std::find_if(streams.begin(), streams.end(), [&](const emby::MediaStream& stream) {
+                return stream.type == "Subtitle" && stream.index == selection.stream;
+            });
+            if (listed != streams.end() && !listed->isTextSubtitle) {
+                appendDiagnostic("Emby: picture subtitle stream " + std::to_string(selection.stream) +
+                                 " is not read from the video and is not shown, pane=" + std::to_string(pane + 1));
+                selectSubtitle(pane, {}, false);
+                continue;
+            }
             appendDiagnostic("Emby: subtitle stream " + std::to_string(selection.stream) +
                              " is not read from the video; asking the server, pane=" + std::to_string(pane + 1));
             selectSubtitle(pane, {SubtitleKind::EmbyStream, selection.stream, {}}, false);
@@ -460,7 +490,7 @@ App::SidecarScan App::scanSidecars(const std::wstring& path, const std::vector<s
     std::size_t attempts = 0;
     for (const std::size_t index : rankSubtitles(candidates, wanted)) {
         if (attempts++ >= kSidecarReadAttempts) break;
-        auto read = readSubtitleFile(scan.files[index]);
+        auto read = readSubtitleFile(scan.files[index], wanted);
         if (read.track) {
             scan.chosen = static_cast<int>(index);
             scan.track = std::move(read.track);
@@ -525,8 +555,8 @@ void App::loadSubtitleFile(std::size_t pane, const std::filesystem::path& file) 
     if (pane >= sources_.size()) return;
     if (subtitleSerial_[pane] == 0) subtitleSerial_[pane] = ++subtitleSerialCounter_;
     const std::uint64_t serial = subtitleSerial_[pane];
-    std::thread([queue = mainQueue_, this, serial, file] {
-        auto read = readSubtitleFile(file);
+    std::thread([queue = mainQueue_, this, serial, file, wanted = subtitleWanted()] {
+        auto read = readSubtitleFile(file, wanted);
         queue->post([this, serial, file, read = std::move(read)]() mutable {
             const auto found = subtitlePaneWithSerial(serial);
             if (!found) return;
@@ -597,24 +627,18 @@ void App::loadSubtitleDialog(std::size_t pane) {
         if (paneOpening(pane)) showNotice(L"The video is still opening; open its subtitles again once it plays");
         return;
     }
-    wchar_t path[MAX_PATH]{};
+    FileDialogRequest request{
+        .filter = L"Subtitles (*.srt;*.ass;*.ssa;*.vtt)\0*.srt;*.ass;*.ssa;*.vtt\0All files\0*.*\0"};
     // Beside the video is where its subtitles usually are.
-    std::wstring folder;
     if (!paths_[pane].empty() && !emby::isLocator(paths_[pane]) && paths_[pane].find(L"://") == std::wstring::npos) {
-        folder = std::filesystem::path(paths_[pane]).parent_path().wstring();
+        request.folder = std::filesystem::path(paths_[pane]).parent_path().wstring();
     }
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"Subtitles (*.srt;*.ass;*.ssa;*.vtt)\0*.srt;*.ass;*.ssa;*.vtt\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrInitialDir = folder.empty() ? nullptr : folder.c_str();
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
     // The player goes on playing under the dialog and may have moved the
     // pane on to its next video, or swapped it, by the time a file is
     // picked: the file is for the video the dialog was opened on.
     const std::uint64_t serial = subtitleSerial_[pane];
-    if (!GetOpenFileNameW(&dialog)) return;
+    const auto path = openFileDialog(window_, request);
+    if (!path) return;
     if (serial != 0) {
         const auto found = subtitlePaneWithSerial(serial);
         if (!found) {
@@ -623,7 +647,7 @@ void App::loadSubtitleDialog(std::size_t pane) {
         }
         pane = *found;
     }
-    addSubtitleFile(pane, path);
+    addSubtitleFile(pane, *path);
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +933,35 @@ std::shared_ptr<const SubtitleBitmap> App::renderAssSubtitles(std::size_t pane, 
     }
     look.raise = std::min(std::round(raise * 10.0) / 10.0, 100.0);
     return state.subtitles->render(frame, look, std::llround(seconds * 1000.0));
+}
+
+std::shared_ptr<const SubtitleBitmap> App::renderPictureSubtitles(std::size_t pane, double seconds) {
+    if (pane >= sources_.size() || !sources_[pane]) return nullptr;
+    PicturePane& state = picturePanes_[pane];
+    const auto picture = sources_[pane]->subtitlePictureAt(seconds);
+    if (!picture) {
+        state = {};
+        return nullptr;
+    }
+    const RectF& cell = chromeCells_[pane];
+    int videoWidth = sources_[pane]->videoWidth();
+    int videoHeight = sources_[pane]->videoHeight();
+    // Against the upright frame, as a script is (renderAssSubtitles).
+    if (turnedSideways(sources_[pane]->videoQuarterTurns())) std::swap(videoWidth, videoHeight);
+    const float pixelAspect =
+        storedPixelAspect(videoWidth, videoHeight, sources_[pane]->videoDisplayAspect());
+    const PaneView& view = shownView(pane);
+    const RectF canvas = subtitleCanvasRect(
+        pictureRect(cell, videoWidth, videoHeight, view.mode, view.zoom, pixelAspect), videoWidth, videoHeight,
+        picture->canvasWidth, picture->canvasHeight);
+    const auto same = [](const RectF& a, const RectF& b) {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+    };
+    if (state.bitmap && state.picture == picture && same(state.canvas, canvas) && same(state.cell, cell)) {
+        return state.bitmap;
+    }
+    state = {picture, canvas, cell, placeSubtitlePicture(*picture, canvas, cell)};
+    return state.bitmap;
 }
 
 // ---------------------------------------------------------------------------

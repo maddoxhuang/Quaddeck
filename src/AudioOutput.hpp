@@ -60,11 +60,16 @@ public:
     void flush(std::size_t pane, std::uint64_t minimumAcceptedGeneration);
     void setMuted(bool muted);
     // 0 to 2: up to 1 on the mastering voice, past it as a gain in the
-    // effects ahead of their limiter.
+    // effects ahead of their limiter (masterVolumeParts).
     void setVolume(float volume);
     // The mix's effects; the boost in them is the volume's.
     void setEffects(const AudioEffectSettings& effects);
     const AudioEffectSettings& effects() const { return effects_; }
+    // Whether the effects act on what plays. They do not on an output that
+    // would not take them or that has more channels than they know: the
+    // sound plays as it is, and volume past 100% is the mastering voice's
+    // with no limiter of QuadDeck's after it.
+    bool effectsRun() const;
     // Per-pane trim, applied on that pane's own source voice. The mastering
     // voice keeps master volume and mute, so the two multiply rather than
     // fight: silencing one pane leaves the others where the user put them.
@@ -137,6 +142,7 @@ private:
     void close();
     void applyPaneVolume(std::size_t pane);
     void applyRateLocked(std::size_t pane);
+    void applyMasterVolume();
     void applyEffects();
     void flushLocked(std::size_t pane, std::uint64_t rejectedThroughGeneration);
 

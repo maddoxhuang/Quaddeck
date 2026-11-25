@@ -311,6 +311,48 @@ inline bool audioNeedsReaim(std::optional<double> error,
     return error && std::abs(*error) > maximumDrift;
 }
 
+// The picture a pane has up while the clock is stopped: whether its source
+// hands one out for the pane's time, and that frame's place and length.
+struct ShownFrame {
+    bool shown{};
+    double pts{};
+    double duration{};
+};
+
+// Whether the frame is the one for `seconds` of its source: its interval
+// holds it. A frame of no known length is given a twentieth of a second, and
+// the first frame after an open may start that much late (pausedFrameStep).
+inline bool frameCoversTime(const ShownFrame& frame, double seconds) {
+    if (!frame.shown || !std::isfinite(frame.pts) || !std::isfinite(seconds)) return false;
+    const double length = std::isfinite(frame.duration) && frame.duration > 0.0 ? frame.duration : 0.050;
+    return seconds >= frame.pts - 0.050 && seconds < frame.pts + length + 0.003;
+}
+
+// Whether Play after Pause can go on from the pictures that are up, with no
+// video sought. Until 2026-11-24 it sought every video to the place it was
+// already at, each decoding from its keyframe again before any moved: a
+// second or more of nothing after the key, with four 4K videos. A stopped
+// source keeps its queue, so the frames after the one shown are still there.
+// Only when every loaded pane is one a global seek would wait for -- ready,
+// not paused by itself, started, short of its end -- and shows the frame for
+// its time: a seek, a step or an offset changed while paused leaves the frame
+// for the new place up once it is done, and until then, or with a pane the
+// seek would have put in its place, the seek is made as before.
+inline bool canResumeInPlace(double timeline, const PaneTimings& panes,
+                             const PaneArray<ShownFrame>& frames, SeekMode seek) {
+    bool any = false;
+    for (std::size_t pane = 0; pane < panes.size(); ++pane) {
+        if (!panes[pane].loaded) continue;
+        if (!panes[pane].ready || panes[pane].paused || !paneIsActive(panes[pane], timeline) ||
+            !paneBeforeEnd(panes[pane], timeline, seek)) {
+            return false;
+        }
+        if (!frameCoversTime(frames[pane], mappedPaneTime(panes[pane], timeline, seek))) return false;
+        any = true;
+    }
+    return any;
+}
+
 // A global seek freezes the master clock until every participating pane has
 // presented its own exact destination frame, so the picture and the audio of
 // all participating panes resume on the same render pass instead of drifting in one at
@@ -360,6 +402,21 @@ public:
             anyWait = anyWait || state.wait;
         }
         return anyWait;
+    }
+
+    // Play after Pause from the pictures that are up (canResumeInPlace): no
+    // video is sought, so every pane's frame is ready as the barrier begins,
+    // and it waits only for the sound that will be heard, started again at
+    // the same place. Returns true when there is such sound to wait for.
+    bool beginResume(double target, const PaneTimings& panes, unsigned audioMask, SeekMode seek) {
+        begin(target, true, panes, audioMask, seek);
+        bool anyAudio = false;
+        for (auto& state : panes_) {
+            if (!state.wait) continue;
+            state.frameReady = state.firstFrameLogged = state.exactLogged = true;
+            anyAudio = anyAudio || state.audioWait;
+        }
+        return anyAudio;
     }
 
     void reset() {

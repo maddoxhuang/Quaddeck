@@ -69,11 +69,6 @@ int spinBoxNumber(const std::wstring& digits) {
     return number;
 }
 
-OverlayRect overlayRect(const RECT& rect) {
-    return {static_cast<float>(rect.left), static_cast<float>(rect.top), static_cast<float>(rect.right - rect.left),
-            static_cast<float>(rect.bottom - rect.top)};
-}
-
 // Where it first stands, in screen pixels: over the middle of the player,
 // below its caption.
 RECT settingsWindowStart(HWND player, float scale, float captionInset) {
@@ -148,15 +143,8 @@ bool App::createSettingsWindow() {
     if (settingsWindow_.window) return true;
     // Painted on the renderer's device; with none there is no window.
     if (!window_ || !renderer_.device()) return false;
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.style = CS_DBLCLKS;
-    windowClass.lpfnWndProc = &App::settingsWindowProc;
-    windowClass.hInstance = instance_;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    windowClass.lpszClassName = kSettingsWindowClass;
-    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    if (!registerWindowClass(instance_, kSettingsWindowClass, &App::settingsWindowProc, CS_DBLCLKS,
+                             static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)))) {
         appendDiagnostic("Settings window class could not be registered");
         return false;
     }
@@ -173,11 +161,7 @@ bool App::createSettingsWindow() {
         appendDiagnostic("Settings window could not be created");
         return false;
     }
-    SetWindowPos(window, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    const BOOL darkTitle = TRUE;
-    const DWORD darkTitleAttribute = 20;
-    DwmSetWindowAttribute(window, darkTitleAttribute, &darkTitle, sizeof(darkTitle));
+    darkCaptionlessFrame(window);
     // No input method, ever: its letters are shortcuts or keys for a key box,
     // and its only typed text, a spin box's number, is digits key by key. An
     // input method in its native mode would make them VK_PROCESSKEY.
@@ -189,32 +173,19 @@ bool App::createSettingsWindow() {
 }
 
 LRESULT CALLBACK App::settingsWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    App* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        app = static_cast<App*>(create->lpCreateParams);
-        app->settingsWindow_.window = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    }
-    return app ? app->handleSettingsWindowMessage(message, wParam, lParam)
-               : DefWindowProcW(window, message, wParam, lParam);
+    App* app = windowApp(window, message, lParam);
+    if (!app) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == WM_NCCREATE) app->settingsWindow_.window = window;
+    return app->handleSettingsWindowMessage(message, wParam, lParam);
 }
 
 LRESULT App::handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     const HWND window = settingsWindow_.window;
     const auto local = [&] { return POINT{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; };
     switch (message) {
-    case WM_NCCALCSIZE: {
-        // No title bar, as the player has none: Windows keeps its frame on
-        // the sides and the bottom, and its own strip is the caption.
-        RECT* client = wParam ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam)->rgrc[0]
-                              : reinterpret_cast<RECT*>(lParam);
-        const LONG top = client->top;
-        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
-        if (result != 0) return result;
-        client->top = top;
-        return 0;
-    }
+    case WM_NCCALCSIZE:
+        // No title bar, as the player has none: its own strip is the caption.
+        return captionlessClientArea(window, wParam, lParam);
     case WM_NCHITTEST: {
         const LRESULT standard = DefWindowProcW(window, message, wParam, lParam);
         if (standard != HTCLIENT) return standard;
@@ -226,34 +197,23 @@ LRESULT App::handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lPa
         info->ptMinTrackSize.y = std::lround(kSettingsWindowMinHeight * settingsWindow_.scale);
         return 0;
     }
-    case WM_DPICHANGED: {
+    case WM_DPICHANGED:
         // Its own monitor's: it may stand on another than the player.
-        settingsWindow_.scale = static_cast<float>(HIWORD(wParam)) / 96.0F;
-        if (const auto* suggested = reinterpret_cast<const RECT*>(lParam)) {
-            SetWindowPos(window, nullptr, suggested->left, suggested->top, suggested->right - suggested->left,
-                         suggested->bottom - suggested->top, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        followDpiChange(window, wParam, lParam, settingsWindow_.scale);
         return 0;
-    }
     // Sized by hand, it is painted at each new size at once rather than at
     // the player's next frame.
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) renderSettingsWindow();
         return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT paint{};
-        BeginPaint(window, &paint);
-        EndPaint(window, &paint);
+    case WM_PAINT:
+        validatePaint(window);
         renderSettingsWindow();
         return 0;
-    }
     case WM_ERASEBKGND:
         return 1;
     case WM_MOUSEMOVE:
-        if (!settingsWindow_.trackingLeave) {
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
-            settingsWindow_.trackingLeave = TrackMouseEvent(&track) != FALSE;
-        }
+        trackMouseLeave(window, settingsWindow_.trackingLeave);
         settingsWindowMove(local(), (wParam & MK_LBUTTON) != 0);
         return 0;
     case WM_MOUSELEAVE:
@@ -334,12 +294,12 @@ LRESULT App::handleSettingsWindowMessage(UINT message, WPARAM wParam, LPARAM lPa
             settingsDropDownKey(wParam);
             return 0;
         }
-        const bool alt = GetKeyState(VK_MENU) < 0;
+        const bool alt = keyHeld(VK_MENU);
         // A spin box's number being typed has every key before the
         // shortcuts but a function key of the settings or the list, as a
         // text box has (handleMessage).
         if (settingsWindow_.spinEdit && !keyChordLeavesTextBox(keyBindings_, keyChordOf(wParam, alt))) {
-            spinEditKey(wParam, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
+            spinEditKey(wParam, keyHeld(VK_CONTROL), keyHeld(VK_SHIFT));
             return 0;
         }
         if (capturingKey()) captureKey(wParam, lParam, alt);
@@ -1224,15 +1184,8 @@ bool App::createSettingsListWindow() {
     auto& settings = settingsWindow_;
     if (settings.listWindow) return true;
     if (!settings.window) return false;
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
     // The shadow under a Windows menu.
-    windowClass.style = CS_DROPSHADOW;
-    windowClass.lpfnWndProc = &App::settingsListWindowProc;
-    windowClass.hInstance = instance_;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.lpszClassName = kSettingsListClass;
-    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    if (!registerWindowClass(instance_, kSettingsListClass, &App::settingsListWindowProc, CS_DROPSHADOW, nullptr)) {
         appendDiagnostic("Settings list window class could not be registered");
         return false;
     }
@@ -1255,15 +1208,10 @@ bool App::createSettingsListWindow() {
 }
 
 LRESULT CALLBACK App::settingsListWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    App* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        app = static_cast<App*>(create->lpCreateParams);
-        app->settingsWindow_.listWindow = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    }
-    return app ? app->handleSettingsListMessage(message, wParam, lParam)
-               : DefWindowProcW(window, message, wParam, lParam);
+    App* app = windowApp(window, message, lParam);
+    if (!app) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == WM_NCCREATE) app->settingsWindow_.listWindow = window;
+    return app->handleSettingsListMessage(message, wParam, lParam);
 }
 
 LRESULT App::handleSettingsListMessage(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -1323,14 +1271,11 @@ LRESULT App::handleSettingsListMessage(UINT message, WPARAM wParam, LPARAM lPara
         // one that reaches the window another way.
         scrollSettingsWindow(GET_WHEEL_DELTA_WPARAM(wParam));
         return 0;
-    case WM_PAINT: {
+    case WM_PAINT:
         // Painted with the settings window, once a frame.
-        PAINTSTRUCT paint{};
-        BeginPaint(list, &paint);
-        EndPaint(list, &paint);
+        validatePaint(list);
         renderSettingsWindow();
         return 0;
-    }
     case WM_ERASEBKGND:
         return 1;
     case WM_NCDESTROY:

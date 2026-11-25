@@ -493,23 +493,17 @@ void App::handleContextCommand(unsigned command, int pane) {
 }
 
 void App::loadShaderDialog() {
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter =
-        L"PotPlayer pixel shader (*.txt)\0*.txt\0HLSL pixel shader (*.hlsl)\0*.hlsl\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&dialog)) {
-        const bool deferShader = deviceRecoveryPending_ || renderer_.deviceLost();
-        if (!deferShader && !renderer_.loadPixelShader(path)) {
-            MessageBoxA(window_, renderer_.error().c_str(), "Pixel shader error", MB_ICONERROR);
-        } else {
-            customShaderPath_ = path;
-            customShaderUnloaded_ = false;
-            scheduleAppSettingsSave();
-        }
+    const auto path = openFileDialog(
+        window_, {.filter = L"PotPlayer pixel shader (*.txt)\0*.txt\0HLSL pixel shader (*.hlsl)\0*.hlsl\0"
+                            L"All files\0*.*\0"});
+    if (!path) return;
+    const bool deferShader = deviceRecoveryPending_ || renderer_.deviceLost();
+    if (!deferShader && !renderer_.loadPixelShader(*path)) {
+        MessageBoxA(window_, renderer_.error().c_str(), "Pixel shader error", MB_ICONERROR);
+    } else {
+        customShaderPath_ = *path;
+        customShaderUnloaded_ = false;
+        scheduleAppSettingsSave();
     }
 }
 
@@ -562,13 +556,7 @@ void App::changeDecodeMode(DecodeMode mode) {
     const bool wasPlaying = playbackIntended();
     cancelSeekBarrier();
     clock_.pause();
-    for (auto& source : sources_) {
-        if (source) source->setAudioEnabled(false);
-    }
-    audio_.flush();
-    for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
-    sourceInitialAlignmentPending_.fill(false);
-    sourceProvisionalTargets_.fill(0.0);
+    retireAllSources();
     decodeMode_ = mode;
     for (std::size_t pane = 0; pane < paths_.size(); ++pane) {
         if (!paths_[pane].empty()) openSource(pane, paths_[pane], false);
@@ -1003,7 +991,7 @@ bool App::anyPaneLoaded() const {
 void App::pausePlaybackAtEnd() {
     clock_.pause();
     audio_.pause();
-    for (auto& source : sources_) if (source) source->setAudioEnabled(false);
+    silenceAllSources();
 }
 
 void App::finishMasterTimeline(bool sourceOpening, bool hasRepeatingSource) {
@@ -1243,34 +1231,28 @@ void App::toggleMasterLoop() {
 
 void App::openFileForPane(std::size_t pane) {
     if (pane >= sources_.size()) return;
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = L"Video files\0*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v;*.ts;*.wmv;*.flv\0All files\0*.*\0";
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&dialog)) {
-        const bool onlyVideo = singleLoadedPane() == static_cast<int>(pane);
-        const bool resume = playbackIntended();
-        const bool resumeInterruptedBarrier = seekBarrier_.active() && seekBarrier_.resume();
-        const double interruptedPosition = clock_.position();
-        if (seekBarrier_.active()) cancelSeekBarrier();
-        openSource(pane, path);
-        bool hasSelectedLoadedAudio = false;
-        for (std::size_t index = 0; index < sources_.size(); ++index) {
-            hasSelectedLoadedAudio = hasSelectedLoadedAudio ||
-                (paneLogicallyLoaded(index) && audioPaneEnabled(index));
-        }
-        if (!hasSelectedLoadedAudio) setAudioMask(1U << pane);
-        if (onlyVideo) {
-            restartReplacedOnlyVideo(resume);
-        } else if (resumeInterruptedBarrier) {
-            beginSynchronizedSeek(interruptedPosition, false, true);
-        }
-        updateControls();
-        updateTitle();
+    const auto path = openFileDialog(
+        window_, {.filter = L"Video files\0*.mp4;*.mkv;*.mov;*.avi;*.webm;*.m4v;*.ts;*.wmv;*.flv\0All files\0*.*\0"});
+    if (!path) return;
+    const bool onlyVideo = singleLoadedPane() == static_cast<int>(pane);
+    const bool resume = playbackIntended();
+    const bool resumeInterruptedBarrier = seekBarrier_.active() && seekBarrier_.resume();
+    const double interruptedPosition = clock_.position();
+    if (seekBarrier_.active()) cancelSeekBarrier();
+    openSource(pane, *path);
+    bool hasSelectedLoadedAudio = false;
+    for (std::size_t index = 0; index < sources_.size(); ++index) {
+        hasSelectedLoadedAudio = hasSelectedLoadedAudio ||
+            (paneLogicallyLoaded(index) && audioPaneEnabled(index));
     }
+    if (!hasSelectedLoadedAudio) setAudioMask(1U << pane);
+    if (onlyVideo) {
+        restartReplacedOnlyVideo(resume);
+    } else if (resumeInterruptedBarrier) {
+        beginSynchronizedSeek(interruptedPosition, false, true);
+    }
+    updateControls();
+    updateTitle();
 }
 
 }  // namespace quaddeck

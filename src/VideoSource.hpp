@@ -2,6 +2,7 @@
 
 #include "Core.hpp"
 #include "ReadAheadCache.hpp"
+#include "SubtitlePictures.hpp"
 #include "Subtitles.hpp"
 
 #include <atomic>
@@ -93,15 +94,17 @@ struct HardwareVideoFrame {
     std::shared_ptr<BgraBufferPool> bgraPool;
 };
 
-// One subtitle stream of the container, as the menu lists it. A stream of
-// pictures (PGS, VobSub) is listed too, so the menu can say why it is not
-// offered: only text is read.
+// One subtitle stream of the container, as the menu lists it: a stream of
+// text, one of pictures (PGS, VobSub, DVB), or one of neither that is
+// listed so the menu can say it is there.
 struct SubtitleTrackInfo {
     int streamIndex{-1};
     std::string language;
     std::string title;
     std::string codec;
     bool text{};
+    // Pictures the source decodes while this is the stream shown.
+    bool pictures{};
     bool isDefault{};
     bool forced{};
 };
@@ -252,6 +255,10 @@ public:
     // the stream's display matrix at open, then the shown frame's own.
     // videoWidth() and videoHeight() are the stored size whatever it is.
     int videoQuarterTurns() const { return videoQuarterTurns_.load(); }
+    // The Dolby Vision profile of an open video this player cannot decode
+    // (dolbyVisionNeedsItsOwnDecoding: no HDR10, HLG or SDR base layer), so
+    // that its colours are wrong; 0 for any other video.
+    int undecodedDolbyVision() const { return undecodedDolbyVision_.load(); }
     bool audioStreamKnown() const { return audioStreamAvailability_.load() != 0; }
     bool hasAudioStream() const { return audioStreamAvailability_.load() > 0; }
     AudioDecodeStatus audioDecodeStatus() const;
@@ -316,8 +323,17 @@ public:
     // False for a stream that is not read.
     bool subtitleStreamHeader(int streamIndex, std::string& header, bool& plain) const;
     // Whether that stream is read, without copying its header: what the
-    // sheet's subtitle labels ask of every stream each frame.
+    // sheet's subtitle labels ask of every stream each frame. A stream of
+    // pictures is one that is read, though only while it is the one shown.
     bool hasSubtitleReader(int streamIndex) const;
+    // Whether that stream is one of pictures that is read.
+    bool subtitleStreamIsPictures(int streamIndex) const;
+    // The chosen stream's picture at a source time, null for none or for a
+    // stream of text. Unlike text, only what was read while the stream was
+    // the one shown is there, and only the last pictures of that: a stream
+    // chosen while playing shows from its next picture on, and a seek
+    // starts over (with what Matroska's read-ahead of a seek brings back).
+    std::shared_ptr<const SubtitlePicture> subtitlePictureAt(double seconds) const;
     // The events of that stream read so far, from the `from`th on, in the
     // order the demuxer passed them; each once, however often a seek reads
     // it again. Returns how many there are in all.
@@ -343,6 +359,12 @@ private:
                        std::int64_t* startPts);
     void closeVideoInput();
     bool handleVideoSeek(double seconds, bool showKeyframePreview, bool keyframe, int direction);
+    // A read of the video's input failed with `result`. Waits and seeks the
+    // stream back to where the picture had got to, again and again while
+    // readRetryDelayMs gives another try, and returns true once it is there,
+    // or a seek asked for meanwhile is to take over. False when the pane
+    // cannot go on: closed, or the tries spent and the source's error set.
+    bool retryVideoRead(int result);
     std::uint64_t requestSeekInternal(double seconds, bool showKeyframePreview, bool keyframe, int direction);
     bool decodeVideoPacket(const AVPacket* packet);
     // Errors a decoder reported for packets it could not use, which its
@@ -401,6 +423,7 @@ private:
     void openSubtitleDecoders();
     void closeSubtitleDecoders();
     void decodeSubtitlePacket(const AVPacket* packet);
+    void decodeSubtitlePicture(SubtitleReader& reader, const AVPacket* packet);
     void retainSubtitle(SubtitleReader& reader, const AVSubtitle& subtitle, double start, double end);
     bool subtitleBudgetAllows(std::size_t bytes, bool entry);
     bool pushVideoFrame(AVFrame* decoded, bool endOfStreamFallback = false);
@@ -447,6 +470,7 @@ private:
     std::atomic<int> videoHeight_{0};
     std::atomic<float> videoDisplayAspect_{0.0F};
     std::atomic<int> videoQuarterTurns_{0};
+    std::atomic<int> undecodedDolbyVision_{0};
     // The stream's own display matrix, read at open, for a frame that
     // carries none. The video worker's.
     int streamQuarterTurns_{0};
@@ -476,6 +500,22 @@ private:
     VideoSeekRequest lastVideoSeek_;
     enum class StartProbe { None, Wanted, Running, Found };
     StartProbe videoStartProbe_{StartProbe::None};
+    // Video worker only, reset before open. A run of reads that failed: the
+    // tries it has had, none while 0, and when it began. The stamp of the
+    // last frame queued since the last seek, where the stream goes on from
+    // after one; while the gate is up, frames stamped at or before
+    // videoResumeAfterPts_, decoded again on the way there, are not shown
+    // twice, nor those that end at or before videoResumeAtPts_, where the
+    // owner's clock has got to meanwhile.
+    int videoReadRetries_{};
+    std::chrono::steady_clock::time_point videoReadFailedAt_{};
+    std::optional<std::int64_t> videoLastQueuedPts_;
+    std::int64_t videoResumeAfterPts_{};
+    std::int64_t videoResumeAtPts_{};
+    bool videoResumeGate_{};
+    // The source time the owner last asked a frame for, -1 before any: a
+    // stream that has been away goes on from there, not from where it stopped.
+    std::atomic<double> videoAskedSeconds_{-1.0};
     std::atomic<unsigned> queuedVideoFrames_{0};
     std::atomic<std::uint64_t> videoCapacityWaits_{0};
     std::atomic<std::uint64_t> audioChunksDecoded_{0};
@@ -485,12 +525,18 @@ private:
     std::atomic<double> audioDelay_{0.0};
     std::atomic<double> audioTempo_{1.0};
     std::atomic<int> shownSubtitleStream_{-1};
-    // The video worker's own: a decoder per text subtitle stream.
+    // The video worker's own: a decoder per text subtitle stream, and one
+    // per stream of pictures.
     struct SubtitleReader {
         int streamIndex{-1};
         AVCodecContext* codec{};
         AssHeader header;
         bool plain{};
+        // A stream of pictures: decoded only while it is the one shown,
+        // into subtitlePictures_, and none of the text's budget is its.
+        bool pictures{};
+        // A packet of it went by undecoded since its decoder last ran.
+        bool passedOver{};
         // What its events were, so that a seek back adds none twice; and the
         // read order handed to libass for a plain stream, whose decoder
         // counts from 0 again after every seek.
@@ -522,6 +568,13 @@ private:
         std::vector<SubtitleEvent> events;
     };
     std::vector<SubtitleStreamEvents> subtitleEvents_;
+    // The streams of pictures that are read, and the last pictures of the
+    // one of them that is shown (`subtitlePicturesStream_` says which they
+    // are of). Under the same lock.
+    static constexpr std::size_t kSubtitlePicturePacketBytes = 8 * 1024 * 1024;
+    std::vector<int> subtitlePictureStreams_;
+    SubtitlePictureTimeline subtitlePictures_;
+    int subtitlePicturesStream_{-1};
     std::atomic<int> colourMatrix_{static_cast<int>(SubtitleMatrix::None)};
     // While a seek reads ahead of the keyframe it is to land on, for the
     // subtitle lines that began before it: video packets are passed over

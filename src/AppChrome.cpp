@@ -864,7 +864,10 @@ void App::buildOverlayScene() {
         out = {};
         out.active = active[pane];
         // A closed pane's libass goes, with the fonts its video brought.
-        if (pane >= sources_.size() || !sources_[pane]) assPanes_[pane] = {};
+        if (pane >= sources_.size() || !sources_[pane]) {
+            assPanes_[pane] = {};
+            picturePanes_[pane] = {};
+        }
         if (!out.active) continue;
         out.cell = chromeCells_[pane];
         out.chrome = paneChrome_[pane];
@@ -898,12 +901,20 @@ void App::buildOverlayScene() {
             out.position01 = static_cast<float>(shown / sourceDuration);
             if (subtitlesShownFor(subtitleSettings_, pane) && isActive) {
                 const double at = shown - subtitleDelay_[pane];
-                // As their script draws them, where libass can.
                 bool drawn = false;
-                POINT origin{};
-                out.subtitleImage = renderAssSubtitles(pane, at, drawn, origin);
-                out.subtitleImageX = origin.x;
-                out.subtitleImageY = origin.y;
+                if (subtitleSelection_[pane].kind == SubtitleKind::Embedded &&
+                    sources_[pane]->subtitleStreamIsPictures(subtitleSelection_[pane].stream)) {
+                    // A stream of pictures: what it painted, where it
+                    // painted it; there is no line of text to fall back on.
+                    out.subtitleImage = renderPictureSubtitles(pane, at);
+                    drawn = true;
+                } else {
+                    // As their script draws them, where libass can.
+                    POINT origin{};
+                    out.subtitleImage = renderAssSubtitles(pane, at, drawn, origin);
+                    out.subtitleImageX = origin.x;
+                    out.subtitleImageY = origin.y;
+                }
                 if (!drawn) {
                     // Plain lines otherwise. A stream inside the file is
                     // asked of the source, which is still reading it;

@@ -22,8 +22,6 @@ using namespace app_internal;
 
 namespace {
 
-std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
-
 std::wstring refusalText(emby::DeleteRefusal refusal) {
     switch (refusal) {
     case emby::DeleteRefusal::Type: return L"only a movie, an episode or a video can be deleted";
@@ -82,7 +80,7 @@ void App::embyAskDelete(const emby::Item& item) {
         showNotice(L"Emby is still busy with the last deletion");
         return;
     }
-    const auto title = wide(emby::displayTitle(item));
+    const auto title = utf8ToWideText(emby::displayTitle(item));
     if (!emby::deletableType(item)) {
         showNotice(L"Not deleted: " + refusalText(emby::DeleteRefusal::Type));
         return;
@@ -150,7 +148,7 @@ void App::embyDeleteJudge(std::uint64_t serial, const std::vector<emby::Item>& g
     const auto& fresh = embyPendingDelete_->fresh;
     if (const auto refusal = emby::deleteRefusal(fresh, guards); refusal != emby::DeleteRefusal::None) {
         appendDiagnostic("Emby: item " + fresh.id + " was not deleted: " + wideToUtf8Text(refusalText(refusal)));
-        showNotice(L"Not deleted: " + wide(emby::displayTitle(fresh)) + L" -- " + refusalText(refusal));
+        showNotice(L"Not deleted: " + utf8ToWideText(emby::displayTitle(fresh)) + L" -- " + refusalText(refusal));
         embyPendingDelete_.reset();
         return;
     }
@@ -180,7 +178,7 @@ void App::embyDeleteInfoArrived(std::uint64_t serial, const EmbyClient::Response
     // over it would hand the player back while the first is still up.
     if (!openEmbyDeleteWindow()) {
         appendDiagnostic("Emby: item " + pending.fresh.id + " was not deleted: the window to confirm it could not open");
-        showNotice(L"Not deleted: " + wide(emby::displayTitle(pending.fresh)) +
+        showNotice(L"Not deleted: " + utf8ToWideText(emby::displayTitle(pending.fresh)) +
                    L" -- close the other QuadDeck dialog first");
         embyPendingDelete_.reset();
     }
@@ -236,14 +234,14 @@ void App::embyDeleteArrived(std::uint64_t serial, const EmbyClient::Response& re
     if (!embyDeleteCurrent(serial)) return;
     const auto item = embyPendingDelete_->fresh;
     embyPendingDelete_.reset();
-    const auto title = wide(emby::displayTitle(item));
+    const auto title = utf8ToWideText(emby::displayTitle(item));
     if (!response.ok) {
         if (response.status == 401) {
             embySessionExpired();
             return;
         }
         appendDiagnostic("Emby: could not delete item " + item.id + ": " + response.error);
-        showNotice(L"Emby did not delete " + title + L" (" + wide(response.error) + L")");
+        showNotice(L"Emby did not delete " + title + L" (" + utf8ToWideText(response.error) + L")");
         return;
     }
     appendDiagnostic("Emby: deleted item " + item.id);
@@ -261,7 +259,8 @@ void App::embyDeleteFailed(std::uint64_t serial, const std::wstring& reason, con
     }
     const std::string detail = response ? ": " + response->error : std::string{};
     appendDiagnostic("Emby: item " + itemId + " was not deleted: " + wideToUtf8Text(reason) + detail);
-    showNotice(L"Not deleted: " + reason + (response ? L" (" + wide(response->error) + L")" : std::wstring{}));
+    showNotice(L"Not deleted: " + reason +
+               (response ? L" (" + utf8ToWideText(response->error) + L")" : std::wstring{}));
 }
 
 // The server no longer has it: every copy QuadDeck holds goes -- the list
@@ -303,14 +302,14 @@ DeleteDialogContent App::embyDeleteDialogContent() const {
     if (!embyDeleteAsking()) return content;
     const auto& pending = *embyPendingDelete_;
     content.caption = L"Delete from Emby server";
-    content.title = wide(emby::displayTitle(pending.fresh));
+    content.title = utf8ToWideText(emby::displayTitle(pending.fresh));
     content.type = typeName(pending.fresh);
     if (const int pane = embyPlayingPane(pending.fresh.id); pane >= 0) {
         content.playing =
             L"Playing in V" + std::to_wstring(positionForPane(static_cast<std::size_t>(pane)) + 1) + L", which closes";
     }
     content.files.reserve(pending.paths.size());
-    for (const auto& path : pending.paths) content.files.push_back(wide(path));
+    for (const auto& path : pending.paths) content.files.push_back(utf8ToWideText(path));
     const std::wstring what = pending.paths.empty()       ? L"Emby names no file for it: only its entry goes."
                               : pending.paths.size() == 1 ? L"Emby deletes this file from its disk."
                                                           : L"Emby deletes these " + std::to_wstring(pending.paths.size()) +

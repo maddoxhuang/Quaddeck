@@ -1160,6 +1160,37 @@ inline std::string subtitleLanguageTag(std::string_view code, std::wstring_view 
     return subtitle_detail::languageFromHint(hint);
 }
 
+// The Windows code page a language's files are in when they are not
+// Unicode, 0 for a language with none of its own here. Chinese whose script
+// is not said has none: it may be either.
+inline unsigned subtitleLegacyCodePage(std::string_view language) {
+    if (language == "zh-Hant") return 950;
+    if (language == "zh-Hans") return 936;
+    if (language == "ja") return 932;
+    if (language == "ko") return 949;
+    return 0;
+}
+
+// The code pages a subtitle file that is not Unicode is tried as, in order,
+// each taken only if it reads every byte: what the file's name says
+// (`hinted`, 0 for nothing), the system's own page when that is an East
+// Asian one, then those of the languages wanted. Without the last, a GBK
+// file with no such name on a Windows set to a Western language was read as
+// accented Latin letters. These pages refuse most text that is in none of
+// them -- an accented letter before a space or a line's end is no character
+// of theirs -- and what they all refuse is read as the system's page.
+inline std::vector<unsigned> subtitleCodePages(unsigned hinted, unsigned system,
+                                               const std::vector<std::string>& wanted) {
+    std::vector<unsigned> pages;
+    const auto add = [&](unsigned page) {
+        if (page != 0 && std::find(pages.begin(), pages.end(), page) == pages.end()) pages.push_back(page);
+    };
+    add(hinted);
+    if (system == 936 || system == 950 || system == 932 || system == 949) add(system);
+    for (const auto& language : wanted) add(subtitleLegacyCodePage(language));
+    return pages;
+}
+
 // The tags to look for, most wanted first. An explicit choice comes before
 // what Windows lists; of Windows' own list the languages other than English
 // come first -- someone who added another language to an English Windows

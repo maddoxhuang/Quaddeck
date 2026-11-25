@@ -2,6 +2,186 @@
 
 Public releases start at 1.0.0. See [README.md](README.md) for current usage and [ARCHITECTURE.md](ARCHITECTURE.md) for implementation and file-format details.
 
+## 1.7.0 (2026-11-26)
+
+This release shows HDR10 and HLG video as HDR on an HDR display and
+tone-maps it on an SDR one, shows the picture subtitles of Blu-ray and DVD
+rips, plays interlaced video field by field, and resumes after a pause
+without decoding every video again. Emby videos open again on Emby
+4.11.0.18, and an HTTPS server's certificate is now checked for the video
+stream too. Settings remain `QCONFIG 26`, styles `QSTYLE 4` and video sets
+`QSETS 1`, so 1.6.0 and 1.7.0 read each other's files.
+
+### HDR video
+
+- On a display with Windows HDR turned on, switch the output to 10-bit PQ
+  while an HDR10 or HLG video is on screen, on any graphics card and
+  without RTX Video HDR. HDR10 reaches the display unchanged; SDR videos
+  beside it are converted at the SDR white level Windows sets for that
+  display. The output returns to SDR about 2 seconds after the last HDR
+  picture leaves, so playing the next episode does not switch back and
+  forth.
+- On an SDR display, with Windows HDR off or with the bitblt renderer,
+  tone-map HDR10 and HLG to SDR. Brightness follows the BT.2390 curve from
+  the video's peak down to SDR white (203 nits): shadows and midtones keep
+  their level and highlights roll off instead of clipping. Colours are
+  converted from BT.2020 to BT.709. The peak is the video's MaxCLL, else its
+  mastering display's, else 1000 nits. Tone mapping comes before the
+  shaders, Vibrance+ and the colour controls, so they work on an ordinary
+  SDR picture.
+- Treat HLG (ARIB STD-B67) as HDR instead of a grey SDR picture. On an HDR
+  display it is shown as on a 1000-nit display (BT.2100, system gamma 1.2);
+  on an SDR display it is tone-mapped with a 1000-nit peak. RTX Video HDR no
+  longer applies to HLG video.
+- Decode software-decoded HDR with the BT.2020 matrix (it used BT.709, which
+  shifted hues) and keep its 10 bits: 10-bit and deeper HDR in 4:2:0, 4:2:2
+  or 4:4:4 now reaches the graphics card's video processor as P010, like
+  hardware decoding, instead of banding in dark gradients. 4:2:2 and 4:4:4
+  chroma is averaged to 4:2:0. The WARP renderer has no video processor and
+  stays 8-bit.
+- Hand the video's HDR10 mastering display, MaxCLL and MaxFALL to Windows
+  while the output is PQ (the brightest video's when several are open), and
+  withdraw them after the last HDR picture. Whether Windows passes them on to
+  the display for a window cannot be checked from QuadDeck.
+- Decode full-range PQ and HLG video and top-left chroma (common on UHD
+  Blu-ray) correctly with hardware decoding, and recognise HDR that is
+  marked only in the MKV or MP4 container.
+- Find an HDR display attached to another graphics card than the one
+  rendering, as on a laptop whose screen is on the integrated graphics.
+- Make Grayscale and Invert work on linear brightness under PQ output.
+  Invert used to turn black into 10,000-nit white; it now inverts within
+  the display's SDR white. Sharpen and custom shaders still work on PQ
+  values.
+- Warn `Dolby Vision profile 5 is not supported: the colours will be wrong`
+  when a Dolby Vision video has no HDR10, HLG or SDR base layer. Its colours
+  are still wrong. Profiles 7 and 8 play their base layer as before.
+- Under PQ output the colour controls and output levels do not apply, as with
+  RTX Video HDR before. The status line on `F5 → Video` says
+  `Output: 10-bit PQ (HDR).` and where HDR video goes: `HDR video is shown
+  as HDR.`, `HDR video is tone-mapped to SDR.`, or, on a card whose video
+  processor cannot convert it, `HDR video is shown as SDR with approximate
+  colours: this card does not convert it.`
+- Not included: decoding Dolby Vision profile 5, HDR10+ dynamic metadata,
+  tone mapping to the display's own peak under PQ output, and an exact
+  conversion of BT.2020 SDR video.
+
+### Picture
+
+- Play interlaced video (TV recordings, DVDs) field by field: each field is
+  shown for half a frame, so 50i moves 50 times a second instead of 25 and
+  pans and scrolling text no longer judder. An interlaced frame now costs
+  the graphics card four conversions instead of one, in its own pane only.
+  Progressive video, and deinterlacing set to Off, are unchanged.
+- Fix SDR video looking flat and grey on a Windows HDR display with RTX
+  Super Resolution and 10-bit output: NVIDIA's driver wrote that output as
+  PQ. A pane that Super Resolution enlarges now uses 8-bit output, and
+  `QuadDeck.log` says `RTX Super Resolution on the 10-bit SDR output` once;
+  other panes stay 10-bit.
+- Stand an upright phone video up in the graphics card's video processor
+  where it can rotate, so NVIDIA RTX Video's status indicator in the corner
+  is upright too. Other pictures are still turned as they are drawn, with
+  the same result. After the video processor, a custom shader sees the
+  upright picture. The log says `Video processor: turns a picture itself`,
+  or `does not turn a picture; the pane's draw does`.
+
+### Subtitles
+
+- Show the picture subtitles inside a video: Blu-ray's PGS, DVD's VobSub
+  and DVB, in local files and Emby videos. Choose them from the subtitle
+  menu or with `Alt+L`. They are drawn where the source placed them and
+  scale with the window and zoom.
+- Automatic choice is unchanged: text subtitles (embedded, files beside the
+  video and Emby's) are chosen by language first, and picture subtitles only
+  when no text subtitle fits. An Emby account's own default subtitle is
+  followed when it is a picture subtitle.
+- Picture subtitles ignore the subtitle font, size, position and box, and do
+  not move up for the bar. They are decoded only while chosen, so one chosen
+  during playback appears with its next line. After a seek, an MKV shows the
+  line already under way; other containers, such as m2ts, show the next.
+- When the subtitle canvas has the video's shape (a 1080p canvas over 1080p
+  or 4K video, a DVD), it follows the picture. Otherwise, as with a 16:9
+  canvas over a film stored as 1920x800, it is scaled to the picture's
+  height and centred, as mpv does.
+- Not shown: separate `.sup` and `.idx` files, and picture subtitles stored
+  beside the file on an Emby server, which stay greyed as
+  `(pictures, not shown)`. The `Sub` badge still counts text subtitles only.
+- Read GBK, Big5, Shift-JIS and Korean subtitle files whose names carry no
+  language on a Windows set to a Western language. Without a suffix such as
+  `.chs` or `.cht`, the code pages of the preferred subtitle languages are
+  tried in turn and the first that reads the whole file is used, then the
+  system's. Western and Cyrillic subtitles are not misread. On a Chinese,
+  Japanese or Korean Windows the system code page is still tried first.
+
+### Playback
+
+- Continue from the frame on screen when Play follows Pause, instead of
+  seeking every video again, which with four 4K videos took a second or
+  more. Only the videos you hear pick their sound up again. A full seek is
+  still made when a video was paused on its own, has ended, has not started,
+  is still opening or failed, when a photo is open, or when the position
+  was changed while paused.
+- Retry a network or share read that fails, as when a server restarts, a
+  connection drops, Wi-Fi switches or a NAS goes offline: after 0.25 s,
+  doubling to at most 4 s, for up to 30 s. Playback continues from the frame
+  it stopped at, or from the current position if the other videos have moved
+  on, and the sound from the sample it stopped at. Each retry is logged.
+  Errors that a retry cannot fix, such as a damaged file or HTTP 401, 403 or
+  404, are reported at once. A cached file on a NAS share whose handle was
+  lost still does not recover.
+- Keep the display on and the computer awake while a video plays. When the
+  window is minimised only sleep is prevented. Paused, ended, closed, or with
+  only photos open, Windows behaves as it normally does.
+- Write the settings file on a background thread, so a slow disk no longer
+  freezes the picture for seconds after a setting changes, most noticeably
+  when switching Vibrance+. Several changes in a row write only the latest,
+  a failed write is tried once more after 1.2 s, and closing still writes
+  the final settings before QuadDeck exits.
+
+### Audio
+
+- Take the output latency off at the playback speed: at 2x only half of it
+  was taken off before.
+- On an output where the effects cannot run (more than eight channels, or a
+  device that refuses them), apply volume above 100% to the output itself
+  instead of ignoring it. There is no limiter of QuadDeck's after it, so
+  very loud passages may distort. The Audio tab and the log say that the
+  effects do not run on that output.
+- Free the queued sound when the audio engine stops on an error, such as an
+  unplugged device.
+
+### Emby
+
+- Fix `Emby: HTTP 500` for every video on Emby 4.11.0.18. The `PlaybackInfo`
+  request now says what the player is: it plays any container and codec
+  directly, needs nothing transcoded, and reads every subtitle format
+  itself, so the server still names its default subtitle.
+- Check the server's certificate for HTTPS video, photo and audio streams,
+  including the connections made by seeking and reconnecting; browsing and
+  signing in already did. A self-signed, expired or untrusted certificate
+  now stops a video from opening, and a revocation list that cannot be
+  fetched may too. `http://` servers are unaffected.
+- Drop a deletion whose confirmation would open while the graphics device is
+  lost; it used to leave the player disabled with no window to answer.
+
+### Video sets and dialogs
+
+- Reuse the check of the video sets list made within the last minute when
+  every video was found. A missing file, an unknown item or a server that
+  did not answer is checked again each time. A file moved within that
+  minute shows as missing once the minute has passed.
+- Remember which sets were tried by the set, not by its place, so moving or
+  deleting sets no longer skips an untried set or tries a failed one again.
+- Cut a set name longer than 120 characters without leaving half an emoji,
+  which made the list impossible to save from then on.
+- Accept paths longer than 260 characters in the dialogs that open videos,
+  subtitles, shaders and presets, save presets, and import and export video
+  sets. Past 260 characters these dialogs closed as if cancelled.
+
+### Settings files
+
+- No format changed: settings remain `QCONFIG 26`, styles `QSTYLE 4` and
+  video sets `QSETS 1`.
+
 ## 1.6.0 (2026-11-17)
 
 This release steps through the videos one at a time with `Tab`, gives a

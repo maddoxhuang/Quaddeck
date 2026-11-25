@@ -248,4 +248,34 @@ inline int chooseAudioTrack(const std::vector<AudioTrackCandidate>& tracks, std:
     return best;
 }
 
+// Where the master volume goes. Up to 100% it is the mastering voice's
+// alone. Past it the rest is a gain in the effects, ahead of their limiter
+// -- or, on an output the effects cannot run on, the voice's as well: louder
+// with nothing of QuadDeck's to hold its peaks, rather than silently no
+// louder than 100%.
+struct MasterVolumeParts {
+    float voice{1.0F};
+    float boost{1.0F};
+};
+
+inline MasterVolumeParts masterVolumeParts(float volume, bool muted, bool effectsRun) {
+    const float level = std::isfinite(volume) ? std::clamp(volume, 0.0F, 2.0F) : 1.0F;
+    return {muted ? 0.0F : effectsRun ? std::min(level, 1.0F) : level, effectsRun ? std::max(level, 1.0F) : 1.0F};
+}
+
+// The ratio a voice plays at for a pane at `rate` whose queued sound its
+// decoder already stretched to `tempo`: the voice makes up the difference,
+// within what XAudio2 takes.
+inline double audioVoiceRatio(double rate, double tempo) {
+    return std::clamp(rate / std::max(tempo, 0.25), 0.25, 4.0);
+}
+
+// Seconds of a video that pass in `outputSeconds` of what the speakers
+// emit: the output's latency, taken off a position in the video's own time,
+// is this long there. A frame stretched to `tempo` is worth that much of
+// the video's time, and the voice plays `voiceRatio` of them in one's time.
+inline double outputSecondsInSourceTime(double outputSeconds, double voiceRatio, double tempo) {
+    return outputSeconds * voiceRatio * (tempo > 0.0 ? tempo : 1.0);
+}
+
 }  // namespace quaddeck

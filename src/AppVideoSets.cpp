@@ -29,10 +29,11 @@ using namespace app_internal;
 
 namespace {
 
-std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
-std::string narrow(const std::wstring& text) { return wideToUtf8Text(text); }
-
 constexpr const wchar_t* kVideoSetsFilter = L"QuadDeck video sets (*.qdeck)\0*.qdeck\0All files\0*.*\0";
+
+// How long a check that found every video there stands before the list,
+// opened again, asks again.
+constexpr std::chrono::seconds kVideoSetCheckKept{60};
 
 std::wstring placeName(std::size_t position) { return L"V" + std::to_wstring(position + 1); }
 
@@ -48,16 +49,16 @@ const wchar_t* videoSetOrderName(PlayOrder order) {
 }
 
 emby::RefindKey refindKey(const VideoSetVideo& video) {
-    return {narrow(video.name), narrow(video.seriesName), narrow(video.type), narrow(video.serverPath),
-            video.season, video.episode, video.year};
+    return {wideToUtf8Text(video.name), wideToUtf8Text(video.seriesName), wideToUtf8Text(video.type),
+            wideToUtf8Text(video.serverPath), video.season, video.episode, video.year};
 }
 
 // What the set keeps of an Emby item, as the item's reply says it.
 void rememberItem(VideoSetVideo& video, const emby::RefindKey& item) {
-    video.name = wide(item.name);
-    video.seriesName = wide(item.seriesName);
-    video.type = wide(item.type);
-    video.serverPath = wide(item.path);
+    video.name = utf8ToWideText(item.name);
+    video.seriesName = utf8ToWideText(item.seriesName);
+    video.type = utf8ToWideText(item.type);
+    video.serverPath = utf8ToWideText(item.path);
     video.season = item.season;
     video.episode = item.episode;
     video.year = item.year;
@@ -148,7 +149,7 @@ std::optional<VideoSet> App::captureVideoSet() const {
         if (embyPanes_[pane]) {
             const auto& state = *embyPanes_[pane];
             video.title = state.title;
-            if (state.serverId == session.serverId) video.serverName = wide(session.serverName);
+            if (state.serverId == session.serverId) video.serverName = utf8ToWideText(session.serverName);
             rememberItem(video, state.refind);
         } else {
             video.title = std::filesystem::path(paths_[pane]).stem().wstring();
@@ -249,37 +250,24 @@ std::wstring App::videoSetProblem(const VideoSetVideo& video, bool* alert) const
 
 std::vector<PanelRow> App::buildVideoSetRows() const {
     std::vector<PanelRow> rows;
-    const auto note = [&](const std::wstring& text, bool alert = false) {
-        PanelRow row;
-        row.kind = PanelRowKind::Note;
-        row.wrapNote = true;
-        row.alert = alert;
-        row.label = text;
-        rows.push_back(std::move(row));
-    };
-    PanelRow header;
-    header.kind = PanelRowKind::Header;
-    header.label = L"Video sets";
+    PanelRowAppender add(rows);
+    PanelRow& header = add.header(L"Video sets");
     const auto count = videoSets_.sets.size();
     if (count > 0) header.value = std::to_wstring(count) + (count == 1 ? L" set" : L" sets");
     header.pinned = true;
-    rows.push_back(std::move(header));
     // Each button acts at once; the last opens what follows a set's end.
-    PanelRow toolbar;
-    toolbar.kind = PanelRowKind::Buttons;
-    toolbar.id = SettingId::VideoSetsToolbar;
-    toolbar.options = {L"Add what plays", L"Import\x2026", L"Export\x2026",
-                       std::wstring(videoSetOrderName(videoSets_.order)) + L" \x25BE"};
+    PanelRow& toolbar = add.buttons(SettingId::VideoSetsToolbar,
+                                    {L"Add what plays", L"Import\x2026", L"Export\x2026",
+                                     std::wstring(videoSetOrderName(videoSets_.order)) + L" \x25BE"});
     toolbar.buttonMinWidth = 80.0F;
     toolbar.pinned = true;
-    rows.push_back(std::move(toolbar));
     if (videoSetsReadOnly_) {
-        note(L"The saved video sets could not be read, so nothing here is saved over them.", true);
+        add.note(L"The saved video sets could not be read, so nothing here is saved over them.").alert = true;
     }
     if (videoSets_.sets.empty()) {
-        note(L"No video sets yet. Open the videos to play together, arranged as they should be, and add them with "
-             L"Add what plays (" + shortcut(KeyAction::AddVideoSet) + L"). While a set plays, Previous and Next "
-             L"go from set to set.");
+        add.note(L"No video sets yet. Open the videos to play together, arranged as they should be, and add them with "
+                 L"Add what plays (" + shortcut(KeyAction::AddVideoSet) + L"). While a set plays, Previous and Next "
+                 L"go from set to set.");
         return rows;
     }
     const int playing = videoSetPlaying();
@@ -309,8 +297,8 @@ std::vector<PanelRow> App::buildVideoSetRows() const {
             const auto& video = set.videos[position];
             bool alert = false;
             const std::wstring problem = videoSetProblem(video, &alert);
-            note(placeName(position) + L"  " + videoTitle(video) + (problem.empty() ? L"" : L"\n" + problem),
-                 alert);
+            add.note(placeName(position) + L"  " + videoTitle(video) + (problem.empty() ? L"" : L"\n" + problem))
+                .alert = alert;
         }
     }
     return rows;
@@ -396,6 +384,12 @@ void App::moveVideoSet(int index, int step) {
     std::swap(videoSets_.sets[static_cast<std::size_t>(index)], videoSets_.sets[static_cast<std::size_t>(other)]);
     if (videoSetIndex_ == index) videoSetIndex_ = other;
     else if (videoSetIndex_ == other) videoSetIndex_ = index;
+    // What the list's going has tried goes with its set, or a skip would
+    // pass over one not yet tried and come back to one that was.
+    videoSetTried_.resize(static_cast<std::size_t>(count), false);
+    const bool tried = videoSetTried_[static_cast<std::size_t>(index)];
+    videoSetTried_[static_cast<std::size_t>(index)] = videoSetTried_[static_cast<std::size_t>(other)];
+    videoSetTried_[static_cast<std::size_t>(other)] = tried;
     saveVideoSets();
 }
 
@@ -404,6 +398,8 @@ void App::deleteVideoSet(int index) {
     cancelVideoSetRename();
     const std::wstring name = videoSets_.sets[static_cast<std::size_t>(index)].name;
     videoSets_.sets.erase(videoSets_.sets.begin() + index);
+    // The sets after it move up, and what was tried of them with them.
+    if (static_cast<std::size_t>(index) < videoSetTried_.size()) videoSetTried_.erase(videoSetTried_.begin() + index);
     // Its videos play on, as videos of no set.
     if (videoSetIndex_ == index) videoSetIndex_ = -1;
     else if (videoSetIndex_ > index) --videoSetIndex_;
@@ -476,7 +472,7 @@ bool App::openVideoSet(int index, std::vector<VideoSetSkip> skipped) {
             }
         }
         if (why.empty()) break;
-        appendDiagnostic("Video sets: skipping set " + std::to_string(index + 1) + ": " + narrow(why));
+        appendDiagnostic("Video sets: skipping set " + std::to_string(index + 1) + ": " + wideToUtf8Text(why));
         skipped.push_back({index, std::move(why)});
         index = videoSetSkipTo(videoSets_.order, index, count, videoSetDirection_, videoSetTried_,
                                static_cast<unsigned>(shuffleRandom_()));
@@ -625,7 +621,7 @@ void App::checkVideoSetSources() {
         if (!sources_[pane] || !videoSetPane(pane)) continue;
         const std::string error = sources_[pane]->error();
         if (error.empty()) continue;
-        videoSetPaneFailed(pane, wide(error));
+        videoSetPaneFailed(pane, utf8ToWideText(error));
         return;
     }
 }
@@ -640,7 +636,7 @@ void App::skipVideoSet() {
     for (std::size_t pane = 0; pane < kMaxPanes; ++pane) {
         if (!paths_[pane].empty() && paths_[pane] != videoSetPanePaths_[pane]) return;
     }
-    appendDiagnostic("Video sets: skipping set " + std::to_string(index + 1) + ": " + narrow(why));
+    appendDiagnostic("Video sets: skipping set " + std::to_string(index + 1) + ": " + wideToUtf8Text(why));
     videoSetTried_.resize(static_cast<std::size_t>(count), false);
     videoSetTried_[static_cast<std::size_t>(index)] = true;
     const int next = videoSetSkipTo(videoSets_.order, index, count, videoSetDirection_, videoSetTried_,
@@ -728,14 +724,9 @@ void App::importVideoSets(const std::wstring& path) {
 }
 
 void App::importVideoSetsDialog() {
-    wchar_t path[MAX_PATH]{};
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = kVideoSetsFilter;
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    if (GetOpenFileNameW(&dialog)) importVideoSets(path);
+    if (const auto path = openFileDialog(window_, {.filter = kVideoSetsFilter})) {
+        importVideoSets(*path);
+    }
 }
 
 void App::exportVideoSetsDialog() {
@@ -743,31 +734,23 @@ void App::exportVideoSetsDialog() {
         showNotice(L"There are no video sets to export");
         return;
     }
-    wchar_t path[MAX_PATH] = L"Video sets.qdeck";
-    OPENFILENAMEW dialog{sizeof(dialog)};
-    dialog.hwndOwner = window_;
-    dialog.lpstrFilter = kVideoSetsFilter;
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrDefExt = L"qdeck";
-    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    if (!GetSaveFileNameW(&dialog)) return;
+    const auto path =
+        saveFileDialog(window_, {.filter = kVideoSetsFilter, .extension = L"qdeck", .name = L"Video sets.qdeck"});
+    if (!path) return;
     const VideoSetList& list = videoSets_;
-    if (!writeUtf8FileAtomically(std::filesystem::path(path),
+    if (!writeUtf8FileAtomically(std::filesystem::path(*path),
                                  [&](std::wostream& output) { return writeVideoSets(output, list); })) {
         MessageBoxW(window_, L"Could not export the video sets.", L"Video sets", MB_ICONERROR);
         return;
     }
     showNotice(L"Exported " + std::to_wstring(list.sets.size()) +
                (list.sets.size() == 1 ? L" video set to " : L" video sets to ") +
-               std::filesystem::path(path).filename().wstring());
+               std::filesystem::path(*path).filename().wstring());
 }
 
 // --- what is there -----------------------------------------------------------
 
 void App::checkVideoSets() {
-    const std::uint64_t serial = ++videoSetCheckSerial_;
-    videoSetChecks_.clear();
     const auto session = emby_.session();
     std::vector<std::wstring> files;
     std::vector<std::wstring> items;
@@ -778,16 +761,39 @@ void App::checkVideoSets() {
             if (!seen.insert(video.path).second) continue;
             if (!emby::isLocator(video.path)) {
                 files.push_back(video.path);
-                videoSetChecks_[video.path] = {};
                 continue;
             }
             // Signed out or on another server, the session says so already.
             if (!sessionProblem(video, session).empty()) continue;
-            videoSetChecks_[video.path] = {};
             items.push_back(video.path);
             ids.push_back(emby::parseLocator(video.path)->itemId);
         }
     }
+    // The list is opened far more often than a file or an item goes: what
+    // the last check found of the same videos, asked as the same account,
+    // stands for a while, as does a check still out. One that found
+    // something wrong, or could not ask, is made again -- that is what the
+    // viewer opens the list again to see mended.
+    std::vector<std::wstring> asked = files;
+    asked.insert(asked.end(), items.begin(), items.end());
+    const auto now = std::chrono::steady_clock::now();
+    const bool standing = videoSetCheckSerial_ != 0 && asked == videoSetCheckAsked_ &&
+                          embyAccountSerial_ == videoSetCheckAccount_ && now - videoSetCheckedAt_ < kVideoSetCheckKept &&
+                          std::all_of(asked.begin(), asked.end(), [this](const std::wstring& path) {
+                              const auto found = videoSetChecks_.find(path);
+                              return found != videoSetChecks_.end() &&
+                                     (found->second.state == VideoSetState::Checking ||
+                                      found->second.state == VideoSetState::Searching ||
+                                      found->second.state == VideoSetState::Fine ||
+                                      found->second.state == VideoSetState::Found);
+                          });
+    if (standing) return;
+    const std::uint64_t serial = ++videoSetCheckSerial_;
+    videoSetChecks_.clear();
+    for (const auto& path : asked) videoSetChecks_[path] = {};
+    videoSetCheckAsked_ = std::move(asked);
+    videoSetCheckAccount_ = embyAccountSerial_;
+    videoSetCheckedAt_ = now;
     if (!files.empty()) {
         // A file on a share that has gone to sleep can take a while to
         // answer, so not on the window thread.
@@ -820,7 +826,8 @@ void App::videoSetItemsArrived(std::uint64_t serial, std::uint64_t account, cons
     if (serial != videoSetCheckSerial_ || account != embyAccountSerial_) return;
     const auto list = response.ok ? emby::parseItems(response.body) : std::nullopt;
     if (!list) {
-        const std::wstring detail = response.ok ? std::wstring(L"a reply QuadDeck cannot read") : wide(response.error);
+        const std::wstring detail =
+            response.ok ? std::wstring(L"a reply QuadDeck cannot read") : utf8ToWideText(response.error);
         for (const auto& path : paths) videoSetChecks_[path] = {VideoSetState::Unreachable, detail};
         if (response.status == 401) embySessionExpired();
         return;
@@ -877,8 +884,8 @@ void App::videoSetRefind(const std::wstring& path,
                    done = std::move(done)](EmbyClient::Response& response) {
         if (account != embyAccountSerial_) return;
         if (!response.ok) {
-            videoSetChecks_[path] = {VideoSetState::Unreachable, wide(response.error)};
-            if (done) done({}, L"Emby did not answer: " + wide(response.error));
+            videoSetChecks_[path] = {VideoSetState::Unreachable, utf8ToWideText(response.error)};
+            if (done) done({}, L"Emby did not answer: " + utf8ToWideText(response.error));
             if (response.status == 401) embySessionExpired();
             return;
         }

@@ -49,8 +49,6 @@ constexpr std::size_t kSubtitleQuestionsAtOnce = 2;
 constexpr std::size_t kEmbyShapeBatch = 48;
 constexpr const char* kEmbyListFields = emby::kBrowserItemFields;
 
-std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
-
 std::wstring searchGroupTitle(emby::SearchGroup group) {
     switch (group) {
     case emby::SearchGroup::Movies: return L"Movies";
@@ -83,9 +81,9 @@ std::wstring itemLabel(const emby::Item& entry) {
             append(entry.seriesName);
             append(entry.name);
         }
-        return wide(label.empty() ? "Episode" : label);
+        return utf8ToWideText(label.empty() ? "Episode" : label);
     }
-    return wide(emby::displayTitle(entry));
+    return utf8ToWideText(emby::displayTitle(entry));
 }
 
 std::wstring runtimeLabel(const emby::Item& entry) {
@@ -107,7 +105,7 @@ std::wstring entryCount(const emby::Item& entry) {
 // Watched state and length side by side: "▶ 40%   23:40", never one
 // instead of the other.
 std::wstring itemValue(const emby::Item& entry) {
-    if (entry.type == "CollectionFolder" || entry.type == "UserView") return wide(entry.collectionType);
+    if (entry.type == "CollectionFolder" || entry.type == "UserView") return utf8ToWideText(entry.collectionType);
     if (emby::isPlaylist(entry)) {
         // How much there is to play: "403 items   22:08:30".
         const std::wstring count = entryCount(entry);
@@ -127,14 +125,14 @@ std::wstring itemValue(const emby::Item& entry) {
             value += std::to_wstring(entry.unplayedCount) + L" new";
         } else if (entry.played) {
             if (!value.empty()) value += L"   ";
-            value += wide(emby::progressLabel(entry));
+            value += utf8ToWideText(emby::progressLabel(entry));
         }
         if (value.empty()) value = entry.type == "Season" ? L"Season" : L"Series";
         return value;
     }
     if (emby::isPhoto(entry)) return L"photo";
     if (emby::isPlayableVideo(entry)) {
-        const std::wstring progress = wide(emby::progressLabel(entry));
+        const std::wstring progress = utf8ToWideText(emby::progressLabel(entry));
         const std::wstring length = runtimeLabel(entry);
         if (progress.empty()) return length;
         if (length.empty()) return progress;
@@ -147,7 +145,7 @@ std::wstring itemValue(const emby::Item& entry) {
 // The tile's top-left pill: the watched state alone.
 std::wstring tileMark(const emby::Item& entry) {
     if (emby::isPlayableVideo(entry) || ((entry.type == "Series" || entry.type == "Season") && entry.played)) {
-        return wide(emby::progressLabel(entry));
+        return utf8ToWideText(emby::progressLabel(entry));
     }
     return {};
 }
@@ -210,37 +208,21 @@ void App::fillEmbyRowContent(PanelRow& row, const ListRowMarks& marks) const {
     const int imageWidth = embyTileImageWidth(row.tileWidth, row.tileAspect < 1.0F, uiScale_);
     const std::size_t count = row.tileParams.size();
     row.options.assign(count, std::wstring());
-    row.tileKeys.clear();
-    row.tileBadges.clear();
-    row.tileMarks.clear();
-    row.tileProgress.clear();
-    row.tileTags.clear();
-    row.tileFavorites.clear();
-    row.tileAddAvailable.clear();
-    row.tilePlaying.clear();
+    row.tiles.assign(count, PanelTile{});
     for (std::size_t part = 0; part < count; ++part) {
         const emby::Item* entry = entryAt(row.tileParams[part]);
-        if (!entry) {
-            row.tileKeys.emplace_back();
-            row.tileBadges.emplace_back();
-            row.tileMarks.emplace_back();
-            row.tileProgress.push_back(0.0F);
-            row.tileTags.emplace_back();
-            row.tileFavorites.push_back(false);
-            row.tileAddAvailable.push_back(false);
-            row.tilePlaying.push_back(-1);
-            continue;
-        }
-        row.tileAddAvailable.push_back(emby::isPlayableVideo(*entry));
-        row.tilePlaying.push_back(playingPosition(*entry));
-        if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
+        if (!entry) continue;
+        auto& tile = row.tiles[part];
+        tile.addAvailable = emby::isPlayableVideo(*entry);
+        tile.playing = playingPosition(*entry);
+        if (tile.playing >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
         row.options[part] = itemLabel(*entry);
-        row.tileKeys.push_back(emby::imageKey(*entry, imageWidth));
-        row.tileBadges.push_back(tileBadge(*entry));
-        row.tileMarks.push_back(tileMark(*entry));
-        row.tileProgress.push_back(progressFraction(*entry));
-        row.tileTags.push_back(embyHasSubtitles(*entry) ? L"Sub" : L"");
-        row.tileFavorites.push_back(entry->favorite && emby::listedAmongFavorites(*entry));
+        tile.key = emby::imageKey(*entry, imageWidth);
+        tile.badge = tileBadge(*entry);
+        tile.mark = tileMark(*entry);
+        tile.progress = progressFraction(*entry);
+        if (embyHasSubtitles(*entry)) tile.tag = L"Sub";
+        tile.favorite = entry->favorite && emby::listedAmongFavorites(*entry);
     }
 }
 
@@ -249,26 +231,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     if (embyPendingPlay_) return buildEmbyReplacementRows(clientWidth);
     if (embyDetails_) return buildEmbyDetailRows(clientWidth);
     std::vector<PanelRow> rows;
-    const auto header = [&](std::wstring text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Header;
-        row.label = std::move(text);
-        rows.push_back(std::move(row));
-    };
-    const auto note = [&](std::wstring text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Note;
-        row.label = std::move(text);
-        row.wrapNote = true;
-        rows.push_back(std::move(row));
-    };
-    const auto buttons = [&](SettingId id, std::vector<std::wstring> captions) {
-        PanelRow row;
-        row.kind = PanelRowKind::Buttons;
-        row.id = id;
-        row.options = std::move(captions);
-        rows.push_back(std::move(row));
-    };
+    PanelRowAppender add(rows);
     // A list as tiles: as many per line as the sheet is wide, every line
     // one row so the sheet scrolls by lines and a hit names one tile.
     const bool posters = embyShownView() == 1;
@@ -304,17 +267,17 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
         // The sign-in page: the sheet stays the browser and its boxes are
         // typed into where they are drawn. Under the button, what is
         // happening or what went wrong.
-        header(L"Sign in");
-        note(L"Browse an Emby server's libraries and play them in the panes.");
+        add.header(L"Sign in");
+        add.note(L"Browse an Emby server's libraries and play them in the panes.");
         rows.back().wrapNote = true;
         rows.push_back(embySignInRow(TextFieldId::EmbyServer));
         rows.push_back(embySignInRow(TextFieldId::EmbyUser));
         rows.push_back(embySignInRow(TextFieldId::EmbyPassword));
-        buttons(SettingId::EmbyAccount, {embyLoading_ ? L"Signing in\x2026" : L"Sign in"});
+        add.buttons(SettingId::EmbyAccount, {embyLoading_ ? L"Signing in\x2026" : L"Sign in"});
         rows.back().primary = true;
         rows.back().enabled = !embyLoading_;
         if (!embyNote_.empty()) {
-            note(embyNote_);
+            add.note(embyNote_);
             rows.back().wrapNote = true;
             rows.back().alert = !embyLoading_;
         }
@@ -336,11 +299,11 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
         // The Search page's own box says what it searched for; below a
         // page opened from it, the crumb does.
         const bool top = i + 1 == embyPages_.size();
-        crumb += L" \x203A " + (page.kind != EmbyPage::Kind::Search ? wide(page.title)
+        crumb += L" \x203A " + (page.kind != EmbyPage::Kind::Search ? utf8ToWideText(page.title)
                                 : top || page.term.empty() ? std::wstring(L"Search")
-                                : L"\x201C" + wide(page.term) + L"\x201D");
+                                : L"\x201C" + utf8ToWideText(page.term) + L"\x201D");
     }
-    header(crumb);
+    add.header(crumb);
     // How many videos the page lists -- folders are not counted -- or, while
     // a long one has come only in part, how many entries it has in all.
     if (!home && !searchPage && !embyItems_.empty()) {
@@ -357,9 +320,9 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     // The way back to the settings is the header's switch, so the home
     // page's row starts at Search; the other pages lead with Back.
     if (home) {
-        buttons(SettingId::EmbyNav, {L"Search", L"Favorites", L"Sign out", L"Refresh"});
+        add.buttons(SettingId::EmbyNav, {L"Search", L"Favorites", L"Sign out", L"Refresh"});
     } else {
-        buttons(SettingId::EmbyNav, {L"\x2190 Back", L"Search", L"Favorites", L"Home", L"Refresh"});
+        add.buttons(SettingId::EmbyNav, {L"\x2190 Back", L"Search", L"Favorites", L"Home", L"Refresh"});
     }
     rows.back().buttonMinWidth = kEmbyNavButtonWidth;
     if (searchPage) rows.push_back(embySearchRow());
@@ -384,10 +347,10 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     // (EmbyBrowserPrefs::personDetails) and no library's. One the page does
     // not offer leaves its slot empty, so a part always names the same
     // button (embyToolbarAction).
-    buttons(SettingId::EmbyToolbar,
-            {view + L" \x25BE", arrange ? sort + L" \x25BE" : L"", arrange ? L"Unplayed" : L"",
-             favoritesOffered ? L"\x2665 Favorites" : L"", flatOffered ? L"All videos" : L"",
-             libraryDetails || personPage ? L"Info pages" : L""});
+    add.buttons(SettingId::EmbyToolbar,
+                {view + L" \x25BE", arrange ? sort + L" \x25BE" : L"", arrange ? L"Unplayed" : L"",
+                 favoritesOffered ? L"\x2665 Favorites" : L"", flatOffered ? L"All videos" : L"",
+                 libraryDetails || personPage ? L"Info pages" : L""});
     rows.back().buttonMinWidth = 80.0F;
     rows.back().buttonsOn = {false, false, arrange && embyBrowser_.unplayed,
                              favoritesOffered && embyBrowser_.favorites, flatOffered && embyBrowser_.flat,
@@ -400,23 +363,24 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
     if (personPage) rows.push_back(embyPersonRow(embyPages_.back()));
     if (searchEmpty) {
         const auto& page = embyPages_.back();
-        note(page.searchesScope()
-                 ? L"Type part of a title: everything under " + wide(page.scopeTitle) + L" is searched as you type."
-                 : L"Type part of a title: every library is searched as you type.");
+        add.note(page.searchesScope()
+                     ? L"Type part of a title: everything under " + utf8ToWideText(page.scopeTitle) +
+                           L" is searched as you type."
+                     : L"Type part of a title: every library is searched as you type.");
     }
-    else if (embyLoading_) note(searchPage ? L"Searching\x2026" : L"Loading\x2026");
+    else if (embyLoading_) add.note(searchPage ? L"Searching\x2026" : L"Loading\x2026");
     else if (!embyNote_.empty()) {
-        note(embyNote_);
+        add.note(embyNote_);
         rows.back().alert = embyNoteError_;
-        if (embyNoteError_) buttons(SettingId::EmbyRetry, {L"Retry"});
+        if (embyNoteError_) add.buttons(SettingId::EmbyRetry, {L"Retry"});
     }
     if (home) {
-        note(embyStatusLine());
+        add.note(embyStatusLine());
         if (!embyResume_.empty()) {
-            header(L"Continue watching");
+            add.header(L"Continue watching");
             listing(embyResume_.size(), -1, -1);
         }
-        header(L"Libraries");
+        add.header(L"Libraries");
     }
     if (searchPage || personPage) {
         // The results under their sections, as the server's own clients
@@ -427,7 +391,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
             const auto group = emby::searchGroup(embyItems_[start]);
             std::size_t end = start + 1;
             while (end < embyItems_.size() && emby::searchGroup(embyItems_[end]) == group) ++end;
-            header(searchGroupTitle(group) + L"  \x00B7  " + std::to_wstring(end - start));
+            add.header(searchGroupTitle(group) + L"  \x00B7  " + std::to_wstring(end - start));
             listing(end - start, static_cast<int>(start), 1);
             start = end;
         }
@@ -441,7 +405,7 @@ std::vector<PanelRow> App::buildEmbyRows(float clientWidth, std::vector<PanelLis
         // On its way, the button says so and takes no press: the same row
         // under the list, so nothing that is being read moves.
         if (embyLoadingMore_ || !embyLoading_) {
-            buttons(SettingId::EmbyMore, {(embyLoadingMore_ ? L"Loading more\x2026" : L"Show more") + count});
+            add.buttons(SettingId::EmbyMore, {(embyLoadingMore_ ? L"Loading more\x2026" : L"Show more") + count});
             rows.back().enabled = !embyLoadingMore_;
         }
     }
@@ -938,9 +902,12 @@ void App::embyRequestVisibleImages() {
             row.kind != PanelRowKind::MediaDetail) return true;
         const auto& box = panelLayout_.rows[i].row;
         if (box.bottom() < top || box.y > bottom) return true;
-        const std::vector<std::string> keys = row.kind == PanelRowKind::MediaDetail
-            ? std::vector<std::string>{row.mediaDetail.posterKey, row.mediaDetail.backdropKey, row.mediaDetail.logoKey}
-            : row.tileKeys;
+        std::vector<std::string> keys;
+        if (row.kind == PanelRowKind::MediaDetail) {
+            keys = {row.mediaDetail.posterKey, row.mediaDetail.backdropKey, row.mediaDetail.logoKey};
+        } else {
+            for (const auto& tile : row.tiles) keys.push_back(tile.key);
+        }
         for (const auto& key : keys) {
             if (embyImagesInFlight_.size() >= kEmbyImageQueue &&
                 localThumbnailsInFlight_.size() >= kLocalThumbnailQueue) return false;
@@ -1695,7 +1662,7 @@ void App::embyFavoriteArrived(std::uint64_t account, const std::string& itemId, 
         }
         appendDiagnostic("Emby: could not " + std::string(wanted ? "mark" : "unmark") + " item " + itemId +
                          " as a favorite: " + response.error);
-        showNotice(L"Emby: the favorite was not changed (" + wide(response.error) + L")");
+        showNotice(L"Emby: the favorite was not changed (" + utf8ToWideText(response.error) + L")");
         return;
     }
     // The reply is the item's user data as the server now holds it; a
@@ -1813,7 +1780,9 @@ void App::showEmbyItemMenu(POINT local) {
     openPanelMenuAt(std::move(menu), local, [this, account, item = *item](unsigned command) {
         // What the menu offered, for the account it was offered under.
         if (account != embyAccountSerial_) return;
-        if (command == CmdEmbyFavorite) embySetFavorite(item.id, wide(emby::displayTitle(item)), !item.favorite);
+        if (command == CmdEmbyFavorite) {
+            embySetFavorite(item.id, utf8ToWideText(emby::displayTitle(item)), !item.favorite);
+        }
         if (command == CmdEmbyDelete) embyAskDelete(item);
     });
 }

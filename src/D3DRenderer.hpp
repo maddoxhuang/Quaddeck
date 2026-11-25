@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ColorConversion.hpp"
 #include "Core.hpp"
 #include "VideoOutput.hpp"
 #include "VideoSource.hpp"
@@ -83,7 +84,10 @@ public:
                 int expandedPane, int soloPane, unsigned contentHeight,
                 const PaneArray<float>& aspectRatios,
                 AutoLayoutFocus autoFocus = AutoLayoutFocus::Dynamic,
-                int autoFocusPane = -1);
+                int autoFocusPane = -1,
+                // The panes whose frame is past its middle (secondFieldDue):
+                // of an interlaced one, the second field is then the picture.
+                const PaneArray<bool>& secondFields = {});
     // A driver reset, a GPU hang or a TDR invalidates the device and every
     // resource on it. Nothing can be rendered again until it is rebuilt.
     bool deviceLost() const { return deviceLost_; }
@@ -149,15 +153,61 @@ private:
         bool hdrOutputMode{};
         // Per processor, never the most recently created pane's global status.
         bool rtxHdrApplied{};
+        bool superResolutionApplied{};
         // The output is PQ: an HDR10 stream passed through, or RTX Video
         // HDR's. A 10-bit SDR output is R10G10B10A2 as well, so the format
         // alone does not say it.
         bool pqOutput{};
         bool tenBitOutputMode{};
+        // An HDR10 picture on an SDR output: `source` holds it as PQ BT.2020
+        // RGB (the processor's output, or a software frame's upload) and the
+        // tone-map pass writes the SDR picture into `texture`, which every
+        // later pass reads as it reads any SDR slot. `toneMapAsked` is the
+        // frame's side of it (HDR10, SDR output), part of the processor's
+        // identity; a processor that does not convert PQ leaves it unmapped.
+        bool toneMapAsked{};
+        bool toneMapped{};
+        // The frame is HLG, part of the slot's identity as PQ is: `source`
+        // then holds HLG codes. On the PQ output the same pass makes PQ of
+        // them into `texture` (`hlgToPq`) and the slot is an HDR source's
+        // from there; on an SDR output it is tone-mapped as above.
+        bool hlg{};
+        bool hlgToPq{};
+        // What this slot's processor says it converts, asked when it is
+        // built: a PQ surface whose chroma sits top-left, and a full-range
+        // BT.2020 one with its transfer left alone.
+        bool chromaTopLeftInput{};
+        bool fullRangeHdrInput{};
+        // The frame is HDR and full range, part of the slot's identity: a
+        // processor without the conversion above undoes it with the
+        // full-range BT.709 pair instead and the pass after it puts BT.2020's
+        // matrix in its place (`rematrix`), into `texture` as above.
+        bool fullRangeHdr{};
+        bool rematrix{};
+        // What the processor's BT.709 pair adds to each of R, G and B, taken
+        // off again before the matrix is mended (measureFullRange709).
+        std::array<float, 3> rematrixOffset{};
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> sourceView;
+        Microsoft::WRL::ComPtr<ID3D11RenderTargetView> toneMapTarget;
         // Built to deinterlace. Once a stream has shown an interlaced frame
         // its processor stays so: the progressive frames among them are
         // told so one by one, and nothing is rebuilt between the two.
         bool interlaced{};
+        // `texture` holds the second field of the frame of `serial`, part
+        // of what it is a picture of: a frame's two fields are converted
+        // one after the other, each when its half of the frame's time comes.
+        bool secondField{};
+        // A deinterlacing processor's own count of the frames it was given
+        // and of the pictures it was asked for (convertSurface).
+        UINT inputFrames{};
+        UINT outputPictures{};
+        // The quarter turns clockwise this slot's processor turns the
+        // picture as it converts it, part of its identity: `texture` then
+        // holds the picture that much nearer upright, its size the turned
+        // one, and the pane's draw turns only what is left. 0 for a slot
+        // with no processor, and where the processor cannot turn.
+        int turned{};
         std::uint64_t serial{};
         bool hardware{};
     };
@@ -166,6 +216,8 @@ private:
         std::vector<std::uint8_t> bytes;
         int width{};
         int height{};
+        // NV12 for an 8-bit SDR frame, P010 for a deeper HDR one.
+        DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
         std::uint64_t serial{};
         bool failed{};
         int failedOutputWidth{};
@@ -207,6 +259,9 @@ private:
     bool createPipeline();
     bool compilePixelShader(const char* source, std::size_t length, const char* name);
     bool compilePixelShaderFile(const std::wstring& path);
+    // A compiled effect shader made the one every pane runs through, with
+    // no preset's flags; `what` names a failure to create it.
+    bool installPixelShader(ID3DBlob* blob, const char* what);
     bool createBackBuffer();
     // Gives the swap chain buffers of this size and a render target on them.
     // When ResizeBuffers fails on a device that is not lost, the chain is
@@ -228,12 +283,47 @@ private:
     void refreshDisplayFactory(bool force = false);
     // Asks the driver once per device whether it honours the two extensions.
     void probeVideoEnhancements();
+    // Asks once per device whether its video processor turns a picture.
+    void probeProcessorRotation();
+    // The quarter turns a frame's processor makes of those its picture
+    // needs: all of them where the processor turns, none where it cannot.
+    int processorTurns(const HardwareVideoFrame& frame) const {
+        return processorRotates_ ? frame.quarterTurns & 3 : 0;
+    }
     // Moves the swap chain between 8-bit sRGB, 10-bit sRGB and 10-bit PQ to
     // match what the settings and the display allow. Rebuilds the back
     // buffer and drops every slot, whose output format changed with it.
     bool applyOutputMode();
     bool wantHdrOutput() const;
     bool wantTenBitOutput() const;
+    // RTX Video HDR is on and this card's driver honours it.
+    bool rtxHdrReady() const;
+    // Whether an HDR (HDR10 or HLG) frame is among those about to be drawn,
+    // held for a
+    // moment after the last (hdrVideoHeld); render() switches the output
+    // when the answer changes.
+    bool noteHdrVideo(bool shownNow);
+    // Whether this card's processor turns the HDR10 surface into PQ BT.2020
+    // RGB, which the tone-map pass reads. Asked when a slot is built.
+    bool processorConvertsPq(ID3D11VideoProcessorEnumerator* enumerator, DXGI_FORMAT input);
+    // Whether it turns a surface in one colour space into 10-bit RGB in
+    // another.
+    bool processorConverts(ID3D11VideoProcessorEnumerator* enumerator, DXGI_FORMAT input,
+                           DXGI_COLOR_SPACE_TYPE inputSpace, DXGI_COLOR_SPACE_TYPE outputSpace);
+    // How far this card's full-range BT.709 conversion of a surface in
+    // `format` stands off the standard one, measured once a device with a
+    // ramp of greys (`full709_`): a driver can take its chroma zero from
+    // 8-bit constants, a code or two of ten bits off, which tints every
+    // grey. False when it cannot be measured or is too far off to mend.
+    bool measureFullRange709(SlotTexture& target, DXGI_FORMAT format);
+    // The slot's `texture` as a render target the tone-map pass draws into.
+    bool createToneMapTarget(std::size_t slot, int width, int height);
+    // The slot's `source` into `texture`: an HDR10 or HLG picture through
+    // the curve to SDR, or an HLG one to PQ (the slot's `hlg`, `hlgToPq`).
+    bool runToneMapPass(std::size_t slot, float peakNits);
+    // Tells the swap chain the HDR10 metadata of the picture being shown, or
+    // that there is none; only when it has changed.
+    void applyHdrMetadata(const HdrStaticMetadata& metadata);
     // Lets every pane's converted picture go, to be made again on the next
     // frame as the settings now say.
     void dropSlots();
@@ -242,6 +332,14 @@ private:
     // The user's shader at the converted picture's size, into the pane's
     // post texture.
     bool runEffectsPass(std::size_t slot);
+    // What every pass into a texture of the picture's own sets first: no
+    // blending, the quad over the whole of it with UVs as they are, a
+    // viewport of its size, the linear sampler.
+    void beginFullscreenPass(int width, int height);
+    // The effect shader over the slot's converted picture into `target`, of
+    // that size, with the parameters it has when it draws straight to the
+    // window: the size, the frame and the clock.
+    void drawEffectShader(std::size_t slot, ID3D11RenderTargetView* target, int width, int height);
     // The pane's picture into the back buffer through the chosen scaler,
     // then the colour controls and the levels; the viewport and the UV
     // transform are already set.
@@ -252,6 +350,10 @@ private:
     bool compositeOverlayLayer();
     bool convertSurface(std::size_t slot, const HardwareVideoFrame& frame,
                         const SurfaceSize& requested);
+    // Whether the picture to make of this frame in this slot is its second
+    // field: the pane's time is past the frame's middle, and the frame is
+    // an interlaced one that is being deinterlaced.
+    bool secondFieldWanted(std::size_t slot, const HardwareVideoFrame& frame) const;
     bool uploadSoftwareFrame(std::size_t slot, const HardwareVideoFrame& frame);
     bool convertSoftwareSurface(std::size_t slot, const HardwareVideoFrame& frame,
                                 const SurfaceSize& requested);
@@ -294,6 +396,13 @@ private:
     bool hdrOutput_{};
     // A 10-bit sRGB back buffer, the Video tab's choice in SDR.
     bool tenBitOutput_{};
+    // An HDR video is being shown, or was a moment ago. It is about what
+    // is played, not the device, so it survives a rebuild.
+    bool hdrVideoShown_{};
+    std::chrono::steady_clock::time_point hdrVideoLastShown_{};
+    // The PQ output was refused and said so in the log; not said again
+    // until it has been had or is no longer wanted.
+    bool pqRefusalLogged_{};
     VideoOutputSettings videoOutput_;
     // What the device was asked to be when it was built, and what it is.
     VideoRendererChoice builtChoice_;
@@ -330,6 +439,7 @@ private:
     // processors does not write five identical lines.
     int loggedSuperResolution_{-1};
     int loggedRtxHdr_{-1};
+    bool superResolutionTenBitLogged_{};
     HANDLE frameLatencyWaitable_{};
     UINT swapChainFlags_{};
     bool deviceLost_{};
@@ -349,18 +459,52 @@ private:
     // The quad for a picture stored 1, 2 and 3 quarter turns from upright:
     // only a pane's own draw uses them, every other pass the one above.
     std::array<Microsoft::WRL::ComPtr<ID3D11VertexShader>, 3> turnedVertexShaders_;
+    // The device's video processor turns a picture by quarter turns
+    // (D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION). A picture that goes
+    // through it is then turned there, so that what the driver draws into
+    // its output -- RTX Video's status indicator -- stands upright with it.
+    bool processorRotates_{};
     Microsoft::WRL::ComPtr<ID3D11Buffer> uvTransformBuffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> pixelParamsBuffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> smartVibranceBuffer_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> vibranceColorBuffer_;
     bool smartVibranceSelected_{};
+    // Grayscale or Invert is in pixelShader_: it reads b2 as well, to know
+    // a PQ picture from an SDR one.
+    bool pqAwarePreset_{};
     Microsoft::WRL::ComPtr<ID3D11PixelShader> pixelShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> copyShader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> sdrToPqShader_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> sdrToPqParams_;
+    // HDR10 or HLG to SDR for an SDR output, HLG to PQ for the PQ one, and
+    // the matrix of a full-range HDR surface mended (kToneMapShader).
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> toneMapShader_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> toneMapParams_;
+    // Last logged route of an HDR picture on an SDR output: -1 none yet,
+    // 1 tone-mapped, 0 left to the 709 approximation because the processor
+    // does not convert PQ; two more for an HLG one.
+    int loggedToneMap_{-1};
+    // A full-range HDR surface went to a processor without a full-range
+    // BT.2020 conversion, and the log has said how it was undone.
+    bool fullRangeHdrLogged_{};
+    // measureFullRange709's answers for this device, one for 8-bit and one
+    // for deeper surfaces.
+    struct FullRange709 {
+        bool measured{};
+        bool usable{};
+        std::array<float, 3> offset{};
+    };
+    std::array<FullRange709, 2> full709_{};
+    // What the swap chain was last told (applyHdrMetadata); `present` false
+    // is nothing, which is also what a new chain has.
+    HdrStaticMetadata hdrMetadata_;
+    // What became of the HDR pictures in the frame last drawn.
+    HdrPicture hdrPicture_{HdrPicture::None};
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
     PaneArray<SlotTexture> slots_{};
     PaneArray<SoftwareUpload> softwareUploads_{};
+    // What render() was last told of each pane's frame: past its middle.
+    PaneArray<bool> secondFields_{};
     PaneArray<SoftwarePqTexture> softwarePq_{};
     PaneArray<int> loggedSoftwareRoute_{{-1, -1, -1, -1, -1}};
     OverlayPainter overlay_;

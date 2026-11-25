@@ -1,4 +1,5 @@
 #include "HangWatchdog.hpp"
+#include "TextEncoding.hpp"
 
 #include <dbghelp.h>
 #include <psapi.h>
@@ -42,18 +43,6 @@ bool readMemory(DWORD64 address, void* buffer, std::size_t size) noexcept {
            read == size;
 }
 
-std::string narrow(const std::wstring& text) {
-    if (text.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                                         nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<std::size_t>(std::max(size, 0)), '\0');
-    if (size > 0) {
-        WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
-                            result.data(), size, nullptr, nullptr);
-    }
-    return result;
-}
-
 std::vector<ModuleRange> listModules() {
     const HANDLE process = GetCurrentProcess();
     std::vector<HMODULE> handles(512);
@@ -76,7 +65,7 @@ std::vector<ModuleRange> listModules() {
         std::wstring path(MAX_PATH, L'\0');
         const DWORD length = K32GetModuleFileNameExW(process, handle, path.data(), static_cast<DWORD>(path.size()));
         path.resize(length);
-        module.name = narrow(std::filesystem::path(path).stem().wstring());
+        module.name = wideToUtf8Text(std::filesystem::path(path).stem().wstring());
         module.path = std::move(path);
         IMAGE_DOS_HEADER dos{};
         IMAGE_NT_HEADERS64 headers{};
@@ -213,7 +202,7 @@ std::string threadName(DWORD id) {
     PWSTR description = nullptr;
     std::string name;
     if (SUCCEEDED(GetThreadDescription(thread, &description)) && description) {
-        name = narrow(description);
+        name = wideToUtf8Text(description);
         LocalFree(description);
     }
     CloseHandle(thread);
@@ -269,12 +258,12 @@ public:
         symbol->MaxNameLen = 255;
         DWORD64 displacement = 0;
         if (SymFromAddrW(process_, address, &displacement, symbol)) {
-            out << ' ' << narrow(symbol->Name) << "+0x" << std::hex << displacement << std::dec;
+            out << ' ' << wideToUtf8Text(symbol->Name) << "+0x" << std::hex << displacement << std::dec;
             IMAGEHLP_LINEW64 line{};
             line.SizeOfStruct = sizeof(line);
             DWORD lineDisplacement = 0;
             if (SymGetLineFromAddrW64(process_, address, &lineDisplacement, &line) && line.FileName) {
-                out << ' ' << narrow(std::filesystem::path(line.FileName).filename().wstring()) << ':'
+                out << ' ' << wideToUtf8Text(std::filesystem::path(line.FileName).filename().wstring()) << ':'
                     << line.LineNumber;
             }
         }

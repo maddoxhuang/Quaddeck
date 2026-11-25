@@ -326,41 +326,16 @@ void App::videoPanelAction(const PanelRow& row, int part) {
 }
 
 void App::appendVideoSettingsRows(std::vector<PanelRow>& rows) const {
-    const auto header = [&](const wchar_t* text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Header;
-        row.label = text;
-        rows.push_back(std::move(row));
-    };
-    const auto note = [&](const std::wstring& text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Note;
-        row.wrapNote = true;
-        row.label = text;
-        rows.push_back(std::move(row));
-    };
-    // A few short options are segments beside the label; a long list, or
-    // long names, a drop-down.
-    const auto choice = [&](SettingId id, const std::wstring& label, std::vector<std::wstring> options, int selected,
-                            bool dropDown = false) {
-        PanelRow row;
-        row.kind = PanelRowKind::Choice;
-        row.id = id;
-        row.label = label;
-        row.options = std::move(options);
-        row.selected = selected;
-        row.dropDown = dropDown;
-        rows.push_back(std::move(row));
-    };
+    PanelRowAppender add(rows);
 
-    header(L"Renderer");
+    add.header(L"Renderer");
     {
         std::vector<std::wstring> renderers;
         for (int renderer = 0; renderer < kVideoRendererCount; ++renderer) {
             renderers.emplace_back(videoRendererLabel(static_cast<VideoRenderer>(renderer)));
         }
-        choice(SettingId::VideoRenderer, L"Video renderer", std::move(renderers),
-               static_cast<int>(videoOutput_.renderer), true);
+        add.choice(SettingId::VideoRenderer, L"Video renderer", std::move(renderers),
+                   static_cast<int>(videoOutput_.renderer), true);
         rows.back().hint = L"Direct3D 11 hands frames to Windows with the flip model, which 10-bit and HDR output "
                            L"need. Bitblt is the older way, for capture tools and drivers the flip model troubles. "
                            L"WARP draws on the CPU, with no graphics card at all.";
@@ -381,21 +356,27 @@ void App::appendVideoSettingsRows(std::vector<PanelRow>& rows) const {
             adapters.push_back(videoOutput_.adapter + L"  (not connected)");
             selected = static_cast<int>(adapters.size() - 1);
         }
-        choice(SettingId::VideoAdapter, L"Graphics card", std::move(adapters), selected, true);
+        add.choice(SettingId::VideoAdapter, L"Graphics card", std::move(adapters), selected, true);
         rows.back().enabled = videoOutput_.renderer != VideoRenderer::Warp;
         rows.back().hint = L"The card that decodes and draws every video. On a laptop with two, the faster one "
                            L"may need choosing here as well as in Windows' graphics settings.";
     }
     // Until 2026-11-07 on the Playback tab; it is the card's work, and WARP
     // has none to do it.
-    choice(SettingId::Decoder, L"Decoder",
-           std::vector<std::wstring>(kDecodeModeNames.begin(), kDecodeModeNames.end()), static_cast<int>(decodeMode_));
+    add.choice(SettingId::Decoder, L"Decoder",
+               std::vector<std::wstring>(kDecodeModeNames.begin(), kDecodeModeNames.end()), static_cast<int>(decodeMode_));
     rows.back().enabled = decoderChoiceApplies();
     rows.back().hint = L"Hardware decodes on the graphics card (D3D11VA), Software on the CPU; Automatic uses the "
                        L"card where it can. On WARP, chosen or used with no card, every video is decoded in "
                        L"software and this is greyed.";
-    note(L"Changing the renderer, the graphics card or the decoder reopens every video at the same time.");
-    note(videoRendererNote(videoOutput_, renderer_.rendererStatus()));
+    add.note(L"Changing the renderer, the graphics card or the decoder reopens every video at the same time.");
+    {
+        auto status = renderer_.rendererStatus();
+        for (const auto& source : sources_) {
+            status.dolbyVisionUndecoded = status.dolbyVisionUndecoded || (source && source->undecodedDolbyVision() != 0);
+        }
+        add.note(videoRendererNote(videoOutput_, status));
+    }
     {
         std::vector<std::wstring> displays{L"The window's display"};
         int selected = videoOutput_.display.empty() ? 0 : -1;
@@ -409,38 +390,38 @@ void App::appendVideoSettingsRows(std::vector<PanelRow>& rows) const {
             displays.push_back(videoOutput_.displayName + L"  (not connected)");
             selected = static_cast<int>(displays.size() - 1);
         }
-        choice(SettingId::VideoDisplay, withShortcut(L"Fullscreen on", KeyAction::Fullscreen), std::move(displays),
-               selected, true);
+        add.choice(SettingId::VideoDisplay, withShortcut(L"Fullscreen on", KeyAction::Fullscreen), std::move(displays),
+                   selected, true);
         rows.back().hint = L"The display fullscreen fills. While it is not connected, fullscreen fills the "
                            L"window's own.";
     }
-    choice(SettingId::VideoDepth, L"Output", {L"8-bit", L"10-bit"}, videoOutput_.tenBit ? 1 : 0);
+    add.choice(SettingId::VideoDepth, L"Output", {L"8-bit", L"10-bit"}, videoOutput_.tenBit ? 1 : 0);
     rows.back().hint = L"10-bit shows smoother gradients on a display that takes it, and needs the flip model. "
-                       L"RTX Video HDR's output is 10-bit either way.";
+                       L"HDR output is 10-bit either way.";
 
-    header(L"Processing");
+    add.header(L"Processing");
     {
         std::vector<std::wstring> modes;
         for (int mode = 0; mode < kVideoDeinterlaceCount; ++mode) {
             modes.emplace_back(videoDeinterlaceLabel(static_cast<VideoDeinterlace>(mode)));
         }
-        choice(SettingId::VideoDeinterlace, L"Deinterlacing", std::move(modes),
-               static_cast<int>(videoOutput_.deinterlace));
+        add.choice(SettingId::VideoDeinterlace, L"Deinterlacing", std::move(modes),
+                   static_cast<int>(videoOutput_.deinterlace));
         rows.back().hint = L"Videos their decoder marks as interlaced, such as TV recordings and DVDs, are "
                            L"deinterlaced by the graphics card. Off shows their two fields woven together.";
         std::vector<std::wstring> scalers;
         for (int scaling = 0; scaling < kVideoScalingCount; ++scaling) {
             scalers.emplace_back(videoScalingLabel(static_cast<VideoScaling>(scaling)));
         }
-        choice(SettingId::VideoScaling, L"Enlarging", std::move(scalers), static_cast<int>(videoOutput_.scaling),
-               true);
+        add.choice(SettingId::VideoScaling, L"Enlarging", std::move(scalers), static_cast<int>(videoOutput_.scaling),
+                   true);
         rows.back().hint = L"How a video shown larger than it is gets there: bicubic and Lanczos are sharper than "
                            L"bilinear, nearest neighbour keeps pixels square. A video shown smaller is bilinear.";
     }
 
-    header(L"Colour");
-    choice(SettingId::VideoLevels, L"Output levels", {L"PC  0\x2013" L"255", L"TV  16\x2013" L"235"},
-           videoOutput_.limitedRange ? 1 : 0);
+    add.header(L"Colour");
+    add.choice(SettingId::VideoLevels, L"Output levels", {L"PC  0\x2013" L"255", L"TV  16\x2013" L"235"},
+               videoOutput_.limitedRange ? 1 : 0);
     rows.back().hint = L"TV levels for a television that expects video levels. The wrong one shows black as grey, "
                        L"or dark detail as black.";
     for (int index = 0; index < kVideoColorControlCount; ++index) {
@@ -458,29 +439,20 @@ void App::appendVideoSettingsRows(std::vector<PanelRow>& rows) const {
         else if (control == VideoColorControl::Contrast) pair(KeyAction::ContrastDown, KeyAction::ContrastUp);
         else if (control == VideoColorControl::Saturation) pair(KeyAction::SaturationDown, KeyAction::SaturationUp);
         else if (control == VideoColorControl::Hue) pair(KeyAction::HueDown, KeyAction::HueUp);
-        PanelRow row;
-        row.kind = PanelRowKind::Slider;
-        row.id = SettingId::VideoColor;
-        row.param = index;
-        row.label = keys.empty() ? std::wstring(videoColorControlLabel(control))
-                                 : videoColorControlLabel(control) + std::wstring(L"  (") + keys + L")";
-        row.slider01 = std::clamp(static_cast<float>(value + range) / static_cast<float>(2 * range), 0.0F, 1.0F);
-        row.value = videoColorValueText(control, value);
-        rows.push_back(std::move(row));
+        add.slider(SettingId::VideoColor, index,
+                   keys.empty() ? std::wstring(videoColorControlLabel(control))
+                                : videoColorControlLabel(control) + std::wstring(L"  (") + keys + L")",
+                   static_cast<float>(value + range) / static_cast<float>(2 * range),
+                   videoColorValueText(control, value));
     }
     {
-        PanelRow row;
-        row.kind = PanelRowKind::Buttons;
-        row.id = SettingId::VideoColorReset;
-        row.param = -1;
         const std::wstring key = shortcut(KeyAction::ColorReset);
-        row.options = {key.empty() ? std::wstring(L"Reset the colour controls")
-                                   : L"Reset the colour controls  " + key};
-        row.enabled = videoOutput_.color != VideoColorControls{};
-        rows.push_back(std::move(row));
+        add.buttons(SettingId::VideoColorReset, -1, L"",
+                    {key.empty() ? std::wstring(L"Reset the colour controls") : L"Reset the colour controls  " + key},
+                    L"", videoOutput_.color != VideoColorControls{});
     }
-    note(L"A double-click sets a slider back to 0. The levels and the colour controls apply to every video after "
-         L"its pixel shader; with RTX Video HDR's output they are left out.");
+    add.note(L"A double-click sets a slider back to 0. The levels and the colour controls apply to every video after "
+             L"its pixel shader; with HDR output they are left out.");
 }
 
 }  // namespace quaddeck

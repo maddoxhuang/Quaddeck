@@ -48,8 +48,9 @@ int probeInterrupted(void* opaque) {
     return interrupt && interrupt->token->load(std::memory_order_relaxed) != interrupt->serial ? 1 : 0;
 }
 
-// A stream the player shows subtitles from: text, with a decoder, as
-// VideoSource's textSubtitleCodec reads them.
+// A stream the list's Sub mark counts: text, with a decoder, as
+// VideoSource's textSubtitleCodec reads them. A stream of pictures is
+// shown too since 2026-11-24, and the mark still leaves it out.
 bool textSubtitleStream(const AVStream* stream) {
     if (!stream->codecpar || stream->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) return false;
     const AVCodecDescriptor* descriptor = avcodec_descriptor_get(stream->codecpar->codec_id);
@@ -1168,7 +1169,7 @@ std::vector<PanelRow> App::buildLocalReplacementRows(float) const {
         row.label = L"V" + std::to_wstring(position + 1) + L" \x2014 " + title;
         row.video = static_cast<int>(position);
         row.value = audioPaneEnabled(pane) ? L"Audio on" : L"Muted";
-        row.tileKeys.push_back(slot ? slot->imageKey : localThumbnailKey(paths_[pane], 400));
+        row.tiles.push_back({.key = slot ? slot->imageKey : localThumbnailKey(paths_[pane], 400)});
         rows.push_back(std::move(row));
     }
     return rows;
@@ -1251,50 +1252,30 @@ void App::fillLocalRowContent(PanelRow& row, const ListRowMarks& marks) const {
     const int imageWidth = std::max(200, static_cast<int>(std::ceil(row.tileWidth * uiScale_ * 2.0F / 100.0F)) * 100);
     const std::size_t count = row.tileParams.size();
     row.options.assign(count, std::wstring());
-    row.tileKeys.clear();
-    row.tileBadges.clear();
-    row.tileMarks.clear();
-    row.tileProgress.clear();
-    row.tileTags.clear();
-    row.tileAddAvailable.clear();
-    row.tilePlaying.clear();
+    row.tiles.assign(count, PanelTile{});
     for (std::size_t part = 0; part < count; ++part) {
+        auto& tile = row.tiles[part];
         // A folder's tile has no picture: the shell's would be its icon, or
         // a slow look inside a share's folder. The tile shows its initial.
         if (const std::wstring* folder = folderAt(row.tileParams[part])) {
             row.options[part] = localFileName(*folder);
-            row.tileKeys.emplace_back();
-            row.tileBadges.emplace_back(L"Folder");
-            row.tileMarks.emplace_back();
-            row.tileProgress.push_back(0.0F);
-            row.tileTags.emplace_back();
-            row.tileAddAvailable.push_back(false);
-            row.tilePlaying.push_back(holdingPosition(row.tileParams[part]));
-            if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
+            tile.badge = L"Folder";
+            tile.playing = holdingPosition(row.tileParams[part]);
+            if (tile.playing >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
             continue;
         }
         const LocalEntry* entry = entryAt(row.tileParams[part]);
-        if (!entry) {
-            row.tileKeys.emplace_back();
-            row.tileBadges.emplace_back();
-            row.tileMarks.emplace_back();
-            row.tileProgress.push_back(0.0F);
-            row.tileTags.emplace_back();
-            row.tileAddAvailable.push_back(false);
-            row.tilePlaying.push_back(-1);
-            continue;
-        }
-        row.tileAddAvailable.push_back(true);
-        row.tilePlaying.push_back(playingPosition(row.tileParams[part]));
-        if (row.tilePlaying.back() >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
+        if (!entry) continue;
+        tile.addAvailable = true;
+        tile.playing = playingPosition(row.tileParams[part]);
+        if (tile.playing >= 0 && row.selected < 0) row.selected = static_cast<int>(part);
         row.options[part] = title(*entry);
-        row.tileKeys.push_back(localThumbnailKey(entry->path, imageWidth));
+        tile.key = localThumbnailKey(entry->path, imageWidth);
         // The length where the Emby tiles have theirs, the size at the left.
         const std::wstring time = length(*entry);
-        row.tileBadges.push_back(time.empty() ? formatFileSize(entry->size) : time);
-        row.tileMarks.push_back(time.empty() ? std::wstring() : formatFileSize(entry->size));
-        row.tileProgress.push_back(0.0F);
-        row.tileTags.push_back(subtitleTag(*entry));
+        tile.badge = time.empty() ? formatFileSize(entry->size) : time;
+        if (!time.empty()) tile.mark = formatFileSize(entry->size);
+        tile.tag = subtitleTag(*entry);
     }
 }
 
@@ -1302,45 +1283,24 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
     if (runs) runs->clear();
     if (localPendingPlay_) return buildLocalReplacementRows(sheetWidth);
     std::vector<PanelRow> rows;
-    const auto header = [&](std::wstring text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Header;
-        row.label = std::move(text);
-        rows.push_back(std::move(row));
-    };
-    const auto note = [&](std::wstring text) {
-        PanelRow row;
-        row.kind = PanelRowKind::Note;
-        row.wrapNote = true;
-        row.label = std::move(text);
-        rows.push_back(std::move(row));
-    };
+    PanelRowAppender add(rows);
     const PanelMetrics metrics;
     const float innerWidth = std::max(0.0F, sheetWidth - 2.0F * metrics.pad * uiScale_);
 
-    header(localDirectory_.empty() ? std::wstring(L"Folder") : localFolderCrumb(localDirectory_));
+    add.header(localDirectory_.empty() ? std::wstring(L"Folder") : localFolderCrumb(localDirectory_));
+    // Up stays away at the top of a drive or a share, the others in their
+    // places.
+    add.buttons(SettingId::LocalNav,
+                {localParentFolder(localDirectory_).empty() ? L"" : L"\x2191 Up", L"Emby\x2026", L"Refresh"})
+        .buttonMinWidth = kEmbyNavButtonWidth;
     {
-        PanelRow row;
-        row.kind = PanelRowKind::Buttons;
-        row.id = SettingId::LocalNav;
-        // Up stays away at the top of a drive or a share, the others in
-        // their places.
-        row.options = {localParentFolder(localDirectory_).empty() ? L"" : L"\x2191 Up", L"Emby\x2026", L"Refresh"};
-        row.buttonMinWidth = kEmbyNavButtonWidth;
-        rows.push_back(std::move(row));
-    }
-    {
-        PanelRow row;
-        row.kind = PanelRowKind::Buttons;
-        row.id = SettingId::LocalToolbar;
         const auto key = emby::sortKeyFromIndex(embyBrowser_.sort);
         std::wstring sort = localSortName(std::max(0, localSortChoice(key)));
         if (key != emby::SortKey::Random) sort += embyBrowser_.descending ? L" \x2193" : L" \x2191";
         // Sort opens its drop-down; Thumbnails and All videos switch at once,
         // lit while they are on, as the Emby browser's filters do.
-        row.options = {L"Thumbnails", sort + L" \x25BE", L"All videos"};
-        row.buttonsOn = {embyBrowser_.view != 0, false, embyBrowser_.flat};
-        rows.push_back(std::move(row));
+        PanelRow& toolbar = add.buttons(SettingId::LocalToolbar, {L"Thumbnails", sort + L" \x25BE", L"All videos"});
+        toolbar.buttonsOn = {embyBrowser_.view != 0, false, embyBrowser_.flat};
     }
     // The folder, the way around and the view stay under the header while
     // the list scrolls, as in the Emby browser.
@@ -1349,16 +1309,16 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
     // none.
     const std::size_t folders = localListFlat_ ? 0 : localFolders_.size();
     const bool nothing = localList_.empty() && folders == 0;
-    if (localListLoading_) note(nothing ? L"Reading the folder\x2026" : L"Refreshing the folder\x2026");
+    if (localListLoading_) add.note(nothing ? L"Reading the folder\x2026" : L"Refreshing the folder\x2026");
     else if (!localListError_.empty()) {
-        note(localListError_ + (nothing ? std::wstring() : L" Showing the last successful list."));
+        add.note(localListError_ + (nothing ? std::wstring() : L" Showing the last successful list."));
         rows.back().alert = true;
         PanelRow retry;
         retry.kind = PanelRowKind::Buttons;
         retry.id = SettingId::LocalRetry;
         retry.options = {L"Retry"};
         rows.push_back(std::move(retry));
-    } else if (nothing) note(localListFlat_ ? L"No videos in this folder or its subfolders." : L"No videos in this folder.");
+    } else if (nothing) add.note(localListFlat_ ? L"No videos in this folder or its subfolders." : L"No videos in this folder.");
     if (!nothing) {
         std::wstring count;
         if (folders > 0) count = std::to_wstring(folders) + (folders == 1 ? L" folder" : L" folders");
@@ -1367,10 +1327,10 @@ std::vector<PanelRow> App::buildLocalRows(float sheetWidth, std::vector<PanelLis
             count += std::to_wstring(localList_.size()) + (localList_.size() == 1 ? L" video" : L" videos");
             if (localListFlat_) count += L", subfolders included";
         }
-        note(std::move(count));
+        add.note(std::move(count));
         if (localListCapped_) {
-            note(L"Only the first " + std::to_wstring(kLocalFlatLimit) +
-                 L" are listed. Open a folder further in for the rest.");
+            add.note(L"Only the first " + std::to_wstring(kLocalFlatLimit) +
+                     L" are listed. Open a folder further in for the rest.");
         }
     }
 

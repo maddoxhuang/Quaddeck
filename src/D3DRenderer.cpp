@@ -84,6 +84,28 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return videoTexture.Sample(videoSampler, uv);
 })";
 
+// ST 2084 (PQ): codes to absolute linear light in nits, and back. Put
+// before the source of every shader that works on a PQ picture
+// (withPqFunctions).
+constexpr char kPqFunctions[] = R"(
+float3 pqToNits(float3 code) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    float3 p = pow(saturate(code), 1.0 / m2);
+    return 10000.0 * pow(max(p - c1, 0.0) / max(c2 - c3 * p, 1e-6), 1.0 / m1);
+}
+float3 nitsToPq(float3 nits) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    float3 p = pow(saturate(nits / 10000.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+)";
+
+std::string withPqFunctions(const char* shader) {
+    return std::string(kPqFunctions) + shader;
+}
+
 // Software fallback remains SDR while the selected effect runs. This final
 // presentation pass maps its G22 / BT.709 RGB to absolute PQ / BT.2020. Merely
 // writing the original 8-bit codes into a PQ swap chain makes SDR white 10,000
@@ -99,10 +121,89 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         dot(linear709, float3(0.6274040, 0.3292820, 0.0433136)),
         dot(linear709, float3(0.0690970, 0.9195400, 0.0113612)),
         dot(linear709, float3(0.0163916, 0.0880132, 0.8955950)));
-    float3 p = pow(saturate(linear2020 * outputParams.x / 10000.0), 2610.0 / 16384.0);
-    float3 pq = pow((3424.0 / 4096.0 + 2413.0 / 128.0 * p) /
-                   (1.0 + 2392.0 / 128.0 * p), 2523.0 / 32.0);
-    return float4(pq, color.a);
+    return float4(nitsToPq(linear2020 * outputParams.x), color.a);
+})";
+
+// An HDR10 picture on an SDR output. The input is PQ-coded BT.2020 R'G'B',
+// the video processor's or a software frame's; the output is the G22 / BT.709
+// picture every SDR pass after it expects. The curve is BT.2390's EETF taken
+// from the stream's peak (toneParams.x) down to SDR white (toneParams.y, 203
+// nits): the picture below the knee keeps its brightness and the highlights
+// above it are rolled off into what is left, rather than cut. It is applied
+// to the largest of the three channels and the others follow in proportion,
+// so no channel clips and the hue stays. A colour BT.709 cannot show is
+// drawn toward its own luminance until it can.
+// An HLG picture comes the same way (toneParams.z): its codes are taken back
+// to scene light and through BT.2100's system gamma for a 1000-nit display
+// (1.2, on the luminance, so the hue stays), which gives nits as PQ's do.
+// On the PQ output (toneParams.w) that is all that is done to it: the nits
+// are coded as PQ and shown as an HDR10 picture is.
+// A full-range HDR surface on a card whose processor takes no full-range
+// BT.2020 input comes here undone with the BT.709 matrix, the one full-range
+// pair every processor has (toneOptions.x): the 709 matrix is put back and
+// BT.2020's applied, which is exact wherever the 709 picture did not leave
+// 0 to 1. What that card's 709 conversion was measured to add to each channel
+// (toneOptions.yzw) is taken off first. A PQ picture so mended for the PQ
+// output goes out as it is.
+constexpr char kToneMapShader[] = R"(
+Texture2D videoTexture : register(t0);
+SamplerState videoSampler : register(s0);
+cbuffer ToneMapParams : register(b0) { float4 toneParams; float4 toneOptions; };
+
+float3 bt709DecodeToBt2020(float3 rgb) {
+    float y = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    float cb = (rgb.b - y) / 1.8556;
+    float cr = (rgb.r - y) / 1.5748;
+    return float3(y + 1.4746 * cr, y - 0.16455312684366 * cb - 0.57135312684366 * cr, y + 1.8814 * cb);
+}
+
+float nitsToPq(float nits) {
+    return nitsToPq(float3(nits, nits, nits)).x;
+}
+
+float toneCurve(float nits) {
+    float sourcePeak = nitsToPq(toneParams.x);
+    float e = saturate(nitsToPq(nits) / sourcePeak);
+    float white = min(nitsToPq(toneParams.y) / sourcePeak, 1.0);
+    float knee = 1.5 * white - 0.5;
+    if (e > knee) {
+        float t = (e - knee) / max(1.0 - knee, 1e-6);
+        float t2 = t * t;
+        float t3 = t2 * t;
+        e = (2.0 * t3 - 3.0 * t2 + 1.0) * knee + (t3 - 2.0 * t2 + t) * (1.0 - knee) +
+            (3.0 * t2 - 2.0 * t3) * white;
+    }
+    return pqToNits(float3(e * sourcePeak, 0.0, 0.0)).x;
+}
+
+float3 hlgToNits(float3 code) {
+    const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
+    code = saturate(code);
+    float3 scene = code <= 0.5 ? code * code / 3.0 : (exp((code - c) / a) + b) / 12.0;
+    float luminance = dot(scene, float3(0.2627, 0.6780, 0.0593));
+    return 1000.0 * pow(max(luminance, 1e-9), 0.2) * scene;
+}
+
+float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
+    float3 code = videoTexture.Sample(videoSampler, uv).rgb;
+    if (toneOptions.x > 0.5) code = saturate(bt709DecodeToBt2020(code - toneOptions.yzw));
+    if (toneParams.w > 0.5 && toneParams.z < 0.5) return float4(code, 1.0);
+    float3 rgb = toneParams.z > 0.5 ? hlgToNits(code) : pqToNits(code);
+    if (toneParams.w > 0.5) return float4(nitsToPq(rgb), 1.0);
+    float peak = max(rgb.r, max(rgb.g, rgb.b));
+    if (peak > 1e-4) rgb *= toneCurve(peak) / peak;
+    float3 linear709 = float3(
+        dot(rgb, float3( 1.6604910, -0.5876411, -0.0728499)),
+        dot(rgb, float3(-0.1245505,  1.1328999, -0.0083494)),
+        dot(rgb, float3(-0.0181508, -0.1005789,  1.1187297))) / toneParams.y;
+    float luminance = saturate(dot(linear709, float3(0.2126, 0.7152, 0.0722)));
+    float low = min(linear709.r, min(linear709.g, linear709.b));
+    float high = max(linear709.r, max(linear709.g, linear709.b));
+    float keep = 1.0;
+    if (low < 0.0) keep = min(keep, luminance / (luminance - low));
+    if (high > 1.0) keep = min(keep, (1.0 - luminance) / (high - luminance));
+    linear709 = luminance + (linear709 - luminance) * keep;
+    return float4(pow(saturate(linear709), 1.0 / 2.2), 1.0);
 })";
 
 constexpr char kSharpenShader[] = R"(
@@ -119,11 +220,26 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     return float4(saturate(center.rgb), 1.0);
 })";
 
+// Grayscale and Invert are written for an SDR picture. One that is PQ BT.2020
+// (b2's colorSpace.x above a half: an HDR picture on the PQ output, or RTX
+// Video HDR's) is taken to nits first, so that grey is the picture's
+// luminance by BT.2020's weights rather than a weighting of its codes, and
+// the inverse of black is the display's SDR white (colorSpace.y, in nits),
+// what it is for an SDR picture beside it, rather than PQ's 10,000 nits.
+// Light above SDR white inverts to black.
+constexpr char kPresetColorSpace[] = R"(
+cbuffer PictureColorSpace : register(b2) { float4 colorSpace; };
+)";
+
 constexpr char kGrayscaleShader[] = R"(
 Texture2D videoTexture : register(t0);
 SamplerState videoSampler : register(s0);
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float4 color = videoTexture.Sample(videoSampler, uv);
+    if (colorSpace.x > 0.5) {
+        float nits = dot(pqToNits(color.rgb), float3(0.2627, 0.6780, 0.0593));
+        return float4(nitsToPq(float3(nits, nits, nits)), color.a);
+    }
     float gray = dot(color.rgb, float3(0.2126, 0.7152, 0.0722));
     return float4(gray, gray, gray, color.a);
 })";
@@ -133,6 +249,11 @@ Texture2D videoTexture : register(t0);
 SamplerState videoSampler : register(s0);
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
     float4 color = videoTexture.Sample(videoSampler, uv);
+    if (colorSpace.x > 0.5) {
+        float white = max(colorSpace.y, 1.0);
+        float3 code = pow(saturate(pqToNits(color.rgb) / white), 1.0 / 2.2);
+        return float4(nitsToPq(white * pow(1.0 - code, 2.2)), color.a);
+    }
     return float4(1.0 - color.rgb, color.a);
 })";
 
@@ -171,21 +292,8 @@ float3 smartVibrance(float3 color) {
     return saturate(luminance + chroma + chroma * gain);
 }
 
-// ST 2084, absolute linear RGB in nits. The SDR preset above stays unchanged.
-float3 pqToNits(float3 code) {
-    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
-    float3 p = pow(saturate(code), 1.0 / m2);
-    return 10000.0 * pow(max(p - c1, 0.0) / max(c2 - c3 * p, 1e-6), 1.0 / m1);
-}
-
-float3 nitsToPq(float3 nits) {
-    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
-    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
-    float3 p = pow(saturate(nits / 10000.0), m1);
-    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
-}
-
+// A PQ picture's vibrance is worked in absolute linear RGB in nits
+// (pqToNits); the SDR preset above stays unchanged.
 float3 hdrVibrance(float3 code) {
     // Avoid even PQ round-trip error at the neutral setting.
     if (intensity == 1.0) return code;
@@ -505,9 +613,18 @@ void D3DRenderer::releaseDeviceResources() {
     copyShader_.Reset();
     sdrToPqShader_.Reset();
     sdrToPqParams_.Reset();
+    toneMapShader_.Reset();
+    toneMapParams_.Reset();
+    loggedToneMap_ = -1;
+    pqRefusalLogged_ = false;
+    fullRangeHdrLogged_ = false;
+    full709_ = {};
+    hdrMetadata_ = {};
+    hdrPicture_ = HdrPicture::None;
     smartVibranceBuffer_.Reset();
     vibranceColorBuffer_.Reset();
     smartVibranceSelected_ = false;
+    pqAwarePreset_ = false;
     pixelParamsBuffer_.Reset();
     uvTransformBuffer_.Reset();
     vertexShader_.Reset();
@@ -543,6 +660,7 @@ void D3DRenderer::releaseDeviceResources() {
     enhancementStatus_.rtxHdrApplied = false;
     loggedSuperResolution_ = -1;
     loggedRtxHdr_ = -1;
+    superResolutionTenBitLogged_ = false;
     pendingWidth_ = 0;
     pendingHeight_ = 0;
     nextBackBufferRetry_ = {};
@@ -761,6 +879,7 @@ bool D3DRenderer::createDevice(HWND window) {
         videoContext1_.Reset();
     }
     probeVideoEnhancements();
+    probeProcessorRotation();
     refreshDisplayStatus();
     return true;
 }
@@ -913,6 +1032,31 @@ void D3DRenderer::probeVideoEnhancements() {
     appendDiagnostic(out.str());
 }
 
+void D3DRenderer::probeProcessorRotation() {
+    processorRotates_ = false;
+    if (!videoDevice_ || !videoContext_) return;
+    // As for the extensions, a throwaway processor's answer is the device's:
+    // a phone's 1080p stood upright.
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate = {60, 1};
+    content.InputWidth = 1920;
+    content.InputHeight = 1080;
+    content.OutputFrameRate = {60, 1};
+    content.OutputWidth = 1080;
+    content.OutputHeight = 1920;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
+    D3D11_VIDEO_PROCESSOR_CAPS caps{};
+    if (FAILED(videoDevice_->CreateVideoProcessorEnumerator(&content, &enumerator)) ||
+        FAILED(enumerator->GetVideoProcessorCaps(&caps))) {
+        return;
+    }
+    processorRotates_ = (caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION) != 0;
+    appendDiagnostic(std::string("Video processor: ") +
+                     (processorRotates_ ? "turns a picture itself" : "does not turn a picture; the pane's draw does"));
+}
+
 void D3DRenderer::refreshDisplayFactory(bool force) {
     if (!displayFactory_ || (!force && displayFactory_->IsCurrent())) return;
     Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
@@ -947,49 +1091,51 @@ void D3DRenderer::refreshDisplayStatus() {
     float sdrWhiteNits = 200.0F;
     const HMONITOR monitor = window_ ? MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST) : nullptr;
     std::wstring outputName;
-    if (adapter_ && monitor) {
-        for (UINT index = 0;; ++index) {
+    const auto findOn = [&](IDXGIAdapter* adapter) {
+        for (UINT index = 0; adapter; ++index) {
             Microsoft::WRL::ComPtr<IDXGIOutput> output;
-            if (adapter_->EnumOutputs(index, &output) != S_OK) break;
+            if (adapter->EnumOutputs(index, &output) != S_OK) break;
             Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
             DXGI_OUTPUT_DESC1 description{};
             if (FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&description)) ||
                 description.Monitor != monitor) continue;
             displayHdr = description.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
             outputName = description.DeviceName;
-            break;
+            return true;
+        }
+        return false;
+    };
+    // The display is an output of the card it is plugged into, which need
+    // not be the one the device is on: a laptop's panel hangs off its
+    // integrated card while a discrete one renders, and the device may be on
+    // an adapter with no outputs at all. The device's own card first, then
+    // every other.
+    bool otherAdapter = false;
+    if (monitor && !findOn(adapter_.Get()) && displayFactory_) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
+        for (UINT index = 0; displayFactory_->EnumAdapters1(index, candidate.ReleaseAndGetAddressOf()) == S_OK;
+             ++index) {
+            if (candidate.Get() != adapter_.Get() && findOn(candidate.Get())) {
+                otherAdapter = true;
+                break;
+            }
         }
     }
     // Windows' SDR white level for that output, the brightness it gives SDR
     // windows on an HDR display; the interface layer is drawn to match it.
     if (!outputName.empty()) {
-        UINT32 pathCount = 0;
-        UINT32 modeCount = 0;
-        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) == ERROR_SUCCESS) {
-            std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
-            std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
-            if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(),
-                                   &modeCount, modes.data(), nullptr) == ERROR_SUCCESS) {
-                for (UINT32 index = 0; index < pathCount; ++index) {
-                    DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
-                    source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-                    source.header.size = sizeof(source);
-                    source.header.adapterId = paths[index].sourceInfo.adapterId;
-                    source.header.id = paths[index].sourceInfo.id;
-                    if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
-                        outputName != source.viewGdiDeviceName) continue;
-                    DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
-                    white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-                    white.header.size = sizeof(white);
-                    white.header.adapterId = paths[index].targetInfo.adapterId;
-                    white.header.id = paths[index].targetInfo.id;
-                    if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) {
-                        // Reported in thousandths of the 80-nit reference.
-                        sdrWhiteNits = std::clamp(white.SDRWhiteLevel / 1000.0F * 80.0F, 80.0F, 1000.0F);
-                    }
-                    break;
-                }
+        for (const auto& display : activeDisplayPaths()) {
+            if (display.device != outputName) continue;
+            DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
+            white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            white.header.size = sizeof(white);
+            white.header.adapterId = display.path.targetInfo.adapterId;
+            white.header.id = display.path.targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) {
+                // Reported in thousandths of the 80-nit reference.
+                sdrWhiteNits = std::clamp(white.SDRWhiteLevel / 1000.0F * 80.0F, 80.0F, 1000.0F);
             }
+            break;
         }
     }
     if (displayHdr != enhancementStatus_.displayHdr ||
@@ -997,17 +1143,72 @@ void D3DRenderer::refreshDisplayStatus() {
         std::ostringstream out;
         out << "Display: " << narrow(outputName) << (displayHdr ? " HDR on" : " HDR off")
             << ", SDR white " << sdrWhiteNits << " nits";
+        if (otherAdapter) out << " (an output of another card than the one rendering)";
         appendDiagnostic(out.str());
     }
     enhancementStatus_.displayHdr = displayHdr;
     enhancementStatus_.sdrWhiteNits = sdrWhiteNits;
 }
 
+bool D3DRenderer::rtxHdrReady() const {
+    return enhancements_.rtxHdr && enhancementStatus_.nvidiaAdapter && enhancementStatus_.rtxHdrSupported;
+}
+
 bool D3DRenderer::wantHdrOutput() const {
-    // HDR presentation is the flip model's.
-    return enhancements_.rtxHdr && enhancementStatus_.nvidiaAdapter &&
-           enhancementStatus_.rtxHdrSupported && enhancementStatus_.displayHdr &&
-           videoContext1_ != nullptr && flipModel_;
+    // HDR presentation is the flip model's, and its processors name their
+    // colour spaces by DXGI type. An HDR video (HDR10 or HLG) is enough, on
+    // any card;
+    // RTX Video HDR asks for it for SDR video as well.
+    return hdrOutputWanted(enhancementStatus_.displayHdr, videoContext1_ != nullptr && flipModel_,
+                           rtxHdrReady(), hdrVideoShown_);
+}
+
+bool D3DRenderer::noteHdrVideo(bool shownNow) {
+    const auto now = std::chrono::steady_clock::now();
+    const bool held = hdrVideoHeld(shownNow, hdrVideoShown_,
+                                   std::chrono::duration<double>(now - hdrVideoLastShown_).count());
+    if (shownNow) hdrVideoLastShown_ = now;
+    const bool changed = held != hdrVideoShown_;
+    hdrVideoShown_ = held;
+    return changed;
+}
+
+void D3DRenderer::applyHdrMetadata(const HdrStaticMetadata& metadata) {
+    if (metadata == hdrMetadata_ || !swapChain_) return;
+    Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain4;
+    if (FAILED(swapChain_.As(&swapChain4))) return;
+    // Windows may or may not pass this on to the display (it composes the
+    // desktop itself unless the window is alone on an overlay plane); where
+    // it does, the display's own tone mapping starts from the film's levels
+    // rather than from a guess.
+    HRESULT hr;
+    if (metadata.present) {
+        DXGI_HDR_METADATA_HDR10 hdr10{};
+        for (int axis = 0; axis < 2; ++axis) {
+            hdr10.RedPrimary[axis] = metadata.red[axis];
+            hdr10.GreenPrimary[axis] = metadata.green[axis];
+            hdr10.BluePrimary[axis] = metadata.blue[axis];
+            hdr10.WhitePoint[axis] = metadata.white[axis];
+        }
+        hdr10.MaxMasteringLuminance = metadata.maxMasteringNits;
+        hdr10.MinMasteringLuminance = metadata.minMasteringTenThousandths;
+        hdr10.MaxContentLightLevel = metadata.maxContentNits;
+        hdr10.MaxFrameAverageLightLevel = metadata.maxFrameAverageNits;
+        hr = swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(hdr10), &hdr10);
+    } else {
+        hr = swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+    }
+    // Not asked again for the same picture whether or not it was taken.
+    hdrMetadata_ = metadata;
+    std::ostringstream out;
+    if (metadata.present) {
+        out << "HDR10 metadata: mastering " << metadata.maxMasteringNits << " nits, MaxCLL "
+            << metadata.maxContentNits << ", MaxFALL " << metadata.maxFrameAverageNits;
+    } else {
+        out << "HDR10 metadata: none";
+    }
+    if (FAILED(hr)) out << " (refused, 0x" << std::hex << static_cast<unsigned long>(hr) << ")";
+    appendDiagnostic(out.str());
 }
 
 bool D3DRenderer::wantTenBitOutput() const {
@@ -1021,15 +1222,20 @@ bool D3DRenderer::applyOutputMode() {
     const bool current = wanted == hdrOutput_ && tenBit == tenBitOutput_;
     // recover() holds the latch up while it builds; its new chain switches
     // here as a first one does.
+    if (!wanted) pqRefusalLogged_ = false;
     if (current || !swapChain_ || (deviceLost_ && !deviceRebuildInProgress_)) return current;
+    // A refusal is said once: with an HDR10 video on screen this is asked
+    // again every couple of seconds.
+    const auto refused = [&](const char* why) {
+        if (!pqRefusalLogged_) appendDiagnostic(why);
+        pqRefusalLogged_ = true;
+        return false;
+    };
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain3;
     if (FAILED(swapChain_.As(&swapChain3))) {
         // 10-bit sRGB is the chain's colour space without being told; PQ
         // has to be told.
-        if (wanted) {
-            appendDiagnostic("RTX Video HDR: swap chain has no colour-space control; staying 8-bit");
-            return false;
-        }
+        if (wanted) return refused("HDR output: swap chain has no colour-space control; staying SDR");
     }
     const DXGI_FORMAT format = wanted || tenBit ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
     const DXGI_COLOR_SPACE_TYPE colorSpace = wanted
@@ -1037,8 +1243,7 @@ bool D3DRenderer::applyOutputMode() {
     UINT support = 0;
     if (wanted && (FAILED(swapChain3->CheckColorSpaceSupport(colorSpace, &support)) ||
                    !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))) {
-        appendDiagnostic("RTX Video HDR: the swap chain cannot present PQ here; staying 8-bit");
-        return false;
+        return refused("HDR output: the swap chain cannot present PQ here; staying SDR");
     }
     context_->OMSetRenderTargets(0, nullptr, nullptr);
     renderTarget_.Reset();
@@ -1058,14 +1263,19 @@ bool D3DRenderer::applyOutputMode() {
     hdrOutput_ = wanted;
     tenBitOutput_ = tenBit;
     enhancementStatus_.hdrOutput = wanted;
+    pqRefusalLogged_ = false;
+    loggedToneMap_ = -1;
+    // The chain's new buffers have been told nothing.
+    hdrMetadata_ = {};
     // Every slot's output texture and processor were built for the old format.
     dropSlots();
     // The chain has switched either way; render() tries again for a target
     // that could not be made on its new buffers.
     const bool targetMade = createBackBuffer();
     if (!targetMade) nextBackBufferRetry_ = std::chrono::steady_clock::now() + kBackBufferRetryInterval;
-    appendDiagnostic(wanted ? "Output: 10-bit PQ (RTX Video HDR)" : tenBit ? "Output: 10-bit sRGB"
-                                                                           : "Output: 8-bit sRGB");
+    appendDiagnostic(wanted ? (rtxHdrReady() ? "Output: 10-bit PQ (RTX Video HDR)"
+                                             : "Output: 10-bit PQ (HDR video)")
+                            : tenBit ? "Output: 10-bit sRGB" : "Output: 8-bit sRGB");
     return targetMade;
 }
 
@@ -1127,24 +1337,31 @@ VideoRendererStatus D3DRenderer::rendererStatus() const {
     status.flipModel = flipModel_;
     status.tenBitOutput = tenBitOutput_;
     status.hdrOutput = hdrOutput_;
+    status.hdrPicture = hdrPicture_;
     return status;
 }
 
 void D3DRenderer::applyStreamExtensions(std::size_t slot, bool hdrSource) {
     auto& target = slots_[slot];
     target.rtxHdrApplied = false;
+    target.superResolutionApplied = false;
     if (!enhancementStatus_.nvidiaAdapter) return;
     // Super Resolution upscales; asked for on a stream shown at or below
     // its own size the driver still runs its network and, at 4K60, that
     // alone can take most of a frame. So it is set only when the processor
     // magnifies, and a source shown at its own size is left alone.
-    const bool magnifies = target.outputWidth > target.inputWidth || target.outputHeight > target.inputHeight;
+    // A picture the processor turns onto its side comes out the other way
+    // round.
+    const bool sideways = turnedSideways(target.turned);
+    const bool magnifies = target.outputWidth > (sideways ? target.inputHeight : target.inputWidth) ||
+                           target.outputHeight > (sideways ? target.inputWidth : target.inputHeight);
     if (enhancements_.superResolution && enhancementStatus_.superResolutionSupported && magnifies) {
         NvidiaSuperResolutionExtension extension{};
         extension.enable = 1;
         const HRESULT hr = videoContext_->VideoProcessorSetStreamExtension(
             target.processor.Get(), 0, &kNvidiaSuperResolutionInterface, sizeof(extension), &extension);
         enhancementStatus_.superResolutionApplied = SUCCEEDED(hr);
+        target.superResolutionApplied = SUCCEEDED(hr);
         const int outcome = SUCCEEDED(hr) ? 1 : 0;
         if (outcome != loggedSuperResolution_) {
             loggedSuperResolution_ = outcome;
@@ -1169,7 +1386,8 @@ void D3DRenderer::applyStreamExtensions(std::size_t slot, bool hdrSource) {
         loggedSuperResolution_ = -1;
     }
     // RTX Video HDR only makes sense with a PQ output to write into, and
-    // only for an SDR stream; an HDR10 stream is passed through as it is.
+    // only for an SDR stream; an HDR10 stream is passed through as it is and
+    // an HLG one is made PQ by the renderer's own pass.
     if (hdrOutput_ && enhancements_.rtxHdr && !hdrSource) {
         NvidiaTrueHdrExtension extension{};
         extension.enable = 1;
@@ -1186,11 +1404,11 @@ void D3DRenderer::applyStreamExtensions(std::size_t slot, bool hdrSource) {
             if (!outcome) out << " (0x" << std::hex << static_cast<unsigned long>(hr) << ")";
             appendDiagnostic(out.str());
         }
-    } else if (hdrOutput_) {
+    } else if (hdrOutput_ && hdrSource) {
         enhancementStatus_.rtxHdrApplied = false;
         if (loggedRtxHdr_ != 2) {
             loggedRtxHdr_ = 2;
-            appendDiagnostic("HDR10 source passed through as PQ; RTX Video HDR not applied to it");
+            appendDiagnostic("HDR source shown as PQ; RTX Video HDR not applied to it");
         }
     } else {
         enhancementStatus_.rtxHdrApplied = false;
@@ -1269,11 +1487,19 @@ bool D3DRenderer::createPipeline() {
     }
     if (!compilePixelShader(kPixelShader, sizeof(kPixelShader) - 1, "QuadDeckPS")) return false;
     copyShader_ = pixelShader_;
-    if (!compilePixelShader(kSdrToPqShader, sizeof(kSdrToPqShader) - 1, "SdrToPq")) return false;
+    const std::string sdrToPq = withPqFunctions(kSdrToPqShader);
+    if (!compilePixelShader(sdrToPq.data(), sdrToPq.size(), "SdrToPq")) return false;
     sdrToPqShader_ = pixelShader_;
+    const std::string toneMap = withPqFunctions(kToneMapShader);
+    if (!compilePixelShader(toneMap.data(), toneMap.size(), "ToneMap")) return false;
+    toneMapShader_ = pixelShader_;
     pixelShader_ = copyShader_;
     hr = device_->CreateBuffer(&vibranceDescription, nullptr, &sdrToPqParams_);
     if (FAILED(hr)) { setError("Create SDR presentation parameter buffer", hr); return false; }
+    D3D11_BUFFER_DESC toneMapDescription = vibranceDescription;
+    toneMapDescription.ByteWidth = sizeof(float) * 8;
+    hr = device_->CreateBuffer(&toneMapDescription, nullptr, &toneMapParams_);
+    if (FAILED(hr)) { setError("Create tone-map parameter buffer", hr); return false; }
     hr = device_->CreateBuffer(&vibranceDescription, nullptr, &vibranceColorBuffer_);
     if (FAILED(hr)) { setError("Create Vibrance colour-space buffer", hr); return false; }
     {
@@ -1364,17 +1590,21 @@ bool D3DRenderer::compilePixelShader(const char* source, std::size_t length, con
         else setError("D3DCompile(pixel)", hr);
         return false;
     }
+    return installPixelShader(blob.Get(), "CreatePixelShader");
+}
+
+bool D3DRenderer::installPixelShader(ID3DBlob* blob, const char* what) {
     std::scoped_lock lock(deviceMutex_);
     if (!device_ || (deviceLost_ && !deviceRebuildInProgress_)) {
         error_ = "Cannot create pixel shader while graphics device is unavailable";
         return false;
     }
     Microsoft::WRL::ComPtr<ID3D11PixelShader> shader;
-    const HRESULT createResult = device_->CreatePixelShader(
-        blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &shader);
-    if (FAILED(createResult)) { setError("CreatePixelShader", createResult); return false; }
+    const HRESULT hr = device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &shader);
+    if (FAILED(hr)) { setError(what, hr); return false; }
     pixelShader_ = std::move(shader);
     smartVibranceSelected_ = false;
+    pqAwarePreset_ = false;
     effectShaderActive_ = true;
     error_.clear();
     return true;
@@ -1384,14 +1614,21 @@ bool D3DRenderer::setShaderPreset(ShaderPreset preset) {
     std::scoped_lock lock(deviceMutex_);
     switch (preset) {
     case ShaderPreset::Sharpen: return compilePixelShader(kSharpenShader, sizeof(kSharpenShader) - 1, "Sharpen");
-    case ShaderPreset::Grayscale: return compilePixelShader(kGrayscaleShader, sizeof(kGrayscaleShader) - 1, "Grayscale");
-    case ShaderPreset::Invert: return compilePixelShader(kInvertShader, sizeof(kInvertShader) - 1, "Invert");
-    case ShaderPreset::SmartVibrancePlus:
-        if (!compilePixelShader(kSmartVibrancePlusShader,
-                                sizeof(kSmartVibrancePlusShader) - 1,
-                                "SmartVibrancePlus")) return false;
+    case ShaderPreset::Grayscale:
+    case ShaderPreset::Invert: {
+        const std::string source = withPqFunctions(kPresetColorSpace) +
+            (preset == ShaderPreset::Grayscale ? kGrayscaleShader : kInvertShader);
+        if (!compilePixelShader(source.data(), source.size(),
+                                preset == ShaderPreset::Grayscale ? "Grayscale" : "Invert")) return false;
+        pqAwarePreset_ = true;
+        return true;
+    }
+    case ShaderPreset::SmartVibrancePlus: {
+        const std::string source = withPqFunctions(kSmartVibrancePlusShader);
+        if (!compilePixelShader(source.data(), source.size(), "SmartVibrancePlus")) return false;
         smartVibranceSelected_ = true;
         return true;
+    }
     default:
         if (!compilePixelShader(kPixelShader, sizeof(kPixelShader) - 1, "Normal")) return false;
         // The plain copy: the output pass reads the converted picture itself.
@@ -1483,25 +1720,12 @@ bool D3DRenderer::compilePixelShaderFile(const std::wstring& path) {
         error_ = std::move(refusal);
         return false;
     }
-    std::scoped_lock lock(deviceMutex_);
-    if (!device_ || (deviceLost_ && !deviceRebuildInProgress_)) {
-        error_ = "Cannot create pixel shader while graphics device is unavailable";
-        return false;
-    }
-    Microsoft::WRL::ComPtr<ID3D11PixelShader> shader;
-    const HRESULT createResult = device_->CreatePixelShader(
-        blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &shader);
-    if (FAILED(createResult)) { setError("Create external pixel shader", createResult); return false; }
-    pixelShader_ = std::move(shader);
-    smartVibranceSelected_ = false;
-    effectShaderActive_ = true;
-    error_.clear();
-    return true;
+    return installPixelShader(blob.Get(), "Create external pixel shader");
 }
 
 void D3DRenderer::bindVibranceColorSpace(std::size_t slot) {
     ID3D11Buffer* buffer = nullptr;
-    if (smartVibranceSelected_) {
+    if (smartVibranceSelected_ || pqAwarePreset_) {
         const auto& target = slots_[slot];
         // Under HDR output a 10-bit slot is the PQ one: 10-bit SDR output
         // is never on with it.
@@ -1509,7 +1733,8 @@ void D3DRenderer::bindVibranceColorSpace(std::size_t slot) {
             (target.hardware && target.outputFormat == DXGI_FORMAT_R10G10B10A2_UNORM));
         const float mode = !pq ? 0.0F :
             (target.rtxHdrApplied && !target.hdrSource ? 1.0F : 2.0F);
-        const float values[] = {mode, 0.0F, 0.0F, 0.0F};
+        // Grayscale and Invert read the display's SDR white beside it.
+        const float values[] = {mode, std::clamp(enhancementStatus_.sdrWhiteNits, 80.0F, 1000.0F), 0.0F, 0.0F};
         context_->UpdateSubresource(vibranceColorBuffer_.Get(), 0, nullptr, values, 0, 0);
         buffer = vibranceColorBuffer_.Get();
     }
@@ -1660,14 +1885,26 @@ bool D3DRenderer::createSlotResources(
     const int outputWidth = requested.width;
     const int outputHeight = requested.height;
     const auto color = videoColorDescription(frame.ownerFrame, frame.width, frame.height);
-    const bool hdrSource = hdrOutput_ && color.pq;
+    const bool hdrSource = hdrOutput_ && color.hdr();
+    // An HDR picture on an SDR output: the processor makes BT.2020 RGB of it,
+    // its PQ or HLG codes kept, and the tone-map pass brings that down to
+    // SDR. An HLG one on the PQ output goes the same way to be made PQ.
+    const bool toneMapAsked = !hdrOutput_ && color.hdr() && videoContext1_ && toneMapShader_;
+    const bool hlgToPq = hdrOutput_ && color.hlg && toneMapShader_;
+    const bool fullRangeHdr = color.hdr() && color.fullRange;
     const bool deinterlace = videoOutput_.deinterlace != VideoDeinterlace::Off;
     const bool interlacedFrame = deinterlace && frame.ownerFrame &&
                                  (frame.ownerFrame->flags & AV_FRAME_FLAG_INTERLACED);
+    // The processor stands a picture stored on its side or on its head
+    // upright where it can: `requested` is then the upright picture's size.
+    const int turns = processorTurns(frame);
     if (target.texture && target.inputWidth == frame.width && target.inputHeight == frame.height &&
+        target.turned == turns &&
         target.inputFormat == inputDescription.Format && target.outputWidth == outputWidth &&
         target.outputHeight == outputHeight && target.hdrOutputMode == hdrOutput_ &&
         target.tenBitOutputMode == tenBitOutput_ && target.hdrSource == hdrSource &&
+        target.toneMapAsked == toneMapAsked && target.hlg == color.hlg &&
+        target.fullRangeHdr == fullRangeHdr &&
         (target.interlaced || !interlacedFrame)) {
         return true;
     }
@@ -1719,10 +1956,14 @@ bool D3DRenderer::createSlotResources(
     hr = videoDevice_->CreateVideoProcessor(target.enumerator.Get(), rateConversion, &target.processor);
     if (FAILED(hr)) { setError("CreateVideoProcessor", hr); return false; }
     if (interlaced) {
-        // One picture out for each frame in, its two fields woven together
-        // as the processor sees fit; the frame's own time shows it.
+        // Two pictures out for each frame in, one of each field, asked for
+        // one at a time (convertSurface): the first for the first half of
+        // the frame's time and the second for the rest. Until 2026-11-24
+        // the rate was the half one, a single picture for the frame (its
+        // first field, from the two drivers tried), and a 50i recording
+        // moved 25 times a second.
         videoContext_->VideoProcessorSetStreamOutputRate(
-            target.processor.Get(), 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_HALF, FALSE, nullptr);
+            target.processor.Get(), 0, D3D11_VIDEO_PROCESSOR_OUTPUT_RATE_NORMAL, FALSE, nullptr);
         if (newlyInterlaced) {
             std::ostringstream out;
             out << "Deinterlacing pane " << (slot + 1) << ": " << frame.width << "x" << frame.height
@@ -1730,6 +1971,16 @@ bool D3DRenderer::createSlotResources(
             appendDiagnostic(out.str());
         }
     }
+    // D3D11's rotations are quarter turns clockwise, as quarterTurns counts
+    // them. What the driver then draws into the output, such as RTX Video's
+    // status indicator, is upright with the picture.
+    if (turns != 0) {
+        constexpr D3D11_VIDEO_PROCESSOR_ROTATION rotations[] = {
+            D3D11_VIDEO_PROCESSOR_ROTATION_IDENTITY, D3D11_VIDEO_PROCESSOR_ROTATION_90,
+            D3D11_VIDEO_PROCESSOR_ROTATION_180, D3D11_VIDEO_PROCESSOR_ROTATION_270};
+        videoContext_->VideoProcessorSetStreamRotation(target.processor.Get(), 0, TRUE, rotations[turns]);
+    }
+    target.turned = turns;
     target.interlaced = interlaced;
     target.inputWidth = frame.width;
     target.inputHeight = frame.height;
@@ -1755,9 +2006,53 @@ bool D3DRenderer::createSlotResources(
     // The 10-bit SDR output keeps a 10-bit stream's depth to the back buffer
     // where the processor can write it; 8-bit where it cannot, which is no
     // error: the picture is whole either way.
-    const bool canFallBack = !pqOutput && tenBitOutput_;
-    DXGI_FORMAT outputFormat = pqOutput || tenBitOutput_ ? DXGI_FORMAT_R10G10B10A2_UNORM
-                                                         : DXGI_FORMAT_B8G8R8A8_UNORM;
+    // A card whose processor does not turn PQ into PQ RGB leaves the HDR10
+    // picture to the 709 approximation below, as before there was a pass.
+    const bool toneMap = toneMapAsked && processorConvertsPq(target.enumerator.Get(), inputDescription.Format);
+    if (toneMapAsked) {
+        const int outcome = (toneMap ? 1 : 0) + (color.hlg ? 2 : 0);
+        if (outcome != loggedToneMap_) {
+            loggedToneMap_ = outcome;
+            appendDiagnostic(std::string(color.hlg ? "HLG" : "HDR10") +
+                (toneMap ? " on an SDR output: tone-mapped to SDR"
+                         : " on an SDR output: this card's video processor does not convert PQ; "
+                           "shown through the BT.709 approximation"));
+        }
+    }
+    // A full-range HDR surface is undone as full range by the processor's
+    // BT.2020 pair where it has one, else by its BT.709 pair with the matrix
+    // mended in the pass after it.
+    bool rematrix = false;
+    if (pqOutput || toneMap) {
+        target.chromaTopLeftInput = processorConverts(target.enumerator.Get(), inputDescription.Format,
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        if (fullRangeHdr) {
+            target.fullRangeHdrInput = processorConverts(target.enumerator.Get(), inputDescription.Format,
+                DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020);
+            rematrix = !target.fullRangeHdrInput && toneMapShader_ &&
+                processorConverts(target.enumerator.Get(), inputDescription.Format,
+                    DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) &&
+                measureFullRange709(target, inputDescription.Format);
+        }
+    }
+    // The pass after the processor: to SDR, an HLG picture to PQ, or that
+    // matrix.
+    const bool transferPass = toneMap || hlgToPq || rematrix;
+    // With Super Resolution running, NVIDIA's driver writes a 10-bit RGB
+    // output as PQ, the SDR picture at the display's SDR white, whatever
+    // colour space the processor is told; the SDR chain then shows those
+    // codes as a flat grey picture. Its 8-bit output stays SDR. Measured on
+    // an RTX 4060 Ti with Windows HDR on (2026-11-26), legacy and DXGI colour
+    // spaces alike.
+    const bool tenBitSdr = tenBitOutput_ && !target.superResolutionApplied;
+    if (tenBitOutput_ && target.superResolutionApplied && !superResolutionTenBitLogged_) {
+        superResolutionTenBitLogged_ = true;
+        appendDiagnostic("RTX Super Resolution on the 10-bit SDR output: its pane's picture is 8-bit, "
+                         "the driver writes 10-bit as PQ");
+    }
+    const bool canFallBack = !pqOutput && !toneMap && tenBitSdr;
+    DXGI_FORMAT outputFormat = pqOutput || toneMap || tenBitSdr ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                                                : DXGI_FORMAT_B8G8R8A8_UNORM;
     if (!outputSupported(outputFormat, !canFallBack)) {
         if (!canFallBack) return false;
         outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1773,22 +2068,196 @@ bool D3DRenderer::createSlotResources(
     outputDescription.SampleDesc.Count = 1;
     outputDescription.Usage = D3D11_USAGE_DEFAULT;
     outputDescription.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    hr = device_->CreateTexture2D(&outputDescription, nullptr, &target.texture);
+    // The processor writes the picture every later pass reads, or, to be
+    // tone-mapped or made PQ, the picture that pass reads.
+    auto& processed = transferPass ? target.source : target.texture;
+    auto& processedView = transferPass ? target.sourceView : target.view;
+    hr = device_->CreateTexture2D(&outputDescription, nullptr, &processed);
     if (FAILED(hr)) { setError("Create zero-copy output texture", hr); return false; }
-    hr = device_->CreateShaderResourceView(target.texture.Get(), nullptr, &target.view);
+    hr = device_->CreateShaderResourceView(processed.Get(), nullptr, &processedView);
     if (FAILED(hr)) { setError("Create output shader view", hr); return false; }
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDescription{};
     outputViewDescription.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     outputViewDescription.Texture2D.MipSlice = 0;
     hr = videoDevice_->CreateVideoProcessorOutputView(
-        target.texture.Get(), target.enumerator.Get(), &outputViewDescription, &target.outputView);
+        processed.Get(), target.enumerator.Get(), &outputViewDescription, &target.outputView);
     if (FAILED(hr)) { setError("CreateVideoProcessorOutputView", hr); return false; }
+    if (transferPass && !createToneMapTarget(slot, outputWidth, outputHeight)) {
+        // Without its picture the slot is not one: the next frame builds it again.
+        target.texture.Reset();
+        return false;
+    }
     target.inputFormat = inputDescription.Format;
     target.outputFormat = outputFormat;
     target.pqOutput = pqOutput;
     target.hdrSource = hdrSource;
     target.hdrOutputMode = hdrOutput_;
     target.tenBitOutputMode = tenBitOutput_;
+    target.toneMapAsked = toneMapAsked;
+    target.toneMapped = toneMap;
+    target.hlg = color.hlg;
+    target.hlgToPq = hlgToPq;
+    target.fullRangeHdr = fullRangeHdr;
+    target.rematrix = rematrix;
+    return true;
+}
+
+bool D3DRenderer::processorConvertsPq(ID3D11VideoProcessorEnumerator* enumerator, DXGI_FORMAT input) {
+    return processorConverts(enumerator, input, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+                             DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+}
+
+bool D3DRenderer::processorConverts(ID3D11VideoProcessorEnumerator* enumerator, DXGI_FORMAT input,
+                                    DXGI_COLOR_SPACE_TYPE inputSpace, DXGI_COLOR_SPACE_TYPE outputSpace) {
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator1> enumerator1;
+    if (!enumerator || FAILED(enumerator->QueryInterface(IID_PPV_ARGS(&enumerator1)))) return false;
+    BOOL supported = FALSE;
+    return SUCCEEDED(enumerator1->CheckVideoProcessorFormatConversion(
+               input, inputSpace, DXGI_FORMAT_R10G10B10A2_UNORM, outputSpace, &supported)) &&
+           supported;
+}
+
+bool D3DRenderer::measureFullRange709(SlotTexture& target, DXGI_FORMAT format) {
+    if (!videoContext1_ || (format != DXGI_FORMAT_NV12 && format != DXGI_FORMAT_P010)) return false;
+    const bool deep = format == DXGI_FORMAT_P010;
+    auto& known = full709_[deep ? 1 : 0];
+    if (known.measured) {
+        target.rematrixOffset = known.offset;
+        return known.usable;
+    }
+    known.measured = true;
+    // A ramp of neutral greys, one a column: each rounds differently into
+    // the 10-bit result, so their mean stands well inside one step of it.
+    constexpr int columns = 64, rows = 16;
+    const int sample = deep ? 2 : 1;
+    const auto grey = [&](int column) { return deep ? 384 + column * 4 : 96 + column; };
+    std::vector<std::uint8_t> planes(static_cast<std::size_t>(columns) * sample * rows * 3 / 2);
+    const auto put = [&](int row, int index, int value) {
+        auto* at = planes.data() + (static_cast<std::size_t>(row) * columns + index) * sample;
+        if (deep) {
+            const auto word = static_cast<std::uint16_t>(value << 6);
+            std::memcpy(at, &word, sizeof(word));
+        } else {
+            *at = static_cast<std::uint8_t>(value);
+        }
+    };
+    for (int row = 0; row < rows; ++row)
+        for (int column = 0; column < columns; ++column) put(row, column, grey(column));
+    for (int row = rows; row < rows * 3 / 2; ++row)
+        for (int index = 0; index < columns; ++index) put(row, index, deep ? 512 : 128);
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = columns;
+    description.Height = rows;
+    description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
+    description.Format = format;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET;
+    D3D11_SUBRESOURCE_DATA data{};
+    data.pSysMem = planes.data();
+    data.SysMemPitch = static_cast<UINT>(columns * sample);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> input, output, staging;
+    if (FAILED(device_->CreateTexture2D(&description, &data, &input))) return false;
+    description.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (FAILED(device_->CreateTexture2D(&description, nullptr, &output))) return false;
+    description.Usage = D3D11_USAGE_STAGING;
+    description.BindFlags = 0;
+    description.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device_->CreateTexture2D(&description, nullptr, &staging))) return false;
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDescription{};
+    inputDescription.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> inputView;
+    if (FAILED(videoDevice_->CreateVideoProcessorInputView(
+            input.Get(), target.enumerator.Get(), &inputDescription, &inputView))) return false;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDescription{};
+    outputDescription.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> outputView;
+    if (FAILED(videoDevice_->CreateVideoProcessorOutputView(
+            output.Get(), target.enumerator.Get(), &outputDescription, &outputView))) return false;
+    // Everything set here is set again for each frame (convertSurface).
+    ID3D11VideoProcessor* processor = target.processor.Get();
+    videoContext1_->VideoProcessorSetStreamColorSpace1(processor, 0, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709);
+    videoContext1_->VideoProcessorSetOutputColorSpace1(processor, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    videoContext_->VideoProcessorSetStreamAutoProcessingMode(processor, 0, FALSE);
+    videoContext_->VideoProcessorSetStreamFrameFormat(processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    const RECT whole{0, 0, columns, rows};
+    videoContext_->VideoProcessorSetStreamSourceRect(processor, 0, TRUE, &whole);
+    videoContext_->VideoProcessorSetStreamDestRect(processor, 0, TRUE, &whole);
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = inputView.Get();
+    if (FAILED(videoContext_->VideoProcessorBlt(processor, outputView.Get(), 0, 1, &stream))) return false;
+    context_->CopyResource(staging.Get(), output.Get());
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+    std::array<double, 3> sum{};
+    const auto* row = static_cast<const std::uint8_t*>(mapped.pData) +
+                      static_cast<std::size_t>(rows / 2) * mapped.RowPitch;
+    for (int column = 0; column < columns; ++column) {
+        std::uint32_t packed{};
+        std::memcpy(&packed, row + column * 4, sizeof(packed));
+        const double expected = deep ? grey(column) / 1023.0 : grey(column) / 255.0;
+        for (int channel = 0; channel < 3; ++channel) {
+            sum[channel] += ((packed >> (10 * channel)) & 1023U) / 1023.0 - expected;
+        }
+    }
+    context_->Unmap(staging.Get(), 0);
+    known.usable = true;
+    for (int channel = 0; channel < 3; ++channel) {
+        known.offset[channel] = static_cast<float>(sum[channel] / columns);
+        // More than this is not a rounding of constants but another
+        // conversion altogether, which an offset does not mend.
+        if (std::abs(known.offset[channel]) > 0.02F) known.usable = false;
+    }
+    target.rematrixOffset = known.offset;
+    return known.usable;
+}
+
+bool D3DRenderer::createToneMapTarget(std::size_t slot, int width, int height) {
+    auto& target = slots_[slot];
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = static_cast<UINT>(width);
+    description.Height = static_cast<UINT>(height);
+    description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
+    // Deep enough that the roll-off's gradients do not band in a 10-bit output.
+    description.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    HRESULT hr = device_->CreateTexture2D(&description, nullptr, &target.texture);
+    if (SUCCEEDED(hr)) hr = device_->CreateShaderResourceView(target.texture.Get(), nullptr, &target.view);
+    if (SUCCEEDED(hr)) hr = device_->CreateRenderTargetView(target.texture.Get(), nullptr, &target.toneMapTarget);
+    if (FAILED(hr)) {
+        setError("Create tone-map texture", hr);
+        target.toneMapTarget.Reset();
+        target.view.Reset();
+        target.texture.Reset();
+        return false;
+    }
+    return true;
+}
+
+bool D3DRenderer::runToneMapPass(std::size_t slot, float peakNits) {
+    auto& target = slots_[slot];
+    if (!target.sourceView || !target.toneMapTarget || !toneMapShader_) {
+        error_ = "No tone-map pass for this picture";
+        return false;
+    }
+    beginFullscreenPass(target.outputWidth, target.outputHeight);
+    // The pass writes PQ where the slot is not brought down to SDR: an HLG
+    // picture made PQ, or a full-range one whose matrix is mended.
+    const bool toPq = target.hlgToPq || (target.rematrix && !target.toneMapped);
+    const float params[] = {std::clamp(peakNits, kHdrReferenceWhiteNits, 10000.0F), kHdrReferenceWhiteNits,
+                            target.hlg ? 1.0F : 0.0F, toPq ? 1.0F : 0.0F,
+                            target.rematrix ? 1.0F : 0.0F, target.rematrixOffset[0], target.rematrixOffset[1],
+                            target.rematrixOffset[2]};
+    context_->UpdateSubresource(toneMapParams_.Get(), 0, nullptr, params, 0, 0);
+    context_->PSSetConstantBuffers(0, 1, toneMapParams_.GetAddressOf());
+    context_->PSSetShader(toneMapShader_.Get(), nullptr, 0);
+    context_->OMSetRenderTargets(1, target.toneMapTarget.GetAddressOf(), nullptr);
+    context_->PSSetShaderResources(0, 1, target.sourceView.GetAddressOf());
+    context_->Draw(4, 0);
+    ID3D11ShaderResourceView* empty = nullptr;
+    context_->PSSetShaderResources(0, 1, &empty);
+    context_->OMSetRenderTargets(0, nullptr, nullptr);
     return true;
 }
 
@@ -1798,15 +2267,47 @@ bool D3DRenderer::convertSurface(
     if (!createSlotResources(slot, frame, requested)) return false;
     // Metadata belongs to each decoded frame, not the cached texture geometry.
     const auto color = videoColorDescription(frame.ownerFrame, frame.width, frame.height);
-    if (target.pqOutput) {
+    if (target.pqOutput || target.toneMapped) {
         // The PQ output mode names the spaces by DXGI type: an HDR10 stream is
         // handed over as PQ BT.2020 and passed through, anything else as the
         // SDR space it is and left to RTX Video HDR to expand. A BT.2020 SDR
         // stream is the one case the 8-bit path approximates that this one
-        // converts properly.
+        // converts properly. A slot to be tone-mapped is an HDR10 stream
+        // made PQ RGB the same way, on an SDR output.
+        // An HLG stream is handed over as PQ too: with the same transfer
+        // named on both sides the processor leaves the codes' curve alone
+        // and only undoes the matrix, and the pass after it reads HLG. A
+        // full-range HDR stream has no DXGI type of its own; it is named
+        // gamma 2.2 on both sides for the same reason, where the processor
+        // takes that. Where it does not, the full-range BT.709 pair undoes
+        // the range and the pass after it mends the matrix (`rematrix`).
+        // With neither it goes as limited range, too contrasty, which the
+        // log says once.
         DXGI_COLOR_SPACE_TYPE inputSpace;
-        if (color.pq) {
-            inputSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+        DXGI_COLOR_SPACE_TYPE outputSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        if (color.hdr() && color.fullRange && target.fullRangeHdrInput) {
+            inputSpace = DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020;
+            outputSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+        } else if (color.hdr() && color.fullRange && target.rematrix) {
+            inputSpace = DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709;
+            outputSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            if (!fullRangeHdrLogged_) {
+                fullRangeHdrLogged_ = true;
+                std::ostringstream out;
+                out << "Full-range HDR video: undone with the video processor's full-range BT.709 pair, its "
+                       "matrix mended afterwards; measured offsets " << target.rematrixOffset[0] << ' '
+                    << target.rematrixOffset[1] << ' ' << target.rematrixOffset[2];
+                appendDiagnostic(out.str());
+            }
+        } else if (color.hdr()) {
+            inputSpace = color.chromaTopLeft && target.chromaTopLeftInput
+                ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_TOPLEFT_P2020
+                : DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+            if (color.fullRange && !fullRangeHdrLogged_) {
+                fullRangeHdrLogged_ = true;
+                appendDiagnostic("Full-range HDR video: this card's video processor takes it only as limited "
+                                 "range; black and white are a little off");
+            }
         } else if (color.bt2020) {
             inputSpace = color.fullRange ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
                                          : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
@@ -1818,8 +2319,7 @@ bool D3DRenderer::convertSurface(
                                          : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
         }
         videoContext1_->VideoProcessorSetStreamColorSpace1(target.processor.Get(), 0, inputSpace);
-        videoContext1_->VideoProcessorSetOutputColorSpace1(
-            target.processor.Get(), DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        videoContext1_->VideoProcessorSetOutputColorSpace1(target.processor.Get(), outputSpace);
     } else {
         D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColor{};
         inputColor.YCbCr_Matrix = color.matrix == VideoColorMatrix::Bt709 ? 1 : 0;
@@ -1857,28 +2357,63 @@ bool D3DRenderer::convertSurface(
     videoContext_->VideoProcessorSetStreamFrameFormat(target.processor.Get(), 0, frameFormat);
     videoContext_->VideoProcessorSetStreamSourceRect(target.processor.Get(), 0, TRUE, &source);
     videoContext_->VideoProcessorSetStreamDestRect(target.processor.Get(), 0, TRUE, &destination);
+    // Which of an interlaced frame's two pictures: at the normal rate the
+    // stream's output index says so, 0 the field that comes first and 1 the
+    // other. A processor built to deinterlace also numbers its frames and
+    // its pictures as they come, and is asked for each picture of an
+    // interlaced frame twice: NVIDIA's (RTX 4060 Ti, driver 32.0.16.2135)
+    // hands back at this rate the picture it was asked for the time before,
+    // so one asking showed every field one late and the frame after a
+    // paused seek not at all; asked again, it hands back the one asked for,
+    // moving or still. Intel's (Arc, 32.0.101.9175) hands back the same
+    // picture both times. A progressive frame is one late on neither.
+    const bool interlacedFrame = frameFormat != D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    const bool secondField = interlacedFrame && secondFields_[slot];
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = inputView.Get();
-    hr = videoContext_->VideoProcessorBlt(
-        target.processor.Get(), target.outputView.Get(), 0, 1, &stream);
-    if (FAILED(hr)) { noteFailure("VideoProcessorBlt", hr); return false; }
+    if (target.interlaced) {
+        if (frame.serial != target.serial) ++target.inputFrames;
+        stream.InputFrameOrField = target.inputFrames;
+        stream.OutputIndex = secondField ? 1U : 0U;
+    }
+    for (int ask = 0; ask < (interlacedFrame ? 2 : 1); ++ask) {
+        hr = videoContext_->VideoProcessorBlt(
+            target.processor.Get(), target.outputView.Get(),
+            target.interlaced ? target.outputPictures++ : 0U, 1, &stream);
+        if (FAILED(hr)) { noteFailure("VideoProcessorBlt", hr); return false; }
+    }
+    if ((target.toneMapped || target.hlgToPq || target.rematrix) &&
+        !runToneMapPass(slot, hdrPicturePeakNits(frame.ownerFrame))) return false;
+    target.secondField = secondField;
     target.serial = frame.serial;
     target.hardware = true;
     return true;
 }
 
+bool D3DRenderer::secondFieldWanted(std::size_t slot, const HardwareVideoFrame& frame) const {
+    // As convertSurface names the frame's format: only in a slot built to
+    // deinterlace, and only of a frame that says it is interlaced.
+    return secondFields_[slot] && slots_[slot].interlaced && frame.ownerFrame &&
+           (frame.ownerFrame->flags & AV_FRAME_FLAG_INTERLACED);
+}
+
 bool D3DRenderer::convertSoftwareSurface(
     std::size_t slot, const HardwareVideoFrame& frame, const SurfaceSize& requested) {
-    if (!videoDevice_ || !videoContext_ || !frame.ownerFrame ||
-        !softwareNv12Eligible(*frame.ownerFrame)) return false;
+    if (!videoDevice_ || !videoContext_ || !frame.ownerFrame) return false;
+    // An 8-bit SDR frame goes in as NV12; an HDR one deeper than that as
+    // P010, which keeps ten of its bits where its BGRA copy keeps eight.
+    const bool deep = softwareP010Eligible(*frame.ownerFrame);
+    if (!deep && !softwareNv12Eligible(*frame.ownerFrame)) return false;
+    const DXGI_FORMAT format = deep ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
     auto& upload = softwareUploads_[slot];
     const auto& source = *frame.ownerFrame;
-    if (upload.width != source.width || upload.height != source.height) {
+    if (upload.width != source.width || upload.height != source.height || upload.format != format) {
         const bool interlaced = upload.interlaced;
         upload = {};
         upload.width = source.width;
         upload.height = source.height;
+        upload.format = format;
         upload.interlaced = interlaced;
     }
     // Retry after a size/output/settings/device change, not on every video
@@ -1890,7 +2425,7 @@ bool D3DRenderer::convertSoftwareSurface(
         upload.failed = true;
         upload.failedOutputWidth = requested.width;
         upload.failedOutputHeight = requested.height;
-        appendDiagnostic("Software NV12 video processor fallback: pane=" +
+        appendDiagnostic(std::string("Software ") + (deep ? "P010" : "NV12") + " video processor fallback: pane=" +
             std::to_string(slot + 1) + " input=" + std::to_string(source.width) + "x" +
             std::to_string(source.height) + " output=" + std::to_string(requested.width) + "x" +
             std::to_string(requested.height) + " reason=" + error_);
@@ -1901,16 +2436,17 @@ bool D3DRenderer::convertSoftwareSurface(
         description.Width = static_cast<UINT>(source.width);
         description.Height = static_cast<UINT>(source.height);
         description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
-        description.Format = DXGI_FORMAT_NV12;
+        description.Format = format;
         description.Usage = D3D11_USAGE_DEFAULT;
         // This is a processor input, independent of the codec's decoder caps.
         description.BindFlags = D3D11_BIND_RENDER_TARGET;
         const HRESULT hr = device_->CreateTexture2D(&description, nullptr, &upload.texture);
-        if (FAILED(hr)) { setError("Create software NV12 input", hr); return fail(); }
+        if (FAILED(hr)) { setError(deep ? "Create software P010 input" : "Create software NV12 input", hr); return fail(); }
     }
     if (upload.serial != frame.serial) {
         int stride{};
-        if (!packSoftwareNv12(source, upload.bytes, stride)) return false;
+        if (!(deep ? packSoftwareP010(source, upload.bytes, stride)
+                   : packSoftwareNv12(source, upload.bytes, stride))) return false;
         context_->UpdateSubresource(upload.texture.Get(), 0, nullptr,
                                     upload.bytes.data(), static_cast<UINT>(stride), 0);
         ++stats_.softwareNv12Uploads;
@@ -1922,8 +2458,21 @@ bool D3DRenderer::convertSoftwareSurface(
     uploaded.texture = upload.texture.Get();
     uploaded.width = source.width;
     uploaded.height = source.height;
+    uploaded.quarterTurns = frame.quarterTurns;
     uploaded.serial = frame.serial;
     if (!convertSurface(slot, uploaded, requested)) return fail();
+    // A processor that does not hand an HDR surface over as PQ would leave
+    // it to the SDR approximation; its BGRA copy is tone-mapped instead.
+    if (deep && !hdrOutput_ && !slots_[slot].toneMapped) {
+        error_ = "the video processor does not convert PQ";
+        return fail();
+    }
+    // Nor is a full-range one left to a processor that reads it as limited
+    // range: swscale undoes the range of its BGRA copy.
+    if (deep && slots_[slot].fullRangeHdr && !slots_[slot].fullRangeHdrInput && !slots_[slot].rematrix) {
+        error_ = "the video processor does not take full-range HDR";
+        return fail();
+    }
     // Slot.hardware means a video-processor output; the public frame still
     // accurately says software decode. Metadata, range and colour stay intact.
     return true;
@@ -1931,7 +2480,16 @@ bool D3DRenderer::convertSoftwareSurface(
 
 bool D3DRenderer::uploadSoftwareFrame(std::size_t slot, const HardwareVideoFrame& frame) {
     auto& target = slots_[slot];
+    // swscale only changes matrix/range; it does not turn PQ/HLG into SDR.
+    // An HDR frame's BGRA is its PQ or HLG BT.2020 codes: on an SDR output
+    // the tone-map pass brings them down; on the PQ output PQ codes are
+    // shown as they are and HLG ones are made PQ by the same pass.
+    const auto color = videoColorDescription(frame.ownerFrame, frame.width, frame.height);
+    const bool toneMap = color.hdr() && !hdrOutput_ && toneMapShader_;
+    const bool hlgToPq = color.hlg && hdrOutput_ && toneMapShader_;
+    const bool transferPass = toneMap || hlgToPq;
     if (target.texture && !target.hardware && target.serial == frame.serial &&
+        target.toneMapped == toneMap && target.hlgToPq == hlgToPq && target.hlg == color.hlg &&
         target.outputWidth == frame.width && target.outputHeight == frame.height) return true;
     // UpdateSubresource reads stride x height bytes. A frame without that
     // many, or with no BGRA copy at all, must fail here rather than have
@@ -1941,8 +2499,9 @@ bool D3DRenderer::uploadSoftwareFrame(std::size_t slot, const HardwareVideoFrame
         error_ = "Software frame has no BGRA pixels to upload";
         return false;
     }
-    if (!target.texture || target.hardware || target.outputWidth != frame.width ||
-        target.outputHeight != frame.height) {
+    if (!target.texture || target.hardware || target.toneMapped != toneMap ||
+        target.hlgToPq != hlgToPq || target.hlg != color.hlg ||
+        target.outputWidth != frame.width || target.outputHeight != frame.height) {
         target = SlotTexture{};
         D3D11_TEXTURE2D_DESC description{};
         description.Width = static_cast<UINT>(frame.width);
@@ -1953,23 +2512,30 @@ bool D3DRenderer::uploadSoftwareFrame(std::size_t slot, const HardwareVideoFrame
         description.SampleDesc.Count = 1;
         description.Usage = D3D11_USAGE_DEFAULT;
         description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        HRESULT hr = device_->CreateTexture2D(&description, nullptr, &target.texture);
+        // The upload is the picture every later pass reads, or, to be
+        // tone-mapped or made PQ, the picture that pass reads.
+        auto& uploaded = transferPass ? target.source : target.texture;
+        auto& uploadedView = transferPass ? target.sourceView : target.view;
+        HRESULT hr = device_->CreateTexture2D(&description, nullptr, &uploaded);
         if (FAILED(hr)) { setError("Create software frame texture", hr); return false; }
-        hr = device_->CreateShaderResourceView(target.texture.Get(), nullptr, &target.view);
+        hr = device_->CreateShaderResourceView(uploaded.Get(), nullptr, &uploadedView);
         if (FAILED(hr)) { setError("Create software frame view", hr); return false; }
+        if (transferPass && !createToneMapTarget(slot, frame.width, frame.height)) return false;
         target.outputWidth = frame.width;
         target.outputHeight = frame.height;
-        target.outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        target.outputFormat = transferPass ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        target.toneMapped = toneMap;
+        target.hlgToPq = hlgToPq;
+        target.hlg = color.hlg;
         target.hardware = false;
     }
-    context_->UpdateSubresource(target.texture.Get(), 0, nullptr, frame.bgra.data(), frame.stride, 0);
+    context_->UpdateSubresource((transferPass ? target.source : target.texture).Get(), 0, nullptr,
+                                frame.bgra.data(), frame.stride, 0);
     ++stats_.softwareFrameUploads;
-    // swscale only changes matrix/range; it does not turn PQ/HLG into SDR.
-    // Keep those pre-existing limited software paths out of the SDR transform
-    // and SDR Vibrance. Correct native HDR software tone mapping is separate.
-    target.hdrSource = frame.ownerFrame &&
-        (frame.ownerFrame->color_trc == AVCOL_TRC_SMPTE2084 ||
-         frame.ownerFrame->color_trc == AVCOL_TRC_ARIB_STD_B67);
+    // Keep the HDR-coded pictures that are shown as they are out of the SDR
+    // transform and SDR Vibrance; a tone-mapped one is SDR from here on.
+    target.hdrSource = !toneMap && color.hdr();
+    if (transferPass && !runToneMapPass(slot, hdrPicturePeakNits(frame.ownerFrame))) return false;
     target.serial = frame.serial;
     return true;
 }
@@ -2000,35 +2566,11 @@ bool D3DRenderer::prepareSoftwarePqTexture(std::size_t slot) {
         target.width = source.outputWidth;
         target.height = source.outputHeight;
     }
-    context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
-    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
-    context_->VSSetConstantBuffers(0, 1, uvTransformBuffer_.GetAddressOf());
-    const float identity[] = {1, 1, 0, 0};
-    context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, identity, 0, 0);
-    D3D11_VIEWPORT viewport{};
-    viewport.Width = static_cast<float>(target.width);
-    viewport.Height = static_cast<float>(target.height);
-    viewport.MaxDepth = 1;
-    context_->RSSetViewports(1, &viewport);
-    context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+    beginFullscreenPass(target.width, target.height);
     // Run every selected effect, including user shaders, in SDR before the
     // output transform. Per-frame execution preserves temporal shader inputs.
-    const float clock = static_cast<float>(std::fmod(std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
-    const float params[] = {viewport.Width, viewport.Height,
-        static_cast<float>(source.serial), clock, 1 / viewport.Width, 1 / viewport.Height,
-        0, 0, 0, 0, 0, 0};
-    context_->UpdateSubresource(pixelParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
-    context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
-    context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
-    bindVibranceColorSpace(slot);
-    context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->OMSetRenderTargets(1, target.effectsTarget.GetAddressOf(), nullptr);
-    context_->PSSetShaderResources(0, 1, source.view.GetAddressOf());
-    context_->Draw(4, 0);
+    drawEffectShader(slot, target.effectsTarget.Get(), target.width, target.height);
     ID3D11ShaderResourceView* empty = nullptr;
-    context_->PSSetShaderResources(0, 1, &empty);
     context_->OMSetRenderTargets(1, target.pqTarget.GetAddressOf(), nullptr);
     context_->PSSetShaderResources(0, 1, target.effectsView.GetAddressOf());
     const float white[] = {std::clamp(enhancementStatus_.sdrWhiteNits, 80.0F, 1000.0F), 0, 0, 0};
@@ -2066,6 +2608,13 @@ bool D3DRenderer::runEffectsPass(std::size_t slot) {
         post.width = source.outputWidth;
         post.height = source.outputHeight;
     }
+    beginFullscreenPass(post.width, post.height);
+    drawEffectShader(slot, post.target.Get(), post.width, post.height);
+    context_->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
+void D3DRenderer::beginFullscreenPass(int width, int height) {
     context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     context_->VSSetShader(vertexShader_.Get(), nullptr, 0);
@@ -2073,30 +2622,31 @@ bool D3DRenderer::runEffectsPass(std::size_t slot) {
     const float identity[] = {1, 1, 0, 0};
     context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, identity, 0, 0);
     D3D11_VIEWPORT viewport{};
-    viewport.Width = static_cast<float>(post.width);
-    viewport.Height = static_cast<float>(post.height);
+    viewport.Width = static_cast<float>(width);
+    viewport.Height = static_cast<float>(height);
     viewport.MaxDepth = 1;
     context_->RSSetViewports(1, &viewport);
     context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
-    // The same parameters the shader has when it draws straight to the
-    // window: the converted picture's size, the frame and the clock.
+}
+
+void D3DRenderer::drawEffectShader(std::size_t slot, ID3D11RenderTargetView* target, int width, int height) {
+    const auto& source = slots_[slot];
+    const float across = static_cast<float>(width);
+    const float down = static_cast<float>(height);
     const float clock = static_cast<float>(std::fmod(std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count(), 3600.0));
-    const float params[] = {viewport.Width, viewport.Height,
-        static_cast<float>(source.serial), clock, 1 / viewport.Width, 1 / viewport.Height,
-        0, 0, 0, 0, 0, 0};
+    const float params[] = {across, down, static_cast<float>(source.serial), clock, 1 / across, 1 / down,
+                            0, 0, 0, 0, 0, 0};
     context_->UpdateSubresource(pixelParamsBuffer_.Get(), 0, nullptr, params, 0, 0);
     context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
     context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
     bindVibranceColorSpace(slot);
     context_->PSSetShader(pixelShader_.Get(), nullptr, 0);
-    context_->OMSetRenderTargets(1, post.target.GetAddressOf(), nullptr);
+    context_->OMSetRenderTargets(1, &target, nullptr);
     context_->PSSetShaderResources(0, 1, source.view.GetAddressOf());
     context_->Draw(4, 0);
     ID3D11ShaderResourceView* empty = nullptr;
     context_->PSSetShaderResources(0, 1, &empty);
-    context_->OMSetRenderTargets(0, nullptr, nullptr);
-    return true;
 }
 
 void D3DRenderer::drawOutputPass(ID3D11ShaderResourceView* view, int width, int height,
@@ -2125,7 +2675,7 @@ void D3DRenderer::render(
     const PaneArray<bool>& active, LayoutMode layout,
     int expandedPane, int soloPane, unsigned contentHeight,
     const PaneArray<float>& aspectRatios,
-    AutoLayoutFocus autoFocus, int autoFocusPane) {
+    AutoLayoutFocus autoFocus, int autoFocusPane, const PaneArray<bool>& secondFields) {
     // The bitblt chain's next frame is at the next refresh, whatever this
     // one does; without a timer set, the main loop goes on its timeout.
     armPaceTimer();
@@ -2138,6 +2688,7 @@ void D3DRenderer::render(
     const auto lockRequested = PerfClock::now();
     std::unique_lock deviceLock(deviceMutex_);
     const auto lockAcquired = PerfClock::now();
+    secondFields_ = secondFields;
     retryBackBuffer();
     if (!renderTarget_ || deviceLost_) return;
     if (!frameFence_ && !frameFenceUnavailable_ && device_) {
@@ -2170,13 +2721,46 @@ void D3DRenderer::render(
         }
     }
     double convertMs = 0.0;
+    const float videoHeight = static_cast<float>(std::min(height_, std::max(1U, contentHeight)));
+    const auto cells = activeLayoutCells(
+        static_cast<float>(width_), videoHeight, active, layout, expandedPane, soloPane,
+        aspectRatios, autoFocus, autoFocusPane);
+    // An HDR picture (HDR10 or HLG) about to be drawn asks for the PQ
+    // output, and the last one gone gives it back. The swap chain is told
+    // the metadata of the brightest HDR10 one; an HLG picture is made PQ
+    // for a display of its nominal peak and has none to tell.
+    bool hdrVideo = false;
+    HdrStaticMetadata metadata;
+    float metadataPeak = 0.0F;
+    for (std::size_t index = 0; index < frames.size(); ++index) {
+        const auto& frame = frames[index];
+        if (!frame || !frame->ownerFrame || cells[index].width <= 0 || cells[index].height <= 0) continue;
+        const auto transfer = frame->ownerFrame->color_trc;
+        if (transfer != AVCOL_TRC_SMPTE2084 && transfer != AVCOL_TRC_ARIB_STD_B67) continue;
+        hdrVideo = true;
+        if (transfer != AVCOL_TRC_SMPTE2084) continue;
+        const auto said = hdrStaticMetadata(frame->ownerFrame);
+        const float peak = hdrSourcePeakNits(frame->ownerFrame);
+        if (said.present && peak > metadataPeak) {
+            metadata = said;
+            metadataPeak = peak;
+        }
+    }
+    const bool hdrVideoChanged = noteHdrVideo(hdrVideo);
     // HDR can be switched in Windows, or the window carried to another
     // display, while playing; look every couple of seconds.
     if (++framesSinceDisplayStatus_ >= kDisplayStatusFrames) {
         refreshDisplayStatus();
         applyOutputMode();
         if (!renderTarget_) return;
+    } else if (hdrVideoChanged) {
+        applyOutputMode();
+        if (!renderTarget_) return;
     }
+    // While the output is only held for a picture that is not there this
+    // frame (a seek, the next episode), what was said for it stands.
+    if (hdrVideo || !hdrVideoShown_) applyHdrMetadata(hdrOutput_ ? metadata : HdrStaticMetadata{});
+    HdrPicture hdrPicture = HdrPicture::None;
     // Only the hardware path goes through the video processor, so only it
     // can hand Super Resolution the upscale.
     const bool magnifyForSuperResolution = enhancements_.superResolution &&
@@ -2192,10 +2776,6 @@ void D3DRenderer::render(
     context_->PSSetConstantBuffers(0, 1, pixelParamsBuffer_.GetAddressOf());
     context_->PSSetConstantBuffers(1, 1, smartVibranceBuffer_.GetAddressOf());
 
-    const float videoHeight = static_cast<float>(std::min(height_, std::max(1U, contentHeight)));
-    const auto cells = activeLayoutCells(
-        static_cast<float>(width_), videoHeight, active, layout, expandedPane, soloPane,
-        aspectRatios, autoFocus, autoFocusPane);
     for (std::size_t index = 0; index < frames.size(); ++index) {
         const auto& frame = frames[index];
         if (!frame || cells[index].width <= 0 || cells[index].height <= 0) {
@@ -2209,22 +2789,34 @@ void D3DRenderer::render(
         }
         const bool deinterlaceSoftware = videoOutput_.deinterlace != VideoDeinterlace::Off &&
                                          videoDevice_ && softwareUploads_[index].interlaced;
-        const bool softwareVideoProcessor = !frame->hardware && frame->ownerFrame &&
-            (hdrOutput_ || enhancements_.superResolution || deinterlaceSoftware) &&
-            softwareNv12Eligible(*frame->ownerFrame);
+        // An HDR frame deeper than 8 bits always goes through the processor,
+        // which keeps its depth; an 8-bit SDR one when something needs it.
+        const bool softwareVideoProcessor = !frame->hardware && frame->ownerFrame && videoDevice_ &&
+            (softwareP010Eligible(*frame->ownerFrame) ||
+             ((hdrOutput_ || enhancements_.superResolution || deinterlaceSoftware) &&
+              softwareNv12Eligible(*frame->ownerFrame)));
         const int sourceWidth = softwareVideoProcessor ? frame->ownerFrame->width : frame->width;
         const int sourceHeight = softwareVideoProcessor ? frame->ownerFrame->height : frame->height;
-        // A picture stored on its side or on its head stays so in every
-        // texture; only the pane's own draw turns it. One on its side fills
-        // the cell the other way round.
+        // A picture stored on its side or on its head is stood upright by
+        // the video processor where it goes through one that can: its
+        // output is then the upright picture, and what the driver draws
+        // into it, RTX Video's status indicator, stands upright too. Any
+        // other picture stays as it is stored in every texture, sized for
+        // the cell the other way round when it is on its side, and the
+        // pane's own draw turns it.
         const int quarterTurns = frame->quarterTurns & 3;
-        const bool sideways = turnedSideways(quarterTurns);
+        const bool throughProcessor = frame->hardware || softwareVideoProcessor;
+        const int processorTurned = throughProcessor ? processorTurns(*frame) : 0;
+        const bool storedSideways = turnedSideways(quarterTurns);
+        const bool uprightOutput = storedSideways && turnedSideways(processorTurned);
         const auto requested = presentationSize(
-            sourceWidth, sourceHeight,
-            (sideways ? cells[index].height : cells[index].width) * paneZoom,
-            (sideways ? cells[index].width : cells[index].height) * paneZoom,
-            3840, 8, magnifyForSuperResolution && (frame->hardware || softwareVideoProcessor));
+            uprightOutput ? sourceHeight : sourceWidth, uprightOutput ? sourceWidth : sourceHeight,
+            (storedSideways && !uprightOutput ? cells[index].height : cells[index].width) * paneZoom,
+            (storedSideways && !uprightOutput ? cells[index].width : cells[index].height) * paneZoom,
+            3840, 8, magnifyForSuperResolution && throughProcessor);
+        // A frame's second field is another picture of the same serial.
         if (slots_[index].serial != frame->serial ||
+            slots_[index].secondField != secondFieldWanted(index, *frame) ||
             ((frame->hardware || softwareVideoProcessor) && (slots_[index].outputWidth != requested.width ||
                                  slots_[index].outputHeight != requested.height))) {
             const auto convertStarted = PerfClock::now();
@@ -2241,15 +2833,23 @@ void D3DRenderer::render(
                 PerfClock::now() - convertStarted).count();
             if (!converted) continue;
             if (!frame->hardware) {
-                const int route = slots_[index].hardware ? (slots_[index].rtxHdrApplied ? 2 : 1)
-                    : (hdrOutput_ ? (slots_[index].hdrSource ? 4 : 3) : 0);
+                const auto& made = slots_[index];
+                const bool hdrFrame = made.hlg || made.toneMapped || made.hdrSource;
+                const int route = made.hardware && hdrFrame ? (made.toneMapped ? 6 : 7)
+                    : made.hardware ? (made.rtxHdrApplied ? 2 : 1)
+                    : made.toneMapped ? 5
+                    : (hdrOutput_ ? (made.hdrSource ? (made.hlgToPq ? 8 : 4) : 3) : 0);
                 if (loggedSoftwareRoute_[index] != route) {
                     loggedSoftwareRoute_[index] = route;
                     const char* name = route == 2 ? "NV12 VP / TrueHDR request accepted" :
                         route == 1 ? (hdrOutput_ ? "NV12 VP SDR / explicit SDR-to-PQ (no RTX)"
                                                                : "NV12 VP / SDR") :
                         route == 3 ? "BGRA / SDR-to-PQ fallback (no RTX)" :
-                        route == 4 ? "HDR-tagged BGRA / legacy software path (no RTX)" : "BGRA / SDR";
+                        route == 4 ? "HDR10 BGRA / shown as PQ, 8-bit" :
+                        route == 5 ? "HDR BGRA / tone-mapped to SDR, 8-bit" :
+                        route == 6 ? "HDR P010 VP / tone-mapped to SDR" :
+                        route == 7 ? "HDR P010 VP / shown as PQ" :
+                        route == 8 ? "HLG BGRA / made PQ, 8-bit" : "BGRA / SDR";
                     appendDiagnostic("Software presentation: pane=" + std::to_string(index + 1) +
                         " input=" + std::to_string(sourceWidth) + "x" + std::to_string(sourceHeight) +
                         " output=" + std::to_string(slots_[index].outputWidth) + "x" +
@@ -2257,15 +2857,30 @@ void D3DRenderer::render(
                 }
             }
         }
+        if (frame->ownerFrame && videoColorDescription(frame->ownerFrame, 0, 0).hdr()) {
+            // The least faithful of the HDR pictures drawn is the one named.
+            const HdrPicture shown = slots_[index].toneMapped ? HdrPicture::ToneMapped
+                : hdrOutput_ && (slots_[index].hdrSource || slots_[index].pqOutput) ? HdrPicture::Hdr
+                : HdrPicture::Approximated;
+            hdrPicture = std::max(hdrPicture, shown);
+        }
         const bool softwarePq = hdrOutput_ &&
             slots_[index].outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM && !slots_[index].hdrSource;
         if (softwarePq && !prepareSoftwarePqTexture(index)) continue;
         // The texture keeps the stored proportions; the picture is shaped by
         // its pixels' width as well, so a 720x576 DVD at 64:45 fills a 16:9
         // pane and the viewport and the crop stretch it there.
+        // What the slot's processor has turned is no longer the draw's to
+        // turn: a slot of a BGRA upload, the fallback from a processor too,
+        // has turned nothing. Stood up from its side, the texture's pixels
+        // are as tall as the stored ones were wide.
+        const int drawTurns = (quarterTurns - slots_[index].turned) & 3;
+        const bool sideways = turnedSideways(drawTurns);
+        const float texturePixelAspect = turnedSideways(slots_[index].turned) && frame->pixelAspect > 0.0
+            ? static_cast<float>(1.0 / frame->pixelAspect) : static_cast<float>(frame->pixelAspect);
         const PanePictureGeometry geometry = panePictureGeometry(
             cells[index], slots_[index].outputWidth, slots_[index].outputHeight,
-            static_cast<float>(frame->pixelAspect), views[index].mode, views[index].zoom, quarterTurns);
+            texturePixelAspect, views[index].mode, views[index].zoom, drawTurns);
         const RectF& fitted = geometry.viewport;
         const float scaleX = geometry.scaleX;
         const float scaleY = geometry.scaleY;
@@ -2302,8 +2917,8 @@ void D3DRenderer::render(
         // presentation target and the pane's state for this pane and every
         // following pane.
         context_->OMSetRenderTargets(1, renderTarget_.GetAddressOf(), nullptr);
-        context_->VSSetShader(quarterTurns != 0 ? turnedVertexShaders_[static_cast<std::size_t>(quarterTurns) - 1].Get()
-                                                : vertexShader_.Get(), nullptr, 0);
+        context_->VSSetShader(drawTurns != 0 ? turnedVertexShaders_[static_cast<std::size_t>(drawTurns) - 1].Get()
+                                             : vertexShader_.Get(), nullptr, 0);
         context_->UpdateSubresource(uvTransformBuffer_.Get(), 0, nullptr, transform, 0, 0);
         context_->RSSetViewports(1, &viewport);
         if (outputPass) {
@@ -2329,6 +2944,7 @@ void D3DRenderer::render(
         ID3D11ShaderResourceView* empty = nullptr;
         context_->PSSetShaderResources(0, 1, &empty);
     }
+    hdrPicture_ = hdrPicture;
     if (overlay_ && (hdrOutput_ || tenBitOutput_)) {
         // Direct2D cannot draw sRGB colours straight into a PQ back buffer:
         // white would come out at 10,000 nits. It paints a layer instead and

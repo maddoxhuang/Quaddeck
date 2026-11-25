@@ -245,16 +245,37 @@ inline bool isBrowsable(const Item& item) {
 }
 
 // The subtitle codecs the server can hand over as text, as it names them.
-// Bitmap subtitles (PGS, VobSub) are not; they would need burning in or a
-// bitmap renderer.
+// Bitmap subtitles (PGS, VobSub) are not: the server would have to burn
+// them in. One inside the file is shown from the file instead.
 inline constexpr std::array<const char*, 12> kTextSubtitleCodecs{
     "subrip", "srt", "ass", "ssa", "webvtt", "vtt", "mov_text", "text", "tx3g", "ttml", "microdvd", "sami"};
+
+// The picture subtitle codecs, as the server names them. The server hands
+// none over as text; they are named to it so that a file is handed over
+// whole whatever subtitle it holds (playbackInfoBody), and one inside the
+// file is then shown from the file (2026-11-24; before, none was drawn).
+inline constexpr std::array<const char*, 11> kPictureSubtitleCodecs{
+    "pgssub", "pgs", "sup", "hdmv_pgs_subtitle", "dvdsub", "dvd_subtitle", "vobsub", "idx",
+    "dvbsub", "dvb_subtitle", "xsub"};
+
+// The bit rate the server may assume the link carries: above any file's, so
+// that none is transcoded down. It fits the 32-bit field of older servers.
+inline constexpr int kDirectPlayBitrate = 2'000'000'000;
 
 inline bool isTextSubtitleCodec(std::string codec) {
     std::transform(codec.begin(), codec.end(), codec.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return std::any_of(kTextSubtitleCodecs.begin(), kTextSubtitleCodecs.end(),
                        [&](const char* text) { return codec == text; });
+}
+
+// A stream of pictures: not one the server hands over as text, but one the
+// player shows from the file itself when it is inside it.
+inline bool isPictureSubtitleCodec(std::string codec) {
+    std::transform(codec.begin(), codec.end(), codec.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return std::any_of(kPictureSubtitleCodecs.begin(), kPictureSubtitleCodecs.end(),
+                       [&](const char* picture) { return codec == picture; });
 }
 
 // A subtitle stream whose own format is ASS or its predecessor; the server
@@ -738,7 +759,9 @@ inline std::optional<Item> refindMatch(const std::vector<Item>& candidates, cons
 // video with a hundred subtitle files beside it. Asked for by id, the
 // server answers with those that have a stream of a text codec
 // (SubtitleCodecs filters by each stream's codec; HasSubtitles=true would
-// count a video with only PGS, which the player cannot show).
+// count a video with only PGS, which the player could not show when this
+// was written; it shows one inside the file now, and the mark still counts
+// text only).
 inline std::string subtitledItemsPath(const std::string& userId, const std::vector<std::string>& ids) {
     std::string list;
     for (const auto& id : ids) list += (list.empty() ? "" : ",") + id;
@@ -913,9 +936,34 @@ inline std::string playbackInfoPath(const std::string& itemId, const std::string
     return "/Items/" + urlEncode(itemId) + "/PlaybackInfo?UserId=" + urlEncode(userId);
 }
 
+// What the player is, which the server takes for granted every client
+// says: an Emby 4.11 answers a PlaybackInfo without a DeviceProfile with 500,
+// reading the subtitle profiles of the profile that is not there. QuadDeck
+// takes any file as it lies on the disk, so every container and codec is
+// played directly and nothing is transcoded. Every subtitle format is named
+// as read from the file or fetched beside it: with none named, the server
+// would burn its default subtitle in, which leaves that source without
+// SupportsDirectPlay and without a DefaultSubtitleStreamIndex. Which of them
+// are drawn is QuadDeck's own matter.
 inline std::string playbackInfoBody(const std::string& userId) {
+    nlohmann::json profile;
+    profile["MaxStreamingBitrate"] = kDirectPlayBitrate;
+    profile["MaxStaticBitrate"] = kDirectPlayBitrate;
+    profile["DirectPlayProfiles"] = nlohmann::json::array({{{"Type", "Video"}}, {{"Type", "Audio"}}});
+    profile["TranscodingProfiles"] = nlohmann::json::array();
+    profile["ContainerProfiles"] = nlohmann::json::array();
+    profile["CodecProfiles"] = nlohmann::json::array();
+    auto subtitles = nlohmann::json::array();
+    const auto name = [&](const char* format) {
+        subtitles.push_back({{"Format", format}, {"Method", "Embed"}});
+        subtitles.push_back({{"Format", format}, {"Method", "External"}});
+    };
+    for (const char* format : kTextSubtitleCodecs) name(format);
+    for (const char* format : kPictureSubtitleCodecs) name(format);
+    profile["SubtitleProfiles"] = std::move(subtitles);
     nlohmann::json body;
     body["UserId"] = userId;
+    body["DeviceProfile"] = std::move(profile);
     return body.dump();
 }
 

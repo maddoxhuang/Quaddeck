@@ -7,7 +7,6 @@
 
 #include <commdlg.h>
 #include <commctrl.h>
-#include <dwmapi.h>
 #include <imm.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -183,30 +182,11 @@ bool App::initializeWindow(HINSTANCE instance, int showCommand) {
     enableDarkPopupMenus();
     HICON appIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_QUADDECK));
     if (!appIcon) appIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    windowClass.lpfnWndProc = &App::windowProc;
-    windowClass.hInstance = instance;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    windowClass.lpszClassName = kWindowClass;
-    windowClass.hIcon = appIcon;
-    // Let Windows select the small frame from hIcon's resource group.
-    // Reusing appIcon here forces the large bitmap into the small slot.
-    windowClass.hIconSm = nullptr;
-    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        return false;
-    }
-    WNDCLASSEXW videoClass{};
-    videoClass.cbSize = sizeof(videoClass);
-    videoClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    videoClass.lpfnWndProc = &App::videoWindowProc;
-    videoClass.hInstance = instance;
-    videoClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    videoClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    videoClass.lpszClassName = kVideoWindowClass;
-    if (!RegisterClassExW(&videoClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    const auto black = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    if (!registerWindowClass(instance, kWindowClass, &App::windowProc, CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS, black,
+                             appIcon) ||
+        !registerWindowClass(instance, kVideoWindowClass, &App::videoWindowProc,
+                             CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS, black)) {
         return false;
     }
     // Created hidden on purpose: WS_VISIBLE paints the frame before the dark
@@ -224,13 +204,7 @@ bool App::initializeWindow(HINSTANCE instance, int showCommand) {
     if (!window_) {
         return false;
     }
-    // Have the frame worked out again through WM_NCCALCSIZE, so Windows and
-    // DWM drop the caption before the window is first shown.
-    SetWindowPos(window_, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    const BOOL darkTitle = TRUE;
-    const DWORD darkTitleAttribute = 20;
-    DwmSetWindowAttribute(window_, darkTitleAttribute, &darkTitle, sizeof(darkTitle));
+    darkCaptionlessFrame(window_);
     // A secondary monitor with its own DPI: re-derive before the first paint.
     if (windowDpi(window_) != static_cast<unsigned>(std::lround(uiScale_ * 96.0F))) {
         applyDpi(windowDpi(window_));
@@ -241,48 +215,29 @@ bool App::initializeWindow(HINSTANCE instance, int showCommand) {
 }
 
 LRESULT CALLBACK App::windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    App* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        app = static_cast<App*>(create->lpCreateParams);
-        app->window_ = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    }
-    return app ? app->handleMessage(message, wParam, lParam)
-               : DefWindowProcW(window, message, wParam, lParam);
+    App* app = windowApp(window, message, lParam);
+    if (!app) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == WM_NCCREATE) app->window_ = window;
+    return app->handleMessage(message, wParam, lParam);
 }
 
 LRESULT CALLBACK App::videoWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
-    App* app = reinterpret_cast<App*>(GetWindowLongPtrW(window, GWLP_USERDATA));
-    if (message == WM_NCCREATE) {
-        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
-        app = static_cast<App*>(create->lpCreateParams);
-        app->videoWindow_ = window;
-        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
-    }
-    return app ? app->handleVideoMessage(message, wParam, lParam)
-               : DefWindowProcW(window, message, wParam, lParam);
+    App* app = windowApp(window, message, lParam);
+    if (!app) return DefWindowProcW(window, message, wParam, lParam);
+    if (message == WM_NCCREATE) app->videoWindow_ = window;
+    return app->handleVideoMessage(message, wParam, lParam);
 }
 
 LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_NCCALCSIZE: {
-        // No title bar. Windows keeps its own frame on the sides and the
-        // bottom -- the resize borders outside the picture, the shadow,
-        // snapping -- and the client reaches the window's top edge, where
-        // the caption is drawn over the video instead. Both forms of the
-        // message: CreateWindowExW sends the one with a bare RECT, and a
-        // window that never changes size afterwards keeps what it said.
-        RECT* client = wParam ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam)->rgrc[0]
-                              : reinterpret_cast<RECT*>(lParam);
-        const LONG top = client->top;
-        const LRESULT result = DefWindowProcW(window_, message, wParam, lParam);
-        if (result != 0) return result;
-        client->top = top;
+        // No title bar: the caption is drawn over the video instead.
+        if (const LRESULT result = captionlessClientArea(window_, wParam, lParam); result != 0) return result;
         const auto style = GetWindowLongPtrW(window_, GWL_STYLE);
         if ((style & WS_CAPTION) == WS_CAPTION && IsZoomed(window_)) {
             // A maximized window hangs its frame off the monitor on every
             // side; the default pulled the other three in, not the top.
+            RECT* client = ncCalcSizeClient(wParam, lParam);
             client->top += resizeFrameThickness(windowDpi(window_));
             leaveAutoHideTaskbarEdges(window_, *client);
         }
@@ -383,7 +338,7 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         // Alt is down with a key here only beside Ctrl; alone it makes
         // WM_SYSKEYDOWN.
-        const bool alt = GetKeyState(VK_MENU) < 0;
+        const bool alt = keyHeld(VK_MENU);
         // A key box of the Keys tab waiting for a key takes the next one,
         // whatever it does now.
         if (capturingKey()) {
@@ -406,7 +361,7 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         // shortcuts but a function key of the settings or the list: a
         // letter, a space or an arrow is text there, and a held one repeats.
         if (fieldTyping() != TextFieldId::None && !keyChordLeavesTextBox(keyBindings_, keyChordOf(wParam, alt))) {
-            fieldKey(wParam, GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
+            fieldKey(wParam, keyHeld(VK_CONTROL), keyHeld(VK_SHIFT));
             return 0;
         }
         runShortcut(wParam, lParam, alt);
@@ -569,16 +524,15 @@ LRESULT App::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         externalOpenBatches_.clear();
         KillTimer(window_, kRenderTimer);
         KillTimer(window_, kSettingsSaveTimer);
+        updateKeepAwake(true);
         settingsSavePending_ = false;
-        settingsSaveRetryCount_ = 0;
+        // A write on the writer's thread finishes first; the state saved
+        // here is newer than any it holds.
+        if (settingsWriter_) settingsWriter_->finish();
         if (!saveAppSettings()) appendDiagnostic("Could not save application settings");
         embyReportStoppedAtExit();
         emby_.drain(1500);
-        for (auto& source : sources_) {
-            if (source) source->setAudioEnabled(false);
-        }
-        audio_.flush();
-        for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
+        retireAllSources();
         // As before, the window waits here for every source to close.
         sourceReaper_.drain();
         audioDevices_.stop();
@@ -783,13 +737,7 @@ void App::recoverLostDevice() {
         clock_.pause();
         clock_.setSlew(1.0);
         audio_.pause();
-        for (auto& source : sources_) {
-            if (source) source->setAudioEnabled(false);
-        }
-        audio_.flush();
-        for (std::size_t pane = 0; pane < sources_.size(); ++pane) retireSource(pane);
-        sourceInitialAlignmentPending_.fill(false);
-        sourceProvisionalTargets_.fill(0.0);
+        retireAllSources();
     }
 
     // The overlay's Direct2D device holds the D3D device it was made on, and
@@ -965,6 +913,22 @@ void App::publishPreferredSizes(const PaneArray<float>& aspects) {
     }
 }
 
+// Windows counts the keyboard and the pointer, not a video: left alone it
+// turns the screen off, starts the screen saver or sleeps in the middle of
+// one. The request belongs to the thread that made it and lasts until that
+// thread changes it, so it is made here, on the window's thread, and only
+// when what the deck needs has changed.
+void App::updateKeepAwake(bool release) {
+    const KeepAwake wanted = release ? KeepAwake::None
+        : keepAwakeFor(playbackIntended(), duration_, window_ && IsIconic(window_));
+    if (wanted == keptAwake_) return;
+    keptAwake_ = wanted;
+    EXECUTION_STATE state = ES_CONTINUOUS;
+    if (wanted != KeepAwake::None) state |= ES_SYSTEM_REQUIRED;
+    if (wanted == KeepAwake::Display) state |= ES_DISPLAY_REQUIRED;
+    SetThreadExecutionState(state);
+}
+
 void App::tick() {
     expireNotice(GetTickCount64());
     embyTick();
@@ -987,6 +951,7 @@ void App::tick() {
         }
     }
     duration_ = stableTimelineDuration(duration_, readyDuration, sourceOpening);
+    updateKeepAwake();
 
     // openSource must issue a provisional seek before FFmpeg has discovered
     // the duration. Once that duration arrives, Independent auto-repeat may
@@ -1009,6 +974,15 @@ void App::tick() {
     // instant and be re-mapped when the worker actually seeks.
     const double alignmentTimeline = clock_.position();
     bool refreshOpeningBarrier = false;
+    // A Dolby Vision video this player cannot decode says so once, as it
+    // opens: its picture comes up green and purple, and nothing else would
+    // say why.
+    const auto announceOpened = [&](std::size_t pane) {
+        if (const int profile = sources_[pane]->undecodedDolbyVision(); profile != 0) {
+            showNotice(L"Dolby Vision profile " + std::to_wstring(profile) +
+                       L" is not supported: the colours will be wrong", 6000);
+        }
+    };
     for (std::size_t pane = 0; pane < sources_.size(); ++pane) {
         if (!sourceInitialAlignmentPending_[pane]) continue;
         const bool exists = sources_[pane] != nullptr;
@@ -1027,6 +1001,7 @@ void App::tick() {
             if (ready && !failed) {
                 sourceProvisionalTargets_[pane] = mapped;
                 lastVideoMappedTimes_[pane] = mapped;
+                announceOpened(pane);
             }
             continue;
         }
@@ -1043,6 +1018,7 @@ void App::tick() {
         sourceInitialAlignmentPending_[pane] = false;
         sourceProvisionalTargets_[pane] = mapped;
         lastVideoMappedTimes_[pane] = mapped;
+        announceOpened(pane);
         sources_[pane]->setAudioEnabled(false);
         sources_[pane]->requestSeek(mapped);
         const auto audioStatus = sources_[pane]->audioDecodeStatus();
@@ -1065,6 +1041,7 @@ void App::tick() {
             if (sourceInitialAlignmentPending_[pane] && sources_[pane] &&
                 (sources_[pane]->ready() || !sources_[pane]->error().empty())) {
                 sourceInitialAlignmentPending_[pane] = false;
+                if (sources_[pane]->error().empty()) announceOpened(pane);
             }
         }
         appendDiagnostic("Refreshing seek barrier after source metadata settled");
@@ -1158,6 +1135,13 @@ void App::tick() {
                 frames[index] = sources_[index]->frameForTime(
                     mapped, playing && !sourcePaused_[index]);
                 ownFrame[index] = frames[index] != nullptr;
+                // Which half of its time the frame is in, for an interlaced
+                // one's two fields. A picture held through a seek stays the
+                // field it was.
+                if (ownFrame[index]) {
+                    shownSecondField_[index] =
+                        secondFieldDue(mapped, frames[index]->pts, frames[index]->duration);
+                }
                 // A seek leaves the source without a frame until the first
                 // one of the new place is decoded: tens of milliseconds for
                 // a keyframe landing, a GOP's preroll for an exact frame.
@@ -1230,7 +1214,7 @@ void App::tick() {
         buildOverlayScene();
         renderer_.render(frames, shownViews(), activePanes(), layoutMode_,
                          expandedPane_, soloPane_, contentHeight_, aspects,
-                         autoLayoutFocus_, autoLayoutFocusPane_);
+                         autoLayoutFocus_, autoLayoutFocusPane_, shownSecondField_);
         if (renderer_.deviceLost()) {
             // The frames just drawn hold textures of the lost device.
             frames = {};
@@ -1304,12 +1288,12 @@ void App::updateTitle() {
         if (error.empty()) continue;
         if (!problems.empty()) problems += L"; ";
         problems += L"V" + std::to_wstring(positionForPane(pane) + 1) + L": " +
-                    utf8ToWide(error);
+                    utf8ToWideText(error);
     }
     const std::string rendererError = renderer_.error();
     if (!rendererError.empty()) {
         if (!problems.empty()) problems += L"; ";
-        problems += L"GPU: " + utf8ToWide(rendererError);
+        problems += L"GPU: " + utf8ToWideText(rendererError);
     }
     if (!problems.empty()) title << L"  ⚠ " << problems;
 

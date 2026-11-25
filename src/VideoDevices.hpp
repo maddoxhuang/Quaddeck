@@ -27,4 +27,14 @@ std::vector<VideoDisplayInfo> listVideoDisplays();
 // the desktop now.
 HMONITOR monitorForDisplay(const std::wstring& device);
 
+// One of the display paths Windows has active: a desktop's source and the
+// monitor it reaches, with the GDI device name of that desktop. A mirrored
+// desktop has a path to each of its monitors.
+struct DisplayPath {
+    DISPLAYCONFIG_PATH_INFO path{};
+    std::wstring device;
+};
+// Every active display path whose desktop Windows names, in its order.
+std::vector<DisplayPath> activeDisplayPaths();
+
 }  // namespace quaddeck

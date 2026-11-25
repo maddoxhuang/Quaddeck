@@ -14,6 +14,7 @@
 #include <cwchar>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -52,9 +53,36 @@ public:
     void STDMETHODCALLTYPE OnBufferStart(void*) override {}
     void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
     void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT) override {}
-    void STDMETHODCALLTYPE OnBufferEnd(void* context) override {
-        delete static_cast<AudioPayload*>(context);
+    void STDMETHODCALLTYPE OnBufferEnd(void* context) override { release(static_cast<AudioPayload*>(context)); }
+
+    // A buffer's samples are kept from before a voice is handed them until
+    // the voice hands them back -- or, for those it never does (an engine
+    // that stopped on an error sends nothing back, and a voice destroyed
+    // with buffers still queued may not), until the voices are gone.
+    void keep(AudioPayload* payload) {
+        std::scoped_lock lock(mutex_);
+        held_.insert(payload);
     }
+    void release(AudioPayload* payload) {
+        {
+            std::scoped_lock lock(mutex_);
+            if (held_.erase(payload) == 0) return;
+        }
+        delete payload;
+    }
+    // Once no voice is left to hand anything back.
+    void releaseAll() {
+        std::unordered_set<AudioPayload*> left;
+        {
+            std::scoped_lock lock(mutex_);
+            left.swap(held_);
+        }
+        for (AudioPayload* payload : left) delete payload;
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_set<AudioPayload*> held_;
 };
 
 // Runs on XAudio2's own thread: it only records the failure.
@@ -276,6 +304,8 @@ void AudioOutput::close() {
         playedOrigin_[pane] = 0;
         streamTempo_[pane] = 1.0;
     }
+    // No voice is left to hand a buffer back: what none did is freed here.
+    if (callback_) callback_->releaseAll();
     if (mastering_) mastering_->DestroyVoice();
     mastering_ = nullptr;
     if (xapo_) xapo_->Release();
@@ -385,7 +415,7 @@ bool AudioOutput::open(const std::wstring& deviceId, bool deviceChannels) {
         sources_[pane]->SetVolume(paneMuted_[pane] ? 0.0F : paneVolume_[pane]);
         applyRateLocked(pane);
     }
-    mastering_->SetVolume(muted_.load() ? 0.0F : std::min(volume_.load(), 1.0F));
+    applyMasterVolume();
     applyEffects();
     return true;
 }
@@ -421,6 +451,7 @@ AudioSubmitResult AudioOutput::submit(std::size_t pane, AudioChunk&& chunk) {
     buffer.AudioBytes = static_cast<UINT32>(payload->samples.size() * sizeof(float));
     buffer.pAudioData = reinterpret_cast<const BYTE*>(payload->samples.data());
     buffer.pContext = payload;
+    callback_->keep(payload);
     const HRESULT hr = source->SubmitSourceBuffer(&buffer);
     if (FAILED(hr)) {
         {
@@ -430,7 +461,7 @@ AudioSubmitResult AudioOutput::submit(std::size_t pane, AudioChunk&& chunk) {
                 << static_cast<unsigned long>(hr);
             error_ = out.str();
         }
-        delete payload;
+        callback_->release(payload);
         return AudioSubmitResult::Error;
     }
     // A generation stretched to another tempo than the last starts on a
@@ -469,8 +500,10 @@ double AudioOutput::playbackPosition(std::size_t pane) {
     const double offset =
         static_cast<double>(played - span.framesBefore) * span.tempo / kSourceSampleRate;
     // SamplesPlayed reflects what the engine has processed, which leads what
-    // the speakers emit by the device's buffer depth.
-    return span.pts + offset - outputLatency();
+    // the speakers emit by the device's buffer depth: that long of the
+    // output's time, which at another speed is not as long of the video's.
+    return span.pts + offset -
+           outputSecondsInSourceTime(outputLatency(), audioVoiceRatio(rate_[pane], streamTempo_[pane]), span.tempo);
 }
 
 double AudioOutput::outputLatency() const {
@@ -479,10 +512,13 @@ double AudioOutput::outputLatency() const {
     engine_->GetPerformanceData(&performance);
     // The effects' limiter holds the sound back by its lookahead too, which
     // the engine's own figure does not know of.
-    const std::uint64_t lookahead = xapo_ && masteringChannels_ <= AudioEffectsProcessor::kMaxChannels
-        ? AudioLimiter::delayFrames(masteringRate_) : 0;
+    const std::uint64_t lookahead = effectsRun() ? AudioLimiter::delayFrames(masteringRate_) : 0;
     return static_cast<double>(performance.CurrentLatencyInSamples + lookahead) /
            std::max(1u, masteringRate_);
+}
+
+bool AudioOutput::effectsRun() const {
+    return xapo_ != nullptr && masteringChannels_ <= AudioEffectsProcessor::kMaxChannels;
 }
 
 void AudioOutput::play() {
@@ -546,14 +582,18 @@ void AudioOutput::flushLocked(std::size_t pane,
 
 void AudioOutput::setMuted(bool muted) {
     muted_.store(muted);
-    if (mastering_) mastering_->SetVolume(muted ? 0.0F : std::min(volume_.load(), 1.0F));
+    applyMasterVolume();
 }
 
 void AudioOutput::setVolume(float volume) {
     const float previous = volume_.load();
     volume_.store(std::isfinite(volume) ? std::clamp(volume, 0.0F, 2.0F) : 1.0F);
-    if (mastering_ && !muted_.load()) mastering_->SetVolume(std::min(volume_.load(), 1.0F));
+    applyMasterVolume();
     if (std::max(previous, 1.0F) != std::max(volume_.load(), 1.0F)) applyEffects();
+}
+
+void AudioOutput::applyMasterVolume() {
+    if (mastering_) mastering_->SetVolume(masterVolumeParts(volume_.load(), muted_.load(), effectsRun()).voice);
 }
 
 void AudioOutput::setEffects(const AudioEffectSettings& effects) {
@@ -565,7 +605,7 @@ void AudioOutput::setEffects(const AudioEffectSettings& effects) {
 void AudioOutput::applyEffects() {
     if (!xapo_) return;
     AudioEffectSettings settings = effects_;
-    settings.boost = std::max(volume_.load(), 1.0F);
+    settings.boost = masterVolumeParts(volume_.load(), muted_.load(), effectsRun()).boost;
     xapo_->setSettings(settings);
 }
 
@@ -613,8 +653,7 @@ void AudioOutput::setRate(std::size_t pane, float rate) {
 
 void AudioOutput::applyRateLocked(std::size_t pane) {
     if (!sources_[pane]) return;
-    const double ratio = static_cast<double>(rate_[pane]) / std::max(streamTempo_[pane], 0.25);
-    sources_[pane]->SetFrequencyRatio(static_cast<float>(std::clamp(ratio, 0.25, 4.0)));
+    sources_[pane]->SetFrequencyRatio(static_cast<float>(audioVoiceRatio(rate_[pane], streamTempo_[pane])));
 }
 
 bool AudioOutput::hasQueuedAudio(std::size_t pane) const {

@@ -47,6 +47,17 @@ inline const wchar_t* videoDeinterlaceLabel(VideoDeinterlace mode) {
     return mode == VideoDeinterlace::Off ? L"Off" : L"Automatic";
 }
 
+// An interlaced frame is two pictures taken half its length apart, and each
+// is shown for its own half: the field that comes first until the middle of
+// the frame's time, the other from there on. Until 2026-11-24 a frame was
+// one picture, so a 50i recording moved 25 times a second.
+// `seconds` is the pane's own time and `pts`, `duration` the frame's; a
+// frame of no known length has no middle and stays its first field.
+inline bool secondFieldDue(double seconds, double pts, double duration) {
+    return std::isfinite(seconds) && std::isfinite(pts) && std::isfinite(duration) && duration > 0.0 &&
+           seconds >= pts + duration * 0.5;
+}
+
 // How a picture is enlarged to its place. Bilinear is the sampler's own and
 // costs nothing; the others are a pass of their own (D3DRenderer's post
 // pass). Shrinking stays the video processor's or the decoder's: a picture
@@ -152,6 +163,7 @@ struct VideoOutputSettings {
     std::wstring display;
     std::wstring displayName;
     // A 10-bit back buffer for SDR, as the HDR output already is.
+    // (hdrOutputWanted says when the output is HDR; it is no setting.)
     bool tenBit{};
     VideoDeinterlace deinterlace{VideoDeinterlace::Automatic};
     VideoScaling scaling{VideoScaling::Bilinear};
@@ -176,6 +188,26 @@ inline VideoOutputSettings clampVideoOutputSettings(VideoOutputSettings settings
         setVideoColorValue(settings.color, which, videoColorValue(settings.color, which));
     }
     return settings;
+}
+
+// Whether the swap chain presents 10-bit PQ. The display has to be in
+// Windows' HDR mode and the chain able to present PQ (the flip model and the
+// DXGI colour-space calls). Then either an HDR video is being shown (HDR10,
+// which is passed through, or HLG, which is made PQ, on any card), or RTX
+// Video HDR is on and the driver honours it, which makes HDR of SDR video.
+// Otherwise the output is SDR and an HDR video is brought down to it
+// (D3DRenderer's tone-map pass).
+inline bool hdrOutputWanted(bool displayHdr, bool canPresentPq, bool rtxHdrReady, bool hdrVideoShown) {
+    return displayHdr && canPresentPq && (rtxHdrReady || hdrVideoShown);
+}
+
+// An HDR video counts as shown for this long after its last frame was
+// drawn, so the output does not go to SDR and back between two of them: the
+// next episode, a seek that shows nothing for a moment.
+inline constexpr double kHdrVideoHoldSeconds = 2.0;
+
+inline bool hdrVideoHeld(bool shownNow, bool held, double secondsSinceShown) {
+    return shownNow || (held && secondsSinceShown < kHdrVideoHoldSeconds);
 }
 
 // What the device is built as. A change of either is a new device, and the
@@ -331,6 +363,13 @@ inline std::wstring videoDisplayLabel(const VideoDisplayInfo& display) {
     return label;
 }
 
+// What became of the HDR (HDR10 or HLG) pictures in the frame last drawn:
+// none was shown; shown as HDR on the PQ output; brought down to SDR by the
+// tone-map pass; or left to the SDR conversion, which only approximates one,
+// because the card's video processor does not hand it over as PQ. With
+// several, the least faithful is the one named.
+enum class HdrPicture { None, Hdr, ToneMapped, Approximated };
+
 // What the renderer actually built, for the line under its choices.
 struct VideoRendererStatus {
     bool built{};
@@ -345,6 +384,11 @@ struct VideoRendererStatus {
     bool flipModel{};
     bool tenBitOutput{};
     bool hdrOutput{};
+    HdrPicture hdrPicture{HdrPicture::None};
+    // A video being shown is Dolby Vision of a kind this player cannot
+    // decode (dolbyVisionNeedsItsOwnDecoding). App's to say, not the
+    // renderer's, which sees only frames.
+    bool dolbyVisionUndecoded{};
 };
 
 // When the renderer is built on WARP though WARP was not chosen, which no
@@ -386,7 +430,7 @@ inline std::wstring videoRendererNote(const VideoOutputSettings& wanted, const V
                (status.adapterName.empty() ? std::wstring(L"the default card") : status.adapterName) + L". ";
     }
     if (status.hdrOutput) {
-        note += L"Output: 10-bit PQ for RTX Video HDR.";
+        note += L"Output: 10-bit PQ (HDR).";
     } else if (status.tenBitOutput) {
         note += L"Output: 10-bit.";
     } else if (wanted.tenBit && !status.flipModel) {
@@ -396,6 +440,15 @@ inline std::wstring videoRendererNote(const VideoOutputSettings& wanted, const V
     }
     if (!status.videoProcessor && status.renderer != VideoRenderer::Warp) {
         note += L" No video processor: hardware decoding and deinterlacing are off.";
+    }
+    if (status.dolbyVisionUndecoded) {
+        note += L" Dolby Vision without an HDR10 layer is not supported: its colours are wrong.";
+    } else if (status.hdrPicture == HdrPicture::Hdr) {
+        note += L" HDR video is shown as HDR.";
+    } else if (status.hdrPicture == HdrPicture::ToneMapped) {
+        note += L" HDR video is tone-mapped to SDR.";
+    } else if (status.hdrPicture == HdrPicture::Approximated) {
+        note += L" HDR video is shown as SDR with approximate colours: this card does not convert it.";
     }
     return note;
 }

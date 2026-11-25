@@ -11,6 +11,7 @@
 #include <cwctype>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -389,6 +390,31 @@ inline MasterTimelineEndAction masterTimelineEndAction(
     }
     return repeatAll ? MasterTimelineEndAction::Restart
                      : MasterTimelineEndAction::Pause;
+}
+
+// A read that failed is tried again, the stream sought back to where it had
+// got: a NAS waking, Wi-Fi roaming or a server restarting is over in seconds,
+// and until 2026-11-24 the first such error ended the pane for good. How long
+// to wait before the `attempt`-th try (1 the first) of a run of failures that
+// began `elapsedMs` ago: a quarter of a second, doubling up to four. Nothing
+// once the run has lasted kReadRetryBudgetMs, and the error stands.
+inline constexpr std::int64_t kReadRetryBudgetMs = 30000;
+
+inline std::optional<int> readRetryDelayMs(int attempt, std::int64_t elapsedMs) {
+    if (attempt < 1 || elapsedMs < 0 || elapsedMs >= kReadRetryBudgetMs) return std::nullopt;
+    return 250 << std::min(attempt - 1, 4);
+}
+
+// What a deck asks of Windows while it plays: the screen kept lit while the
+// window is seen, and only the machine kept from sleeping, for the sound,
+// while it is minimized. Nothing once playback is paused or has ended, and
+// nothing for a deck with no length -- a photo is not a reason to keep the
+// screen on for good.
+enum class KeepAwake { None, System, Display };
+
+inline KeepAwake keepAwakeFor(bool playing, double duration, bool minimized) {
+    if (!playing || !std::isfinite(duration) || duration <= 0.0) return KeepAwake::None;
+    return minimized ? KeepAwake::System : KeepAwake::Display;
 }
 
 inline double timelineForSourceTime(

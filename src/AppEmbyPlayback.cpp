@@ -30,9 +30,6 @@ namespace {
 constexpr int kEmbySiblingScan = 4000;
 constexpr int kEmbyPhotoWidth = 3840;
 
-std::wstring wide(const std::string& text) { return utf8ToWideText(text); }
-std::string narrow(const std::wstring& text) { return wideToUtf8Text(text); }
-
 std::string streamHeaders(const emby::Session& session) {
     return "X-Emby-Token: " + session.token + "\r\nX-Emby-Authorization: " +
            emby::authorizationHeader(session.deviceId) + "\r\n";
@@ -153,7 +150,7 @@ std::vector<PanelRow> App::buildEmbyReplacementRows(float clientWidth) const {
     if (!embyPendingPlay_) return rows;
     PanelRow heading; heading.kind = PanelRowKind::Header; heading.label = L"All five panes are occupied"; rows.push_back(std::move(heading));
     PanelRow note; note.kind = PanelRowKind::Note; note.wrapNote = true;
-    note.label = L"Replace one pane with " + wide(emby::displayTitle(embyPendingPlay_->item)) +
+    note.label = L"Replace one pane with " + utf8ToWideText(emby::displayTitle(embyPendingPlay_->item)) +
         (embyPendingPlay_->fromBeginning ? L" from the beginning (muted)." : L" (resume saved progress, muted).");
     rows.push_back(std::move(note));
     PanelRow cancel; cancel.kind = PanelRowKind::Buttons; cancel.id = SettingId::EmbyReplaceCancel;
@@ -171,7 +168,7 @@ std::vector<PanelRow> App::buildEmbyReplacementRows(float clientWidth) const {
         row.video = position;
         row.on = audioPaneEnabled(pane);
         row.value = row.on ? L"Audio on" : L"Muted";
-        row.tileKeys.push_back(slot ? slot->imageKey : localThumbnailKey(paths_[pane], 200));
+        row.tiles.push_back({.key = slot ? slot->imageKey : localThumbnailKey(paths_[pane], 200)});
         rows.push_back(std::move(row));
     }
     return rows;
@@ -203,7 +200,7 @@ void App::embyPlayItem(const emby::Item& entry, std::size_t pane, bool fromBegin
         state.autoplay = true;
         state.startPlaying = startPlaying;
         state.addedMuted = add || retainedMute;
-        state.title = wide(emby::displayTitle(entry));
+        state.title = utf8ToWideText(emby::displayTitle(entry));
         state.imageKey = emby::imageKey(entry, 400);
         state.photo = emby::isPhoto(entry);
         state.fromBeginning = fromBeginning;
@@ -216,7 +213,7 @@ void App::embyPlayItem(const emby::Item& entry, std::size_t pane, bool fromBegin
     if (emptyDeck && !deviceRecoveryPending_) clock_.play();
     if (selectTarget) embySelectTarget(pane);
     if (add) soloPane_ = -1;
-    showNotice(L"V" + std::to_wstring(positionForPane(pane) + 1) + L": " + wide(emby::displayTitle(entry)) +
+    showNotice(L"V" + std::to_wstring(positionForPane(pane) + 1) + L": " + utf8ToWideText(emby::displayTitle(entry)) +
         (add ? L" · muted" : L"") + (startPlaying ? L"" : L" · paused with all panes"));
     layoutHoverControls();
     updateHoverControls();
@@ -227,7 +224,7 @@ void App::embyPlayItem(const emby::Item& entry, std::size_t pane, bool fromBegin
 void App::embyBeginResolve(std::size_t pane) {
     const auto locator = emby::parseLocator(paths_[pane]);
     if (!locator) {
-        appendDiagnostic("Emby: unreadable locator " + narrow(paths_[pane]));
+        appendDiagnostic("Emby: unreadable locator " + wideToUtf8Text(paths_[pane]));
         paths_[pane].clear();
         return;
     }
@@ -249,7 +246,7 @@ void App::embyBeginResolve(std::size_t pane) {
     state.serverUrl = session.serverUrl;
     state.userId = session.userId;
     state.accountSerial = embyAccountSerial_;
-    state.title = L"Emby " + wide(locator->itemId);
+    state.title = L"Emby " + utf8ToWideText(locator->itemId);
     embyPanes_[pane] = state;
     if (!session.signedIn()) {
         showNotice(L"Sign in to Emby to play this item");
@@ -274,7 +271,7 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
         // An item of the set playing that the server does not know is
         // looked for, rather than given up.
         if (videoSetItemGone(target, response.status)) return;
-        embyResolveFailed(target, L"Emby: " + wide(response.error));
+        embyResolveFailed(target, L"Emby: " + utf8ToWideText(response.error));
         if (response.status == 401) embySessionExpired();
         return;
     }
@@ -284,7 +281,7 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
         return;
     }
     auto& state = *embyPanes_[target];
-    state.title = wide(emby::displayTitle(*item));
+    state.title = utf8ToWideText(emby::displayTitle(*item));
     state.refind = {item->name, item->seriesName, item->type, item->path, item->parentIndexNumber,
                     item->indexNumber, item->productionYear};
     state.imageKey = emby::imageKey(*item, 400);
@@ -313,7 +310,7 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
         if (!again) return;
         const std::size_t pane = *again;
         if (!reply.ok) {
-            embyResolveFailed(pane, L"Emby: " + wide(reply.error));
+            embyResolveFailed(pane, L"Emby: " + utf8ToWideText(reply.error));
             if (reply.status == 401) embySessionExpired();
             return;
         }
@@ -328,7 +325,7 @@ void App::embyItemArrived(std::uint64_t serial, const EmbyClient::Response& resp
 
 void App::embyResolveFailed(std::size_t pane, const std::wstring& reason) {
     if (pane < embyPanes_.size() && embyPanes_[pane]) embyPanes_[pane]->resolving = false;
-    appendDiagnostic(narrow(reason));
+    appendDiagnostic(wideToUtf8Text(reason));
     // A video set's skips the set, whose notice says why.
     if (!videoSetPaneFailed(pane, reason)) showNotice(reason);
     closePane(pane);
@@ -340,7 +337,7 @@ void App::embyStartResolved(std::size_t pane, const emby::Item& item, const emby
     const auto* source = emby::directPlaySource(info);
     if (!source || !(source->supportsDirectPlay || source->supportsDirectStream)) {
         std::wstring reason = L"Emby cannot hand this item over as a file";
-        if (!info.errorCode.empty()) reason += L" (" + wide(info.errorCode) + L")";
+        if (!info.errorCode.empty()) reason += L" (" + utf8ToWideText(info.errorCode) + L")";
         else if (source && !source->transcodingUrl.empty()) {
             reason += L"; it would need transcoding, which QuadDeck does not do";
         }
@@ -379,7 +376,7 @@ void App::embyStartResolved(std::size_t pane, const emby::Item& item, const emby
         updateTitle();
         return;
     }
-    startSourceStream(pane, wide(session.serverUrl + streamPath), options, source->defaultAudioStreamIndex,
+    startSourceStream(pane, utf8ToWideText(session.serverUrl + streamPath), options, source->defaultAudioStreamIndex,
                       clock_.position(), clock_.isPlaying());
     // The stream the server names for this account, or, when it names none
     // -- an account set to show subtitles only over foreign audio with no
@@ -424,7 +421,8 @@ void App::embyStartPhoto(std::size_t pane, const emby::Item& item) {
         updateTitle();
         return;
     }
-    startSourceStream(pane, wide(session.serverUrl + path), options, -1, clock_.position(), clock_.isPlaying());
+    startSourceStream(pane, utf8ToWideText(session.serverUrl + path), options, -1, clock_.position(),
+                      clock_.isPlaying());
     appendDiagnostic("Emby: showing photo " + item.id + " from " + session.serverUrl + path);
     state.autoplay = false;
     updateTitle();
@@ -467,7 +465,7 @@ void App::embyOpenAdjacent(std::size_t pane, int step, bool selectTarget) {
         const auto found = embyPaneWithSerial(serial);
         if (!found) return;
         if (!response.ok) {
-            showNotice(L"Emby: " + wide(response.error));
+            showNotice(L"Emby: " + utf8ToWideText(response.error));
             if (response.status == 401) embySessionExpired();
             return;
         }

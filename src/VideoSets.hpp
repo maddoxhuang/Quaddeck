@@ -76,12 +76,24 @@ inline int findSameVideos(const VideoSetList& list, const VideoSet& set) {
     return -1;
 }
 
+// A name cut to `units` UTF-16 units, and one fewer where that would leave
+// the first half of a character written as two: half a character cannot be
+// written as UTF-8, and the file of sets would not be saved with it.
+inline void cutVideoSetName(std::wstring& name, std::size_t units) {
+    if (name.size() <= units) return;
+    name.resize(units);
+    if (!name.empty() && name.back() >= 0xD800 && name.back() <= 0xDBFF) name.pop_back();
+}
+
 // What a set is called until it is renamed: its first video's title, and
 // how many more it has.
 inline std::wstring videoSetDefaultName(const std::vector<std::wstring>& titles) {
     if (titles.empty()) return L"Set";
     std::wstring name = titles.front().empty() ? std::wstring(L"Video") : titles.front();
-    if (name.size() > kVideoSetNameLimit) name = name.substr(0, kVideoSetNameLimit - 1) + L"\x2026";
+    if (name.size() > kVideoSetNameLimit) {
+        cutVideoSetName(name, kVideoSetNameLimit - 1);
+        name += L"\x2026";
+    }
     if (titles.size() > 1) name += L" + " + std::to_wstring(titles.size() - 1);
     return name;
 }
@@ -95,7 +107,7 @@ inline std::wstring cleanVideoSetName(std::wstring name) {
     const auto first = name.find_first_not_of(L' ');
     if (first == std::wstring::npos) return {};
     name = name.substr(first, name.find_last_not_of(L' ') - first + 1);
-    if (name.size() > kVideoSetNameLimit) name.resize(kVideoSetNameLimit);
+    cutVideoSetName(name, kVideoSetNameLimit);
     return name;
 }
 
